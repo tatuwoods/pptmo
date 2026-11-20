@@ -836,6 +836,14 @@ function draftFontSize() {
 function closeInline(commit = false) {
   if (!state.inline) return;
   const session = state.inline;
+  // Escape calls finish(false) directly (explicit cancel); this path is
+  // navigation-away, where silently dropping typed text is a data loss
+  if (!commit && !session.finished) {
+    const changed = session.draft
+      ? Boolean(session.textarea.value.trim())
+      : session.textarea.value !== (session.obj?.text || "");
+    if (changed && !window.confirm("有未保存的修改，确定放弃吗？")) return;
+  }
   if (commit) session.finish(true);
   else session.finish(false);
 }
@@ -1867,8 +1875,9 @@ async function handleFile(file) {
     toast("只支持 .pptx 文件", "error");
     return;
   }
-  if (file.size > 60 * 1024 * 1024) {
-    toast("文件超过 60 MB 限制", "error");
+  const capMb = Number(state.doc?.max_upload_mb) || 60;
+  if (file.size > capMb * 1024 * 1024) {
+    toast(`文件超过 ${capMb} MB 限制`, "error");
     return;
   }
   const form = new FormData();

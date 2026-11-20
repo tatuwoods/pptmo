@@ -86,7 +86,14 @@ Useful endpoints beyond these: `GET /api/sessions`, `GET /api/docs/{id}` (object
 
 ## Remote access via Tailscale
 
-Best practice: keep uvicorn bound to `127.0.0.1` and publish through `tailscale serve` (auto-HTTPS, tailnet-only, streams SSE fine):
+Best practice: keep uvicorn bound to `127.0.0.1` and publish through `tailscale serve` (auto-HTTPS, tailnet-only, streams SSE fine). **Since v0.1.2 the app runs a request guard** (anti drive-by / DNS-rebinding), so proxied browser traffic needs the public host whitelisted in `backend/.env` or every cross-origin POST gets 403:
+
+```dotenv
+TRUSTED_HOSTS=macbookpro.example.ts.net
+TRUSTED_ORIGINS=https://macbookpro.example.ts.net:9443
+```
+
+(Hostnames listed in TRUSTED_ORIGINS are trusted automatically; loopback is always trusted, so plain `curl` keeps working.)
 
 ```bash
 tailscale serve --bg --https=9443 http://127.0.0.1:8090
@@ -100,11 +107,31 @@ TS="tailscale --socket=$HOME/.local/state/tailscale/tailscaled.sock"
 $TS serve --bg --https=9443 http://127.0.0.1:8090
 ```
 
-Find the socket via `ps aux | grep tailscaled` (`--socket=` flag). Userspace mode has **no tun device**, so bare connections to the machine's 100.x IP will NOT work — `serve` is the way. To test from the serving machine itself in userspace mode, route through its SOCKS5 proxy: `curl --proxy socks5h://127.0.0.1:1055 https://<host>.<tailnet>.ts.net:9443/api/health`. Undo with `tailscale serve --https=9443 off`.
+Find the socket via `ps aux | grep tailscaled` (`--socket=` flag). Userspace mode has **no tun device**, so bare connections to the machine's 100.x IP will NOT work — `serve` is the way. To test from the serving machine itself in userspace mode, route through its SOCKS5 proxy: `curl --proxy socks5h://127.0.0.1:1055 https://<host>.<tailnet>.ts.net:9443/api/health` (note: curl sends no Origin header, so the guard passes it — this does NOT prove browser access works; check the TRUSTED_* config). Undo with `tailscale serve --https=9443 off`.
 
 **Coexisting with other serve users (important).** All serve entries share one config table on the node; different ports coexist by design, but the same port is **last-writer-wins** — issuing `serve --https=443 ...` silently replaces whatever 443 pointed at. Port 443 is the "default" everyone (humans and agent bots) tends to grab. So: always publish this app on a dedicated high port (9443 here) and leave 443 alone; check `tailscale serve status` first to see which ports are taken. If full isolation is ever required (multiple tenants fighting over serve), the escalation path is a second tailscaled instance with its own `--state`/`--socket` (a separate tailnet node, needs its own login), but a distinct port on the shared daemon is almost always enough.
 
 Do NOT rebind uvicorn to `0.0.0.0` instead: the app has no auth and open CORS; the tailnet HTTPS proxy is the only exposure that keeps it private.
+
+## Environment knobs (v0.1.5)
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `TRUSTED_HOSTS` | loopback | extra Host names accepted (reverse proxy) |
+| `TRUSTED_ORIGINS` | loopback | extra browser Origins accepted; hostnames auto-trusted |
+| `MAX_JSON_BODY_MB` | 2 | cap for JSON request bodies (apply/chat) |
+| `AUTO_APPLY_DESTRUCTIVE` | 0 | allow auto-apply of delete_textbox/clear |
+| `AI_CONCURRENCY` | 2 | max simultaneous agent chats (429 beyond) |
+| `RENDER_QUEUE_MAX` | 4 | queued renders before 429 |
+| `RENDER_MAX_PAGES` | 500 | LibreOffice render page cap |
+| `PARSE_MAX_SLIDES` | 500 | upload rejected (413) above this |
+| `PARSE_MAX_SHAPES` | 5000 | shapes cap (recursive groups incl.) |
+| `PARSE_MAX_GROUP_DEPTH` | 20 | nested group cap |
+| `MAX_VERSIONS` | 50 | versions kept per doc (old pruned with renders) |
+| `AI_MAX_STEPS` / `AI_MAX_OPS` | 10 / 24 | agent loop limits (2–16 / 4–60) |
+| `MAX_UPLOAD_MB` | 60 | upload cap; served to the frontend |
+
+Behavior notes (v0.1.1–v0.1.5): chat finalize persists even on client disconnect; `/apply` marks exactly the sourced message (send `assistant_message_id`), partial applies recorded as `partial_applies`; out-of-range "第 N 页" → 400; `pending_operations` field keeps staged ops alive past message trimming; renders happen outside the doc lock (two-phase commit with version re-check).
 
 ## Troubleshooting
 
