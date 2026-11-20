@@ -322,6 +322,7 @@ def _validate_before(patch: Dict[str, Any], current_text: str, shape_id: str) ->
     if ratio < 0.9:
         raise PatchConflict(
             f"shape {shape_id} changed on the server; refresh and retry"
+            f"（对象 {shape_id} 的原文已变化，请刷新后重试）"
         )
 
 

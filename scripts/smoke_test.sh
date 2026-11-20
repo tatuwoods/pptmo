@@ -91,7 +91,7 @@ if [[ "$ai_on" == "True" ]]; then
   echo "$stream" | grep -q "^event: start" && ok "SSE start" || bad "no SSE start"
   echo "$stream" | grep -q "tool_call" && ok "agent called a tool" || bad "no tool_call seen"
   echo "$stream" | grep -q "^event: done" && ok "SSE done" || bad "no SSE done"
-  echo "$stream" | grep -q "applied" && bad "read-only chat unexpectedly applied" || ok "no write for read-only ask"
+  echo "$stream" | grep -q "^event: applied" && bad "read-only chat unexpectedly applied" || ok "no write for read-only ask"
   versions=$(curl -sf "$BASE/api/docs/$doc_id/versions" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["current"])')
   check "no new version after read-only chat" "$versions" "v2"
 else

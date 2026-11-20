@@ -188,13 +188,22 @@ def request_json(
     return parsed
 
 
-def extract_requested_slide(instruction: str, slide_count: int) -> Optional[int]:
+def locate_requested_slide(instruction: str, slide_count: int) -> Tuple[str, Optional[int]]:
+    """Classify an explicit page mention in the instruction.
+
+    Returns one of:
+      ("ok", index)          — a valid, in-range page was requested (0-based)
+      ("out_of_range", n)    — a page number parsed but exceeds the deck (1-based n)
+      ("none", None)         — no explicit page mention
+    Distinguishing out-of-range from absent prevents silently editing whatever
+    page happens to be open when the user names a page that doesn't exist.
+    """
     text = (instruction or "").strip()
     if not text:
-        return None
+        return "none", None
     lower = text.lower()
     if "首页" in text or "第一页" in text or "first page" in lower:
-        return 0 if slide_count > 0 else None
+        return ("ok", 0) if slide_count > 0 else ("none", None)
 
     def _cn_number(token: str) -> Optional[int]:
         token = token.strip()
@@ -220,13 +229,21 @@ def extract_requested_slide(instruction: str, slide_count: int) -> Optional[int]
         if number is not None:
             index = number - 1
             if 0 <= index < slide_count:
-                return index
+                return "ok", index
+            return "out_of_range", number
     match = re.search(r"\b(?:page|slide)\s*([0-9]+)\b", lower)
     if match:
-        index = int(match.group(1)) - 1
+        number = int(match.group(1))
+        index = number - 1
         if 0 <= index < slide_count:
-            return index
-    return None
+            return "ok", index
+        return "out_of_range", number
+    return "none", None
+
+
+def extract_requested_slide(instruction: str, slide_count: int) -> Optional[int]:
+    state_, index = locate_requested_slide(instruction, slide_count)
+    return index if state_ == "ok" else None
 
 
 def _validate(

@@ -219,3 +219,97 @@ def test_no_key_in_responses(client, uploaded_doc, monkeypatch):
         client.get("/api/docs-ui"),
     ):
         assert "super-secret-key-value" not in resp.text
+
+
+# ---------- v0.1.1: precise applied-marking, partial applies, page guards ----------
+
+def _stage_assistant_message(doc_id, ops, base_version=0):
+    import storage
+    import uuid
+    from datetime import datetime, timezone
+    message = {
+        "id": uuid.uuid4().hex[:12],
+        "role": "assistant",
+        "content": "已收集操作",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "kind": "chat",
+        "operations": ops,
+        "base_version": base_version,
+    }
+    storage.append_messages(doc_id, [message])
+    return message
+
+
+def _op_for_text(doc, needle):
+    target = next(o for o in doc["objects"] if o["kind"] == "text" and needle in o["text"])
+    return {"action": "edit", "shape_id": target["shape_id"], "after": "改后文本",
+            "before": target["text"]}
+
+
+def test_apply_marks_only_targeted_message(client, uploaded_doc):
+    doc_id = uploaded_doc["doc_id"]
+    doc = client.get(f"/api/docs/{doc_id}").json()
+    op_a = _op_for_text(doc, "项目进展汇报")
+    op_b = _op_for_text(doc, "本季度完成")
+    msg_a = _stage_assistant_message(doc_id, [op_a])
+    msg_b = _stage_assistant_message(doc_id, [op_b])
+    # apply msg_b's op with explicit message id
+    r = client.post(f"/api/docs/{doc_id}/apply", json={
+        "patches": [op_b], "label": "AI 改稿 · 1 项",
+        "base_version": 0, "assistant_message_id": msg_b["id"],
+    })
+    assert r.status_code == 200
+    messages = client.get(f"/api/docs/{doc_id}/messages").json()["messages"]
+    by_id = {m["id"]: m for m in messages if m.get("id")}
+    assert by_id[msg_b["id"]].get("applied_version") == "v1"
+    assert "applied_version" not in by_id[msg_a["id"]]
+
+
+def test_apply_partial_records_partial_applies(client, uploaded_doc):
+    doc_id = uploaded_doc["doc_id"]
+    doc = client.get(f"/api/docs/{doc_id}").json()
+    op_a = _op_for_text(doc, "项目进展汇报")
+    op_b = _op_for_text(doc, "本季度完成")
+    msg = _stage_assistant_message(doc_id, [op_a, op_b])
+    # apply only one of the two ops
+    r = client.post(f"/api/docs/{doc_id}/apply", json={
+        "patches": [op_b], "label": "AI 改稿 · 1 项",
+        "base_version": 0, "assistant_message_id": msg["id"],
+    })
+    assert r.status_code == 200
+    messages = client.get(f"/api/docs/{doc_id}/messages").json()["messages"]
+    marked = next(m for m in messages if m.get("id") == msg["id"])
+    assert "applied_version" not in marked  # not fully applied
+    partial = marked.get("partial_applies") or []
+    assert len(partial) == 1
+    assert op_b["shape_id"] in partial[0]["applied_shape_ids"]
+    assert op_a["shape_id"] not in partial[0]["applied_shape_ids"]
+
+
+def test_chat_out_of_range_page_rejected(client, uploaded_doc):
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/chat",
+                    json={"message": "帮我改一下第 99 页的标题", "scope": "current",
+                          "slide_index": 0, "base_version": 0})
+    assert r.status_code == 400
+    assert "超出范围" in r.json()["detail"]
+
+
+def test_chat_disconnect_still_persists(client, uploaded_doc):
+    """Abandoning the SSE stream must not lose the assistant message (v0.1.1 fix)."""
+    import time
+    doc_id = uploaded_doc["doc_id"]
+    with client.stream("POST", f"/api/docs/{doc_id}/chat",
+                       json={"message": "把标题改短一点", "scope": "current",
+                             "slide_index": 0, "base_version": 0}) as resp:
+        assert resp.status_code == 200
+        for _ in resp.iter_lines():
+            break  # read one line then abandon the stream
+    # worker thread finalizes regardless; poll for the assistant message
+    deadline = time.time() + 10
+    found = False
+    while time.time() < deadline and not found:
+        messages = client.get(f"/api/docs/{doc_id}/messages").json()["messages"]
+        found = any(m.get("role") == "assistant" for m in messages)
+        if not found:
+            time.sleep(0.3)
+    assert found, "assistant message lost after client disconnect"

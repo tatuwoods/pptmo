@@ -304,6 +304,7 @@ async function deleteDocument(docId, title) {
 
 /* document lifecycle */
 async function openDocument(docId) {
+  if (state.streaming && state.streamController) state.streamController.abort();
   setBusy(true, "正在载入文档", "读取版本与渲染图…");
   try {
     const doc = await api(`/api/docs/${docId}`, {}, 60000);
@@ -366,7 +367,20 @@ function restorePendingOperations() {
     if (message.applied_version) return;
     if (messages.slice(index + 1).some((later) => later.kind === "apply")) return;
     if (messages.length - 1 - index > 4) return;
-    state.patches = operations.map((operation) => ({ ...operation, uiState: "accepted" }));
+    // ops already applied through a partial apply must not be offered again
+    const appliedIds = new Set(
+      (Array.isArray(message.partial_applies) ? message.partial_applies : [])
+        .flatMap((apply) => (Array.isArray(apply.applied_shape_ids) ? apply.applied_shape_ids : []))
+    );
+    const remaining = operations.filter(
+      (operation) => !operation.shape_id || !appliedIds.has(String(operation.shape_id))
+    );
+    if (!remaining.length) return;
+    state.patches = remaining.map((operation) => ({
+      ...operation,
+      uiState: "accepted",
+      message_id: message.id || null,
+    }));
     const baseVersion = Number.isInteger(message.base_version)
       ? message.base_version
       : Number.isInteger(message.version)
@@ -380,6 +394,7 @@ function restorePendingOperations() {
 }
 
 function goHome() {
+  if (state.streaming && state.streamController) state.streamController.abort();
   if (state.inline) closeInline(false);
   state.doc = null;
   state.selectedId = null;
@@ -949,7 +964,7 @@ function startBoxGesture(event, obj, box, mode) {
   const stageWidth = dom.slideImage.clientWidth || dom.stage.clientWidth;
   const stageHeight = dom.slideImage.clientHeight || dom.stage.clientHeight;
   if (!stageWidth || !stageHeight) return;
-  const size = state.doc.slide_size_emu;
+  const size = state.doc.slide_size_emu || { width: 9144000, height: 5143500 };
   const bbox = obj.bbox_emu || {};
   const orig = {
     left: Number(bbox.x) / size.width * stageWidth,
@@ -1027,7 +1042,7 @@ function startBoxGesture(event, obj, box, mode) {
 /* server write */
 async function runApply(patches, label, options = {}) {
   if (!state.doc || state.busy) return null;
-  const { successMessage, preserveSelection = true } = options;
+  const { successMessage, preserveSelection = true, assistantMessageId } = options;
   setBusy(
     true,
     "正在回写 PPTX",
@@ -1044,6 +1059,7 @@ async function runApply(patches, label, options = {}) {
           patches,
           label,
           base_version: state.doc.version,
+          ...(assistantMessageId ? { assistant_message_id: assistantMessageId } : {}),
         }),
       },
       300000
@@ -1213,28 +1229,6 @@ function renderChat() {
   }
   dom.chatList.innerHTML = messages.map(chatMessageHtml).join("");
   dom.chatList.scrollTop = dom.chatList.scrollHeight;
-}
-
-function renderTrace() {
-  const trace = state.lastTrace || [];
-  dom.traceBox.classList.toggle("is-hidden", trace.length === 0);
-  dom.traceCount.textContent = `${trace.length} 步`;
-  const labels = {
-    get_slides: "读取页面",
-    search_text: "搜索原文",
-    propose_patches: "提交建议",
-    finish: "完成",
-    fallback: "回退读稿",
-  };
-  dom.traceList.innerHTML = trace.map((step) => `
-    <div class="trace-step">
-      <b>${Number(step.step) || ""}</b>
-      <div class="trace-body">
-        <strong>${escapeHtml(labels[step.action] || step.action || "行动")}</strong>
-        <span>${escapeHtml(step.detail || "")}</span>
-        ${step.thought ? `<span class="trace-thought">${escapeHtml(step.thought)}</span>` : ""}
-      </div>
-    </div>`).join("");
 }
 
 function renderMessages() {
@@ -1438,9 +1432,11 @@ function parseSseChunk(chunk) {
   }
 }
 
-async function refreshChatMessages() {
-  if (!state.doc) return;
-  const data = await api(`/api/docs/${state.doc.doc_id}/messages`, {}, 30000);
+async function refreshChatMessages(docId) {
+  const targetDocId = docId || state.doc?.doc_id;
+  if (!targetDocId) return;
+  const data = await api(`/api/docs/${targetDocId}/messages`, {}, 30000);
+  if (state.doc?.doc_id !== targetDocId) return; // user switched docs mid-flight
   state.doc.messages = data.messages || [];
   state.doc.message_count = state.doc.messages.length;
   renderChat();
@@ -1448,21 +1444,35 @@ async function refreshChatMessages() {
   if (!state.streaming) restorePendingOperations();
 }
 
-function showPendingOperations(operations) {
+function showPendingOperations(operations, baseVersion, messageId) {
   const ops = Array.isArray(operations) ? operations : [];
-  state.patches = ops.map((op) => ({ ...op, uiState: "accepted" }));
-  state.patchesStale = false;
+  state.patches = ops.map((op) => ({
+    ...op,
+    uiState: "accepted",
+    ...(messageId ? { message_id: messageId } : {}),
+  }));
+  // staleness must come from the version the ops were computed against, not
+  // from whatever version the doc happens to be on when the stream ends
+  state.patchesStale = Number.isInteger(baseVersion) && baseVersion !== state.doc.version;
   renderPatchList();
   dom.chatPending.classList.toggle("is-hidden", state.patches.length === 0);
+  if (state.patchesStale) {
+    setNotice("这组操作基于旧版本生成，请重新生成后再应用。", "error");
+  }
   if (state.patches.length) {
     dom.chatPending.scrollTop = 0;
   }
 }
 
-async function finalizeChat(done, slideIndex) {
-  if (!state.doc) return;
+async function finalizeChat(done, slideIndex, docId) {
+  const targetDocId = docId || state.doc?.doc_id;
+  if (!targetDocId) return;
   if (done.applied) {
-    const doc = await api(`/api/docs/${state.doc.doc_id}`, {}, 90000);
+    const doc = await api(`/api/docs/${targetDocId}`, {}, 90000);
+    if (state.doc?.doc_id !== targetDocId) {
+      toast(`AI 已执行并保存为 ${done.applied_version_id || doc.version_id}`, "success");
+      return;
+    }
     const selected = state.selectedId;
     applyDocument(doc, { preserveSelection: Boolean(selected), clearPatches: true });
     const touched = (done.operations || [])
@@ -1472,25 +1482,26 @@ async function finalizeChat(done, slideIndex) {
     if (state.slideIndex !== target) setSlide(target, { keepSelection: true });
     state.patches = [];
     dom.chatPending.classList.add("is-hidden");
-    toast(`AI 已执行并保存为 ${done.applied_version || doc.version_id}`, "success");
+    toast(`AI 已执行并保存为 ${done.applied_version_id || doc.version_id}`, "success");
     setNotice(`已自动执行 ${(done.operations || []).length} 项操作 · ${done.reply || done.summary || ""}`, "success");
     return;
   }
   try {
-    await refreshChatMessages();
+    await refreshChatMessages(targetDocId);
   } catch (error) {
-    if (done.assistant) {
+    if (done.assistant && state.doc?.doc_id === targetDocId) {
       state.doc.messages = [...(state.doc.messages || []), done.assistant];
       renderChat();
     }
   }
+  if (state.doc?.doc_id !== targetDocId) return;
   const ops = done.operations || [];
   if (ops.length) {
     const target = Number(ops[0]?.slide_index);
     if (Number.isInteger(target) && target !== state.slideIndex) {
       setSlide(target, { keepSelection: true });
     }
-    showPendingOperations(ops);
+    showPendingOperations(ops, done.base_version, done.message_id);
     setNotice(`AI 提出 ${ops.length} 项操作，已默认选中，确认后写入。`, "");
   } else {
     state.patches = [];
@@ -1500,7 +1511,7 @@ async function finalizeChat(done, slideIndex) {
   }
   if (done.apply_error) {
     toast(`自动执行失败：${done.apply_error}`, "error");
-    if (ops.length) showPendingOperations(ops);
+    if (ops.length) showPendingOperations(ops, done.base_version, done.message_id);
   }
 }
 
@@ -1525,12 +1536,13 @@ async function sendChat() {
   state.patchesStale = false;
   renderPatchList();
   dom.chatPending.classList.add("is-hidden");
-  dom.chatInput.value = "";
   dom.sendBtn.disabled = true;
   dom.stopBtn.classList.remove("is-hidden");
   dom.chatInput.disabled = true;
   const controller = new AbortController();
   state.streamController = controller;
+  const docId = state.doc.doc_id;
+  const docVersion = state.doc.version;
   const slideIndex = state.slideIndex;
   const scope = state.scope;
   const selected = state.selectedId;
@@ -1548,7 +1560,7 @@ async function sendChat() {
   const doneRef = { value: null };
   let failure = "";
   try {
-    const response = await fetch(`/api/docs/${state.doc.doc_id}/chat`, {
+    const response = await fetch(`/api/docs/${docId}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1557,7 +1569,7 @@ async function sendChat() {
         slide_index: slideIndex,
         selected_shape_id: selected || null,
         auto_apply: auto,
-        base_version: state.doc.version,
+        base_version: docVersion,
       }),
       signal: controller.signal,
     });
@@ -1567,8 +1579,13 @@ async function sendChat() {
         const data = await response.json();
         detail = data.detail || detail;
       } catch { /* ignore */ }
-      throw new Error(detail);
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
     }
+    // request accepted — only now clear the composer, so a rejected send
+    // (409 conflict, validation) keeps what the user typed
+    dom.chatInput.value = "";
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -1592,11 +1609,27 @@ async function sendChat() {
     if (error.name === "AbortError") {
       failure = "已停止生成";
       setNotice("已停止生成；已写入的用户消息会保留在会话里。", "");
+      if (!dom.chatInput.value) dom.chatInput.value = instruction;
     } else {
       failure = error.message || "请求失败";
-      setNotice(`对话失败：${failure}`, "error");
-      if (live?.output) live.output.textContent = `执行中断：${failure}`;
-      toast(`对话失败：${failure}`, "error");
+      if (error.status === 409 || /已经更新/.test(failure)) {
+        // stale doc: refresh to the latest version and give the input back
+        try {
+          const fresh = await api(`/api/docs/${docId}`, {}, 60000);
+          if (state.doc?.doc_id === docId) {
+            applyDocument(fresh, { preserveSelection: true, clearPatches: true });
+          }
+          dom.chatInput.value = instruction;
+          setNotice("文档已在别处更新，已加载最新版本；输入已保留，请重新发送。", "error");
+          failure = "";
+        } catch { /* fall through to generic error handling */ }
+      }
+      if (failure) {
+        if (!dom.chatInput.value) dom.chatInput.value = instruction;
+        setNotice(`对话失败：${failure}`, "error");
+        if (live?.output) live.output.textContent = `执行中断：${failure}`;
+        toast(`对话失败：${failure}`, "error");
+      }
     }
   } finally {
     state.streaming = false;
@@ -1607,8 +1640,8 @@ async function sendChat() {
     if (live?.root) live.root.remove();
     state.live = null;
     try {
-      if (doneRef.value) await finalizeChat(doneRef.value, slideIndex);
-      else await refreshChatMessages();
+      if (doneRef.value) await finalizeChat(doneRef.value, slideIndex, docId);
+      else await refreshChatMessages(docId);
     } catch (error) {
       toast(`收尾失败：${error.message || error}`, "error");
     }
@@ -1673,11 +1706,13 @@ async function applyAcceptedPatches() {
     return;
   }
   const patches = accepted.map((patch) => {
-    const { uiState, ...operation } = patch;
+    const { uiState, message_id, ...operation } = patch;
     return operation;
   });
+  const messageId = state.patches.find((patch) => patch.message_id)?.message_id || null;
   const doc = await runApply(patches, `AI 改稿 · ${patches.length} 项`, {
     successMessage: `${patches.length} 项 AI 操作已写入原 PPTX`,
+    assistantMessageId: messageId,
   });
   const target = Number(accepted[0]?.slide_index);
   if (doc && Number.isInteger(target) && target !== state.slideIndex) {
@@ -1724,7 +1759,7 @@ function renderVersionList(data) {
 }
 
 async function restoreVersion(versionId) {
-  if (!state.doc) return;
+  if (!state.doc || state.busy || state.streaming) return;
   if (!window.confirm(`恢复到 ${versionId}？当前内容会保留在历史中，并生成一个新版本。`)) return;
   dom.historyDialog.close();
   setBusy(true, "正在恢复版本", `读取 ${versionId} 并重新渲染…`);

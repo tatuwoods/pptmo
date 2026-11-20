@@ -319,3 +319,14 @@ def test_parse_shape_ids_unique(demo_pptx):
     objects, _ = parse.parse_pptx(str(demo_pptx))
     ids = [o["shape_id"] for o in objects]
     assert len(ids) == len(set(ids))
+
+
+# ---------- v0.1.1: locate_requested_slide distinguishes absent vs out-of-range ----------
+
+def test_locate_requested_slide_states():
+    assert ai.locate_requested_slide("改标题", 10) == ("none", None)
+    assert ai.locate_requested_slide("只改第 4 页", 10) == ("ok", 3)
+    assert ai.locate_requested_slide("首页", 10) == ("ok", 0)
+    assert ai.locate_requested_slide("改第 99 页", 10)[0] == "out_of_range"
+    assert ai.locate_requested_slide("fix page 42", 10)[0] == "out_of_range"
+    assert ai.locate_requested_slide("改第 10 页", 10) == ("ok", 9)

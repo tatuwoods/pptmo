@@ -49,6 +49,7 @@ class ApplyIn(BaseModel):
     patches: List[Dict[str, Any]] = Field(min_length=1, max_length=100)
     label: Optional[str] = Field(default=None, max_length=80)
     base_version: Optional[int] = None
+    assistant_message_id: Optional[str] = Field(default=None, max_length=32)
 
 
 class ChatIn(BaseModel):
@@ -459,10 +460,15 @@ def chat(doc_id: str, body: ChatIn):
     if slide_index < 0 or slide_index >= total_slides:
         raise HTTPException(status_code=400, detail="页码超出范围")
     selected_shape_id = (body.selected_shape_id or "").strip() or None
-    requested = ai.extract_requested_slide(message, total_slides)
-    if requested is not None:
+    requested_state, requested_number = ai.locate_requested_slide(message, total_slides)
+    if requested_state == "out_of_range":
+        raise HTTPException(
+            status_code=400,
+            detail=f"指令提到的页码（第 {requested_number} 页）超出范围：文档共 {total_slides} 页",
+        )
+    if requested_state == "ok":
         scope = "current"
-        slide_index = requested
+        slide_index = requested_number
     scope_label = f"第 {slide_index + 1} 页" if scope == "current" else "整份文稿"
 
     user_id = uuid.uuid4().hex[:12]
@@ -544,81 +550,80 @@ def chat(doc_id: str, body: ChatIn):
                 "base_version": start_version,
                 "auto_apply": bool(body.auto_apply),
             }
+        # Finalize inside the worker thread: a client disconnect (Stop button,
+        # tab close, proxy cut) abandons the response generator, and any logic
+        # living in the generator after the read loop would never run. Doing it
+        # here guarantees the assistant message — and with auto_apply the
+        # already-validated operations — are always persisted.
+        result = state.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        try:
+            if body.auto_apply and result.get("operations"):
+                emit(
+                    "applying",
+                    {
+                        "count": len(result.get("operations") or []),
+                        "version_id": f"v{start_version + 1}",
+                    },
+                )
+            applied_event, apply_error, final_fields = _finalize_chat(
+                doc_id, bool(body.auto_apply), start_version, result
+            )
+            if applied_event is not None:
+                emit("applied", applied_event)
+            elif apply_error:
+                emit(
+                    "apply_error",
+                    {
+                        "message": apply_error,
+                        "staged": True,
+                        "version_id": final_fields["version_id"],
+                    },
+                )
+            result.update(final_fields)
+            log.info(
+                "chat doc=%s steps=%s ops=%s applied=%s",
+                doc_id,
+                result.get("steps"),
+                len(result.get("operations") or []),
+                result.get("applied"),
+            )
+            emit("done", result)
+        except Exception as exc:
+            log.exception("chat finalize failed for %s", doc_id)
+            message_text = f"保存对话失败：{exc}"
+            emit("error", {"message": message_text})
+            result.update(
+                {
+                    "message_id": None,
+                    "content": result.get("reply") or result.get("summary") or message_text,
+                    "version_id": f"v{start_version}",
+                    "message_count": 0,
+                    "applied": False,
+                    "error": result.get("error") or message_text,
+                    "apply_error": None,
+                    "mode": "agent",
+                    "model": result.get("model")
+                    or os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+                    "auto_apply": bool(body.auto_apply),
+                }
+            )
+            emit("done", result)
         finally:
             events.put(None)
 
     threading.Thread(target=worker, daemon=True, name=f"agent-{doc_id[:8]}").start()
 
     def event_stream():
-        done_data: Optional[Dict[str, Any]] = None
+        # Pure relay: all state transitions (applying/applied/done) are emitted
+        # by the worker, so a disconnect can't skip persistence work.
         while True:
             item = events.get()
             if item is None:
                 break
             name, data = item
-            if name == "done":
-                done_data = data
-                continue
             yield _sse(name, data)
-        if done_data is None:
-            done_data = state.get("result")
-        if not isinstance(done_data, dict):
-            done_data = {}
-        if body.auto_apply and done_data.get("operations"):
-            yield _sse(
-                "applying",
-                {
-                    "count": len(done_data.get("operations") or []),
-                    "version_id": f"v{start_version + 1}",
-                },
-            )
-        try:
-            applied_event, apply_error, final_fields = _finalize_chat(
-                doc_id, bool(body.auto_apply), start_version, done_data
-            )
-        except Exception as exc:
-            log.exception("chat finalize failed for %s", doc_id)
-            message_text = f"保存对话失败：{exc}"
-            yield _sse("error", {"message": message_text})
-            done_data.update(
-                {
-                    "message_id": None,
-                    "content": done_data.get("reply")
-                    or done_data.get("summary")
-                    or message_text,
-                    "version_id": f"v{start_version}",
-                    "message_count": 0,
-                    "applied": False,
-                    "error": done_data.get("error") or message_text,
-                    "apply_error": None,
-                    "mode": "agent",
-                    "model": done_data.get("model")
-                    or os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-                    "auto_apply": bool(body.auto_apply),
-                }
-            )
-            yield _sse("done", done_data)
-            return
-        if applied_event is not None:
-            yield _sse("applied", applied_event)
-        elif apply_error:
-            yield _sse(
-                "apply_error",
-                {
-                    "message": apply_error,
-                    "staged": True,
-                    "version_id": final_fields["version_id"],
-                },
-            )
-        done_data.update(final_fields)
-        log.info(
-            "chat doc=%s steps=%s ops=%s applied=%s",
-            doc_id,
-            done_data.get("steps"),
-            len(done_data.get("operations") or []),
-            done_data.get("applied"),
-        )
-        yield _sse("done", done_data)
 
     return StreamingResponse(
         event_stream(),
@@ -641,24 +646,70 @@ def apply(doc_id: str, body: ApplyIn):
             raise edits.PatchConflict("文档已经更新，请刷新后再试")
         new_version, _ = storage.next_version_id(meta)
         work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
-        touched = edits.apply_patches_to_file(
-            storage.current_path(doc_id), work_path, body.patches
-        )
-        result = _commit_work(
-            doc_id, meta, work_path, new_version, label, touched=sorted(touched)
-        )
-        if label.startswith("AI 改稿"):
+        try:
+            touched = edits.apply_patches_to_file(
+                storage.current_path(doc_id), work_path, body.patches
+            )
+            result = _commit_work(
+                doc_id, meta, work_path, new_version, label, touched=sorted(touched)
+            )
+        except Exception:
+            # a rejected patch used to leak the work file; _commit_work cleans
+            # up only for failures that happen inside it
+            try:
+                work_path.unlink()
+            except OSError:
+                pass
+            raise
+        # Mark exactly the message the patches came from. The legacy
+        # label-prefix scan marked the newest un-applied assistant message even
+        # when the user applied a different (or partial) set, silently
+        # un-restoring ops that were never applied.
+        mark_id = (body.assistant_message_id or "").strip()
+        if mark_id or label.startswith("AI 改稿"):
             old_messages = storage.load_messages(doc_id)
-            for old in reversed(old_messages):
-                if (
-                    old.get("role") == "assistant"
-                    and old.get("operations")
-                    and not old.get("applied_version")
-                ):
-                    old["applied_version"] = result["version_id"]
-                    old["content"] = f"{old.get('content') or ''}（已应用为 {result['version_id']}）"
-                    storage.save_messages(doc_id, old_messages)
-                    break
+            target = None
+            if mark_id:
+                candidate = next(
+                    (m for m in old_messages if m.get("id") == mark_id), None
+                )
+                if candidate is not None and candidate.get("role") == "assistant":
+                    target = candidate
+            else:
+                target = next(
+                    (
+                        m
+                        for m in reversed(old_messages)
+                        if m.get("role") == "assistant"
+                        and m.get("operations")
+                        and not m.get("applied_version")
+                    ),
+                    None,
+                )
+            if target is not None and not target.get("applied_version"):
+                op_ids = {
+                    str(op.get("shape_id"))
+                    for op in (target.get("operations") or [])
+                    if isinstance(op, dict) and op.get("shape_id")
+                }
+                submitted_ids = {
+                    str(p.get("shape_id"))
+                    for p in body.patches
+                    if isinstance(p, dict) and p.get("shape_id")
+                }
+                if op_ids and op_ids <= submitted_ids:
+                    target["applied_version"] = result["version_id"]
+                    target["content"] = (
+                        f"{target.get('content') or ''}（已应用为 {result['version_id']}）"
+                    )
+                else:
+                    target.setdefault("partial_applies", []).append(
+                        {
+                            "version_id": result["version_id"],
+                            "applied_shape_ids": sorted(op_ids & submitted_ids),
+                        }
+                    )
+                storage.save_messages(doc_id, old_messages)
         message = {
             "id": uuid.uuid4().hex[:12],
             "role": "assistant" if label.startswith("AI 改稿") else "system",
@@ -704,8 +755,15 @@ def restore_version(doc_id: str, version_id: str):
         source = storage.version_file(doc_id, version_id)
         new_version, _ = storage.next_version_id(meta)
         work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
-        shutil.copy2(source, work_path)
-        result = _commit_work(doc_id, meta, work_path, new_version, f"恢复 {version_id}")
+        try:
+            shutil.copy2(source, work_path)
+            result = _commit_work(doc_id, meta, work_path, new_version, f"恢复 {version_id}")
+        except Exception:
+            try:
+                work_path.unlink()
+            except OSError:
+                pass
+            raise
         message = {
             "id": uuid.uuid4().hex[:12],
             "role": "system",
