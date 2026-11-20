@@ -1,0 +1,118 @@
+---
+name: pptmo
+description: Deploy and drive PPT Light (pptmo), a local conversational AI PPTX editor with high-fidelity preview, versioning, and precise agent-driven edits written back to a real editable .pptx. Use this skill whenever the user wants to edit/revise/polish PowerPoint files through conversation, asks to set up or start the ppt-light service, wants AI to read a deck and make precise text/style/geometry changes, needs the PPT editing API (upload/chat-SSE/apply/download) called programmatically, or wants to expose the local service remotely via Tailscale. Also use it when the user mentions "PPT 改稿", "对话改 PPT", uploading a .pptx for AI editing, or recovering/rolling back PPT versions.
+---
+
+# pptmo — Conversational AI PPTX Editor (PPT Light)
+
+A self-hosted web app: upload a `.pptx`, get a high-fidelity render, then edit it either manually (double-click text, drag boxes) or by chatting with an AI agent (ReAct loop) that reads the deck and submits **validated, reviewable operations**. Applying them writes a real editable PPTX via `python-pptx` and creates a restorable version.
+
+Stack: FastAPI + python-pptx + LibreOffice(`soffice`) → PDF → PyMuPDF PNG; vanilla JS frontend; any OpenAI-compatible chat API for the AI agent.
+
+## Layout of this skill
+
+```
+app/        # full application source (backend/ web/ samples/demo.pptx)
+scripts/    # setup.sh — one-shot environment bootstrap
+```
+
+## When the user just wants it running (fast path)
+
+```bash
+bash <skill-dir>/scripts/setup.sh <target-dir>          # copies app, creates venv, installs deps
+cd <target-dir>/backend
+.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8090
+curl -s http://127.0.0.1:8090/api/health                # {"ok": true, ...}
+```
+
+Open http://127.0.0.1:8090 . Without an AI key everything works except the chat pane; with a key configured (below) AI editing unlocks.
+
+Prerequisites: Python 3.10+ (tested on 3.12 and 3.14), `soffice` on PATH (LibreOffice; on macOS `brew install --cask libreoffice` puts a CLI at `$(brew --prefix)/bin/soffice`). Data lives in `backend/data/docs/`; deleting a session in the UI deletes its files.
+
+## AI configuration
+
+The agent calls any **OpenAI-compatible** `/chat/completions` endpoint. Configure via `backend/.env` (chmod 600, never commit):
+
+```dotenv
+DEEPSEEK_API_KEY=<key>
+DEEPSEEK_API_BASE=<base-url-ending-in-/v1>
+DEEPSEEK_MODEL=<model>
+RENDER_SCALE=2
+# optional: AI_MAX_STEPS=10 (2-16), AI_MAX_OPS=24 (4-60), MAX_UPLOAD_MB=60
+```
+
+The env names say "DEEPSEEK" but the provider is arbitrary. Verified working:
+
+| Provider | BASE | MODEL | Notes |
+| --- | --- | --- | --- |
+| Zhipu coding plan | `https://open.bigmodel.cn/api/coding/paas/v4` | `glm-5.3-flash` | supports `response_format: json_object` + SSE; reasoning model, a few seconds slower per step |
+| Zhipu standard | `https://open.bigmodel.cn/api/paas/v4` | `glm-4.6` etc. | |
+| DeepSeek official | `https://api.deepseek.com/v1` | `deepseek-chat` | |
+
+The client already retries without `response_format` once if an endpoint rejects it, and it tolerates `delta.reasoning_content`-style models (it only concatenates `delta.content`). Key must exist or `ai_configured` stays false — a placeholder value turns the badge green but every chat will 502, so leave it empty rather than fake.
+
+## How the AI edit flow works (what to tell the user)
+
+1. AI **cannot** write the file directly. It calls read tools (`outline`, `read_slides`, `search_text`, `read_table`, `inspect_shapes`), then submits ops via `propose_operations` (≤6 per call, ≤24 per turn).
+2. Default is **review mode**: operations appear as cards, applied only after the user clicks apply. The "自动执行" toggle auto-applies after the turn.
+3. Guards you can rely on: ops must target real `shape_id`s from tool output; text edits carry a `before` checked against current text (page-number/footer/logo objects are protected unless the instruction names them); grouped shapes allow text/style edits but reject geometry; every apply creates a version that can be restored (restore itself creates a new version, history is never lost).
+4. Optimistic-locking: requests carry `base_version`; if the doc changed meanwhile the server answers 409 and ops stay staged.
+
+## Driving it programmatically (no UI needed)
+
+The whole feature set is HTTP. Typical agent loop:
+
+```bash
+# 1. upload
+DOC=$(curl -s -X POST http://127.0.0.1:8090/api/docs/upload \
+  -F "file=@deck.pptx" | python3 -c 'import json,sys;print(json.load(sys.stdin)["doc_id"])')
+
+# 2. chat (SSE stream of events: start/step/thought/tool_call/tool_result/operations/summary/done)
+curl -sN -X POST http://127.0.0.1:8090/api/docs/$DOC/chat -H "Content-Type: application/json" \
+  -d '{"message":"把第4页的项目总投资改成190万，保留格式","scope":"current","slide_index":3,"base_version":0}'
+# done event contains operations[] — each has id/action/shape_id/before/after/description
+
+# 3. apply accepted operations (auto_apply=false flow)
+curl -s -X POST http://127.0.0.1:8090/api/docs/$DOC/apply -H "Content-Type: application/json" \
+  -d '{"patches":[<op objects>],"label":"AI 改稿","base_version":0}'
+
+# 4. download the real pptx
+curl -sO http://127.0.0.1:8090/api/docs/$DOC/download
+```
+
+Say “第 N 页” in the message and the server auto-scopes to that slide (Chinese numerals, “首页”, "page N" all work). `scope: "deck"` widens to the whole file. SSE is plain `event:`/`data:` lines — parse incrementally; the `done` payload holds `message_id`, final `operations`, `trace`, and (if auto-apply) `applied_version_id`.
+
+Useful endpoints beyond these: `GET /api/sessions`, `GET /api/docs/{id}` (objects+messages in one shot), `GET /api/docs/{id}/versions`, `POST .../versions/{v}/restore`, `GET /api/docs/{id}/slides/{n}/image`. Interactive docs at `/api/docs-ui`.
+
+## Remote access via Tailscale
+
+Best practice: keep uvicorn bound to `127.0.0.1` and publish through `tailscale serve` (auto-HTTPS, tailnet-only, streams SSE fine):
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:8090
+tailscale serve status        # prints https://<host>.<tailnet>.ts.net/
+```
+
+On macOS with a **homebrew userspace** tailscaled (common on agent boxes), the CLI must point at its socket or every command fails with "failed to connect to local tailscaled":
+
+```bash
+TS="tailscale --socket=$HOME/.local/state/tailscale/tailscaled.sock"
+$TS serve --bg --https=443 http://127.0.0.1:8090
+```
+
+Find the socket via `ps aux | grep tailscaled` (`--socket=` flag). Userspace mode has **no tun device**, so bare connections to the machine's 100.x IP will NOT work — `serve` is the way. To test from the serving machine itself in userspace mode, route through its SOCKS5 proxy: `curl --proxy socks5h://127.0.0.1:1055 https://<host>.<tailnet>.ts.net/api/health`. Undo with `tailscale serve off`.
+
+Do NOT rebind uvicorn to `0.0.0.0` instead: the app has no auth and open CORS; the tailnet HTTPS proxy is the only exposure that keeps it private.
+
+## Troubleshooting
+
+- **`ai_configured: false`** in `/api/health` → missing/empty `DEEPSEEK_API_KEY`; env is read at process start, so restart after editing `.env`.
+- **Chat 502 / "AI 服务异常"** → wrong base URL (must include `/v1`-style suffix the provider expects), invalid/expired key, or proxy interference; the backend honors `HTTPS_PROXY`.
+- **Upload 400 “无法解析 PPTX”** → corrupt or non-pptx; only `.pptx` (no `.ppt`).
+- **First open of a big deck is slow** → LibreOffice renders synchronously (all pages, 2x PNG); tens of seconds for 50+ pages is normal, later versions only rerender once per apply.
+- **`render/` grows unboundedly** → every version keeps full-page PNGs by design; clean old `backend/data/docs/<id>/render/vN/` dirs if disk matters (thumbnails of old versions will 404 harmlessly).
+- **Port 8090 busy** → launch with `--port 8091`, or run `python main.py` which reads `PORT`/`HOST` env vars.
+
+## Known limits (set expectations honestly)
+
+Text layer + textbox geometry only — pictures/charts/SmartArt render but can't be edited; table cells accept text/style but not move/resize; grouped text can be reworded but not repositioned; fonts may render slightly differently vs PowerPoint (LibreOffice rasterizes the preview; the downloaded file opens fine in PowerPoint/WPS). 60 MB upload cap. No multi-user auth — keep it behind localhost or a private tailnet.

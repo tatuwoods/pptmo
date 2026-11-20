@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PPT Light · 轻量高保真 PPT 改稿</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M20 48V16h14c8 0 13 4 13 11s-5 11-13 11h-6v10H20zm8-17h5c4 0 6-1.5 6-4s-2-4-6-4h-5v8z' fill='%23ffffff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <a class="brand" href="#" id="brandLink" aria-label="PPT Light 首页">
+        <span class="brand-mark">P</span>
+        <span class="brand-copy">
+          <strong>PPT Light</strong>
+          <small>高保真渲染 · AI 改稿</small>
+        </span>
+      </a>
+      <div class="doc-meta is-hidden" id="docMeta">
+        <span id="docName"></span>
+        <span class="version-chip" id="docVersion">v0</span>
+      </div>
+      <div class="top-actions">
+        <button class="btn ghost is-hidden" id="backBtn" type="button">会话列表</button>
+        <button class="btn ghost" id="uploadBtn" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+          新建会话
+        </button>
+        <button class="btn ghost" id="historyBtn" type="button" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5"/><path d="M12 7v5l3 2"/></svg>
+          历史
+        </button>
+        <button class="btn primary" id="downloadBtn" type="button" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m0 0 4.5-4.5M12 16l-4.5-4.5M4 19h16"/></svg>
+          下载 PPTX
+        </button>
+      </div>
+    </header>
+
+    <section class="landing" id="landing">
+      <div class="home">
+        <div class="home-intro">
+          <div class="home-kicker"><span class="pulse"></span> PPT LIGHT</div>
+          <h1>让 PPT 的修改<br>像对话一样简单。</h1>
+          <p class="home-sub">
+            点选文字直接改，拖动排版；AI 以 ReAct 模式读稿，
+            只给可审阅的建议，接受后才写回原文件。
+          </p>
+          <div class="home-actions">
+            <button class="btn primary" id="landingUploadBtn" type="button">
+              <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+              上传 PPTX
+            </button>
+            <span>支持 .pptx · 文件仅保存在本机</span>
+          </div>
+          <div class="home-drop" id="dropzone" role="button" tabindex="0" aria-label="上传 PPTX">
+            <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+            <span>也可以把文件拖到这里</span>
+          </div>
+        </div>
+
+        <section class="home-sessions" id="recentSection">
+          <div class="home-sessions-head">
+            <div>
+              <h2>会话</h2>
+              <p>回到上次的 PPT，继续修改</p>
+            </div>
+            <button class="btn tiny ghost" id="refreshDocsBtn" type="button">刷新</button>
+          </div>
+          <div class="session-list" id="recentList"></div>
+        </section>
+      </div>
+      <footer class="home-foot">
+        <span>LibreOffice · python-pptx · DeepSeek ReAct harness</span>
+        <span>本地会话 · 版本可回滚</span>
+      </footer>
+    </section>
+
+    <main class="workspace is-hidden" id="workspace">
+      <aside class="rail">
+        <div class="rail-head">
+          <span>幻灯片</span>
+          <span class="rail-count" id="slideCount">0</span>
+        </div>
+        <div class="thumbs" id="thumbs"></div>
+      </aside>
+
+      <section class="center">
+        <div class="stage-toolbar">
+          <div class="nav-group">
+            <button class="icon-btn" id="prevBtn" type="button" aria-label="上一页">
+              <svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></svg>
+            </button>
+            <span class="slide-label" id="slideLabel">1 / 1</span>
+            <button class="icon-btn" id="nextBtn" type="button" aria-label="下一页">
+              <svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
+            </button>
+          </div>
+          <div class="toolbar-hint">双击文字编辑 · 拖动移动 · 右下角缩放</div>
+          <div class="toolbar-actions">
+            <button class="btn tiny ghost" id="addTextBtn" type="button">
+              <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+              文本框
+            </button>
+          </div>
+        </div>
+
+        <div class="stage-scroll" id="stageScroll">
+          <div class="stage" id="stage">
+            <img id="slideImage" alt="幻灯片预览" draggable="false">
+            <div class="overlay" id="overlay"></div>
+            <div class="stage-loader is-hidden" id="stageLoader"><span class="spinner dark"></span></div>
+          </div>
+        </div>
+
+        <div class="statusbar">
+          <span id="statusText">准备就绪</span>
+          <span id="statusRight"></span>
+        </div>
+      </section>
+
+      <aside class="side">
+        <div class="side-head">
+          <div>
+            <h2>AI 改稿</h2>
+            <p>ReAct harness · 建议需审阅</p>
+          </div>
+          <div class="side-head-tools">
+            <button class="btn tiny ghost" id="sessionLogBtn" type="button">记录</button>
+            <span class="chip" id="aiBadge">DeepSeek</span>
+          </div>
+        </div>
+
+        <div class="side-tabs" role="tablist">
+          <button class="tab is-active" id="tabAi" type="button" data-tab="ai">AI 建议</button>
+          <button class="tab" id="tabText" type="button" data-tab="text">文本检查器</button>
+        </div>
+
+        <div class="side-body">
+          <section class="pane chat-pane" id="aiPane">
+            <div class="chat-toolbar">
+              <div class="segment" id="scopeSegment">
+                <button class="is-active" type="button" data-scope="current">当前页</button>
+                <button type="button" data-scope="deck">整份文稿</button>
+              </div>
+              <label class="auto-toggle" title="AI 完成后自动写入 PPTX 并生成新版本">
+                <input type="checkbox" id="autoApplyToggle">
+                <span>自动执行</span>
+              </label>
+            </div>
+            <div class="chat-list" id="chatList"></div>
+            <div class="chat-pending is-hidden" id="chatPending">
+              <div class="patch-head">
+                <span>待确认 <b id="patchCount">0</b> 项</span>
+                <div class="patch-head-actions">
+                  <button class="link-btn" id="acceptAllBtn" type="button">全选</button>
+                  <button class="link-btn" id="clearPatchesBtn" type="button">清空</button>
+                </div>
+              </div>
+              <div class="patch-list" id="patchList"></div>
+              <div class="apply-bar is-hidden" id="applyBar">
+                <span id="acceptedCount">已接受 0 条</span>
+                <button class="btn primary" id="applyBtn" type="button">应用并生成新版本</button>
+              </div>
+            </div>
+            <div class="chat-composer">
+              <div class="chips" id="promptChips">
+                <button type="button" data-prompt="整体更专业、更简洁，去掉口语和空话">更专业简洁</button>
+                <button type="button" data-prompt="压缩为适合 PPT 展示的短句和要点，保留关键信息">压缩成要点</button>
+                <button type="button" data-prompt="检查并修正语病、错别字和标点，统一书面表达">修正语病</button>
+                <button type="button" data-prompt="检查全篇术语、数字和称呼是否一致">统一术语</button>
+              </div>
+              <textarea id="chatInput" class="prompt-input chat-input" rows="3" placeholder="直接说要改哪一页、哪一段、怎么改。例如：把第 4 页项目名称改正式，其他不动。"></textarea>
+              <div class="composer-row">
+                <span class="composer-hint" id="chatHint">Enter 发送 · Shift+Enter 换行</span>
+                <button class="btn tiny ghost is-hidden" id="stopBtn" type="button">停止</button>
+                <button class="btn primary" id="sendBtn" type="button">发送</button>
+              </div>
+              <div class="notice is-hidden" id="aiNotice"></div>
+            </div>
+          </section>
+
+          <section class="pane is-hidden" id="textPane">
+            <div class="empty-soft" id="noSelection">
+              <span class="empty-mark">⌖</span>
+              <p>在画布上单击一个文本框，这里会显示精确文本、字号和位置。</p>
+            </div>
+            <div class="inspector is-hidden" id="inspector">
+              <div class="inspect-meta">
+                <span id="inspectPage"></span>
+                <span id="inspectFont"></span>
+                <span id="inspectId" class="mono"></span>
+              </div>
+              <label class="field-label" for="textEditor">文本内容</label>
+              <textarea id="textEditor" class="text-editor" rows="8" spellcheck="false"></textarea>
+              <div class="inspect-actions">
+                <button class="btn primary" id="saveTextBtn" type="button">保存文本</button>
+                <button class="btn danger ghost" id="deleteShapeBtn" type="button">删除文本框</button>
+              </div>
+              <div class="style-panel">
+                <span class="field-label">精确样式</span>
+                <div class="style-row">
+                  <label>字号 <input class="mini-input" id="fontSizeInput" type="number" min="6" max="120" step="0.5"></label>
+                  <label>颜色 <input class="mini-color" id="colorInput" type="color" value="#1F2937"></label>
+                  <label>对齐
+                    <select class="mini-input" id="alignSelect">
+                      <option value="LEFT">左对齐</option>
+                      <option value="CENTER">居中</option>
+                      <option value="RIGHT">右对齐</option>
+                      <option value="JUSTIFY">两端对齐</option>
+                    </select>
+                  </label>
+                  <label class="mini-check"><input id="boldToggle" type="checkbox"> 加粗</label>
+                  <label class="mini-check"><input id="italicToggle" type="checkbox"> 斜体</label>
+                </div>
+                <button class="btn tiny ghost" id="applyStyleBtn" type="button">应用样式</button>
+              </div>
+              <div class="inspect-geo" id="inspectGeo"></div>
+              <p class="hint">提示：双击文字原位编辑；表格单元格可改文字或样式，但不能单独移动。拖动文本框可移动，右下角把手可缩放，松手后自动保存成新版本。</p>
+            </div>
+          </section>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <input type="file" id="fileInput" accept=".pptx" hidden>
+
+  <div class="busy is-hidden" id="busy" role="status" aria-live="polite">
+    <div class="busy-card">
+      <span class="spinner"></span>
+      <div>
+        <strong id="busyTitle">处理中</strong>
+        <p id="busyText">请稍候…</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+  <dialog class="dialog" id="historyDialog">
+    <div class="dialog-head">
+      <div>
+        <h2>版本历史</h2>
+        <p>每次保存都会生成一个新的可恢复版本</p>
+      </div>
+      <button class="icon-btn" id="closeHistoryBtn" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="version-list" id="versionList"></div>
+  </dialog>
+
+  <dialog class="dialog" id="sessionDialog">
+    <div class="dialog-head">
+      <div>
+        <h2>会话记录</h2>
+        <p id="sessionDialogMeta">当前 PPT 的对话与保存记录</p>
+      </div>
+      <button class="icon-btn" id="closeSessionLogBtn" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="message-list" id="messageList"></div>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
