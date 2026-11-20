@@ -416,3 +416,95 @@ def test_error_details_sanitized(client, uploaded_doc, tmp_path):
     r = client.get(f"/api/docs/{doc_id}/download")
     assert r.status_code == 404
     assert str(tmp_path) not in r.text
+
+
+# ---------- v0.1.3: resource caps, pruning, concurrency bounds ----------
+
+def test_version_pruning_keeps_recent(client, uploaded_doc, monkeypatch):
+    import storage as storage_mod
+    doc_id = uploaded_doc["doc_id"]
+    monkeypatch.setenv("MAX_VERSIONS", "2")
+    for i in range(3):
+        doc = client.get(f"/api/docs/{doc_id}").json()
+        target = next(o for o in doc["objects"] if o["kind"] == "text")
+        r = client.post(f"/api/docs/{doc_id}/apply", json={
+            "patches": [{"action": "style", "shape_id": target["shape_id"],
+                         "style": {"bold": bool(i % 2)}}],
+            "base_version": doc["version"],
+        })
+        assert r.status_code == 200, r.text
+    versions = client.get(f"/api/docs/{doc_id}/versions").json()["versions"]
+    assert len(versions) <= 2
+    assert [v["id"] for v in versions] == ["v2", "v3"]
+    assert not (storage_mod.versions_dir(doc_id) / "v0.pptx").exists()
+    assert (storage_mod.versions_dir(doc_id) / "v3.pptx").exists()
+    # pruned render dirs are gone too
+    assert not (storage_mod.doc_dir(doc_id) / "render" / "v0").exists()
+
+
+def test_parse_slide_cap_rejected_on_upload(client, demo_pptx, monkeypatch):
+    monkeypatch.setenv("PARSE_MAX_SLIDES", "2")
+    with open(demo_pptx, "rb") as fh:
+        r = client.post("/api/docs/upload",
+                        files={"file": ("demo.pptx", fh.read(), "application/octet-stream")})
+    assert r.status_code == 413
+    assert "上限" in r.json()["detail"]
+
+
+def test_parse_truncation_flag_direct(demo_pptx, monkeypatch):
+    from services import parse as parse_mod
+    monkeypatch.setenv("PARSE_MAX_SLIDES", "2")
+    objects, payload = parse_mod.parse_pptx(str(demo_pptx))
+    assert payload["slide_count"] == 2
+    assert payload["truncated_slides"] is True
+
+
+def test_render_busy_maps_to_429(client, demo_pptx, monkeypatch):
+    from services import render as render_mod
+
+    def busy_render(*args, **kwargs):
+        raise render_mod.RenderBusy("render queue is full")
+
+    monkeypatch.setattr(render_mod, "render_pptx", busy_render)
+    with open(demo_pptx, "rb") as fh:
+        r = client.post("/api/docs/upload",
+                        files={"file": ("demo.pptx", fh.read(), "application/octet-stream")})
+    assert r.status_code == 429
+    assert "渲染队列已满" in r.json()["detail"]
+
+
+def test_render_pptx_busy_semantics(tmp_path):
+    import threading
+    from services import render as render_mod
+    import pytest as _pytest
+    original = render_mod._queue_slots
+    render_mod._queue_slots = threading.BoundedSemaphore(0)
+    try:
+        with _pytest.raises(render_mod.RenderBusy):
+            render_mod.render_pptx(tmp_path / "x.pptx", tmp_path / "out")
+    finally:
+        render_mod._queue_slots = original
+
+
+def test_chat_per_doc_guard(client, uploaded_doc, monkeypatch):
+    import main as app_module
+    doc_id = uploaded_doc["doc_id"]
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")  # pass the ai_configured gate client-side irrelevant; server doesn't check
+    with app_module._chat_inflight_lock:
+        app_module._chat_inflight[doc_id] = 1
+    try:
+        r = client.post(f"/api/docs/{doc_id}/chat", json={"message": "改标题"})
+        assert r.status_code == 429
+        assert "已有对话进行中" in r.json()["detail"]
+    finally:
+        with app_module._chat_inflight_lock:
+            app_module._chat_inflight.pop(doc_id, None)
+
+
+def test_chat_slot_exhaustion_429(client, uploaded_doc, monkeypatch):
+    import threading
+    import main as app_module
+    monkeypatch.setattr(app_module, "_chat_slots", threading.BoundedSemaphore(0))
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/chat", json={"message": "改标题"})
+    assert r.status_code == 429
+    assert "AI 并发已满" in r.json()["detail"]

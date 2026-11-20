@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -294,6 +295,13 @@ def _table_cells(shape, slide_index: int, shape_id: str, bbox: Dict[str, int], s
     return cells, meta
 
 
+def _cap(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     path = Path(pptx_path)
     prs = Presentation(str(path))
@@ -305,9 +313,18 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
     elements: List[Dict[str, Any]] = []
     tables: List[Dict[str, Any]] = []
     seq = 0
+    # structural caps: a hostile 60MB pptx can expand into hundreds of MB of
+    # JSON that would then be re-read on every GET; these keep worst cases sane
+    max_slides = _cap("PARSE_MAX_SLIDES", 500)
+    max_shapes = _cap("PARSE_MAX_SHAPES", 5000)
+    max_depth = _cap("PARSE_MAX_GROUP_DEPTH", 20)
+    limits = {"truncated_slides": False, "truncated_shapes": False, "truncated_depth": False}
 
     def walk(shape, transform, slide_index: int, grouped: bool, parent_shape_id: Optional[str], group_path: List[str], depth: int = 0) -> None:
         nonlocal seq
+        if len(elements) >= max_shapes:
+            limits["truncated_shapes"] = True
+            return
         seq += 1
         current_seq = seq
         left = _int(getattr(shape, "left", 0))
@@ -333,6 +350,9 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
             }
         )
         if kind == "group":
+            if depth >= max_depth:
+                limits["truncated_depth"] = True
+                return
             child_transform = _compose(transform, shape)
             for child in list(getattr(shape, "shapes", [])):
                 walk(child, child_transform, slide_index, True, shape_id, group_path + [shape_id], depth + 1)
@@ -381,9 +401,14 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
         )
 
     for slide_index, slide in enumerate(prs.slides):
+        if slide_index >= max_slides or limits["truncated_shapes"]:
+            limits["truncated_slides"] = slide_index >= max_slides
+            break
         slides.append({"slide_index": slide_index})
         for shape in slide.shapes:
             walk(shape, _identity, slide_index, False, None, [])
+        if len(elements) >= max_shapes:
+            limits["truncated_shapes"] = True
 
     payload = {
         "slide_count": len(slides),
@@ -392,5 +417,6 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
         "objects": objects,
         "elements": elements,
         "tables": tables,
+        **limits,
     }
     return objects, payload

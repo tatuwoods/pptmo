@@ -16,7 +16,39 @@ class RenderError(RuntimeError):
     pass
 
 
+class RenderBusy(RenderError):
+    """Raised when the render queue is saturated; routes answer 429."""
+
+
+_queue_slots = threading.BoundedSemaphore(max(1, int(os.getenv("RENDER_QUEUE_MAX", "4"))))
+_queue_depth_lock = threading.Lock()
+_queue_depth = 0
+
+
+def _max_pages() -> int:
+    try:
+        return max(1, int(os.getenv("RENDER_MAX_PAGES", "500")))
+    except (TypeError, ValueError):
+        return 500
+
+
 def render_pptx(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> int:
+    global _queue_depth
+    # bound the wait queue: without this, a burst of requests queues behind a
+    # 180s conversion and head-of-line blocks every mutation endpoint
+    if not _queue_slots.acquire(blocking=False):
+        raise RenderBusy("render queue is full")
+    with _queue_depth_lock:
+        _queue_depth += 1
+    try:
+        return _render_pptx_locked(pptx_path, out_dir, scale)
+    finally:
+        with _queue_depth_lock:
+            _queue_depth -= 1
+        _queue_slots.release()
+
+
+def _render_pptx_locked(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     for item in out_dir.iterdir():
         if item.is_file():
@@ -69,6 +101,10 @@ def render_pptx(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> int:
     try:
         doc = pymupdf.open(pdf_path)
         page_count = doc.page_count
+        if page_count > _max_pages():
+            raise RenderError(
+                f"document has {page_count} pages, above the render cap of {_max_pages()}"
+            )
         for index, page in enumerate(doc):
             pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
             pix.save(out_dir / f"slide-{index + 1:03d}.png")

@@ -49,6 +49,12 @@ MULTIPART_SLACK_BYTES = 8 * 1024 * 1024  # multipart framing overhead beyond the
 AUTO_APPLY_DESTRUCTIVE = os.getenv("AUTO_APPLY_DESTRUCTIVE", "0").strip().lower() in ("1", "true", "yes")
 DESTRUCTIVE_ACTIONS = {"delete_textbox", "clear"}
 _LOCAL_HOST_NAMES = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "testserver", "testclient"}
+
+# bound concurrent agent chats: each one holds LLM connections for minutes
+AI_CONCURRENCY = max(1, int(os.getenv("AI_CONCURRENCY", "2")))
+_chat_slots = threading.BoundedSemaphore(AI_CONCURRENCY)
+_chat_inflight_lock = threading.Lock()
+_chat_inflight: Dict[str, int] = {}
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
@@ -228,6 +234,11 @@ async def _render_error_handler(_request, exc: render.RenderError):
     return JSONResponse(status_code=500, content={"detail": f"渲染失败：{_sanitize_detail(exc)}"})
 
 
+@app.exception_handler(render.RenderBusy)
+async def _render_busy_handler(_request, exc: render.RenderBusy):
+    return JSONResponse(status_code=429, content={"detail": "渲染队列已满，请稍后重试"})
+
+
 @app.exception_handler(FileNotFoundError)
 async def _not_found_handler(_request, exc: FileNotFoundError):
     # OS-level errors can embed absolute server paths; keep those server-side
@@ -283,21 +294,56 @@ def _sse(event: str, data: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _commit_work(
-    doc_id: str,
-    meta: Dict[str, Any],
-    work_path: Path,
-    new_version: int,
-    label: str,
-    touched: Optional[List[int]] = None,
-) -> Dict[str, Any]:
+def _prepare_commit(doc_id: str, work_path: Path, new_version: int):
+    """Render + parse the work file WITHOUT holding the doc lock.
+
+    LibreOffice can take up to 180s per document; doing this inside the lock
+    blocked delete/rename/apply/chat on the doc (and the global conversion lock
+    blocked every other doc). Returns the prepared payloads for the commit.
+    """
     render_dir = storage.render_dir(doc_id, new_version)
     try:
         page_count = render.render_pptx(work_path, render_dir, scale=RENDER_SCALE)
-        objects_payload_objs, objects_payload = parse.parse_pptx(work_path)
-        del objects_payload_objs
+        _objs, objects_payload = parse.parse_pptx(work_path)
+        del _objs
         if page_count != objects_payload.get("slide_count"):
             page_count = objects_payload.get("slide_count", page_count)
+        return render_dir, objects_payload, int(page_count)
+    except Exception:
+        shutil.rmtree(render_dir, ignore_errors=True)
+        raise  # caller owns work_path cleanup
+
+
+def _discard_prepared(work_path: Path, render_dir: Optional[Path]) -> None:
+    try:
+        work_path.unlink()
+    except OSError:
+        pass
+    if render_dir is not None:
+        shutil.rmtree(render_dir, ignore_errors=True)
+
+
+def _commit_prepared(
+    doc_id: str,
+    new_version: int,
+    label: str,
+    work_path: Path,
+    render_dir: Path,
+    objects_payload: Dict[str, Any],
+    page_count: int,
+    expected_version: Optional[int] = None,
+    touched: Optional[List[int]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Take the doc lock, re-check the optimistic version, commit, and serialize.
+
+    Raises PatchConflict (cleaning up the prepared artifacts) when the doc moved
+    while rendering. Returns (committed_meta, objects_payload).
+    """
+    with storage.lock_for(doc_id):
+        meta = storage.load_meta(doc_id)
+        if expected_version is not None and int(meta.get("version", 0)) != int(expected_version):
+            _discard_prepared(work_path, render_dir)
+            raise edits.PatchConflict("文档已经更新，请刷新后再试")
         committed = storage.commit_work(
             doc_id=doc_id,
             meta=meta,
@@ -308,13 +354,10 @@ def _commit_work(
             slide_size=objects_payload.get("slide_size_emu") or meta.get("slide_size_emu"),
             objects_payload=objects_payload,
         )
-    except Exception:
-        try:
-            work_path.unlink()
-        except OSError:
-            pass
-        shutil.rmtree(render_dir, ignore_errors=True)
-        raise
+    return committed, objects_payload
+
+
+def _commit_result(committed: Dict[str, Any], objects_payload: Dict[str, Any], touched: Optional[List[int]] = None) -> Dict[str, Any]:
     result = _serialize(committed, objects_payload)
     if touched is not None:
         result["touched_slides"] = sorted(set(touched))
@@ -349,6 +392,7 @@ def _finalize_chat(
     apply_error: Optional[str] = None
     applied = False
 
+    # ---- phase 1 (short lock): persist the message, decide eligibility ----
     with storage.lock_for(doc_id):
         meta = storage.load_meta(doc_id)
         assistant_message = {
@@ -373,6 +417,7 @@ def _finalize_chat(
         }
         storage.append_messages(doc_id, [assistant_message])
 
+        eligible = False
         if auto_apply and operations:
             if int(meta.get("version", 0)) != int(start_version):
                 apply_error = "文档在对话期间已更新，操作已暂存，请刷新后重试"
@@ -383,93 +428,116 @@ def _finalize_chat(
                 # review path unless explicitly enabled in .env
                 apply_error = "包含删除/清空类操作，已转为手动确认；请在操作卡片中检查后应用"
             else:
-                new_version, _ = storage.next_version_id(meta)
-                work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
-                applied_doc: Optional[Dict[str, Any]] = None
-                try:
-                    touched = edits.apply_patches_to_file(
-                        storage.current_path(doc_id), work_path, operations
-                    )
-                    applied_doc = _commit_work(
-                        doc_id,
-                        meta,
-                        work_path,
-                        new_version,
-                        f"AI 对话改稿 · {len(operations)} 项",
-                        touched=sorted(touched),
-                    )
-                except Exception as exc:
-                    apply_error = str(exc) or "应用操作失败"
-                    try:
-                        work_path.unlink()
-                    except OSError:
-                        pass
-                if applied_doc is not None:
-                    applied = True
-                    apply_message = {
-                        "id": uuid.uuid4().hex[:12],
-                        "role": "system",
-                        "content": (
-                            f"AI 对话改稿 · 已应用 {len(operations)} 条修改 · "
-                            f"保存为 {applied_doc['version_id']}"
-                        ),
-                        "at": storage.now_iso(),
-                        "kind": "apply",
-                        "version": applied_doc["version_id"],
-                        "patch_count": len(operations),
-                        "mode": "agent",
-                    }
-                    try:
-                        messages = storage.load_messages(doc_id)
-                        for item in messages:
-                            if item.get("id") == assistant_id:
-                                item["applied_version"] = applied_doc["version_id"]
-                        messages.append(apply_message)
-                        storage.save_messages(doc_id, messages)
-                        messages = messages[-120:]
-                        applied_doc["messages"] = messages
-                        applied_doc["message_count"] = len(messages)
-                    except Exception:
-                        log.exception("append apply message failed for %s", doc_id)
-                    applied_event = {
-                        "version_id": applied_doc.get("version_id"),
-                        "version": applied_doc.get("version"),
-                        "operation_count": len(operations),
-                        "operations_applied": len(operations),
-                        "touched_slides": applied_doc.get("touched_slides") or [],
-                        "doc": applied_doc,
-                        "message_id": apply_message["id"],
-                        "message_count": int(applied_doc.get("message_count") or 0),
-                        "assistant_message_id": assistant_id,
-                    }
+                eligible = True
 
-        meta_after = storage.load_meta(doc_id)
-        messages_after = storage.load_messages(doc_id)
-        version_id = _version_id(meta_after)
-        fields: Dict[str, Any] = {
-            "message_id": assistant_id,
-            "at": assistant_at,
-            "content": content,
-            "summary": summary,
-            "reply": reply,
-            "question": question,
-            "trace": trace,
-            "operations": operations,
-            "version_id": version_id,
-            "base_version": int(start_version),
-            "message_count": len(messages_after),
-            "applied": applied,
-            "error": error,
-            "apply_error": apply_error,
-            "mode": "agent",
-            "model": model,
-            "auto_apply": bool(auto_apply),
-            "steps": int(done_data.get("steps") or 0),
-            "finished": bool(done_data.get("finished")),
-        }
-        if applied_event is not None:
-            fields["applied_version_id"] = applied_event["version_id"]
-            fields["touched_slides"] = applied_event["touched_slides"]
+    # ---- phase 2 (no lock): apply edits to the work file, render, parse ----
+    prepared: Optional[Tuple[int, Path, Path, Dict[str, Any], int, List[int]]] = None
+    if eligible:
+        new_version = int(start_version) + 1
+        work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+        render_dir: Optional[Path] = None
+        try:
+            touched = edits.apply_patches_to_file(
+                storage.current_path(doc_id), work_path, operations
+            )
+            render_dir, objects_payload, page_count = _prepare_commit(doc_id, work_path, new_version)
+            prepared = (new_version, work_path, render_dir, objects_payload, page_count, sorted(touched))
+        except Exception as exc:
+            try:
+                work_path.unlink()
+            except OSError:
+                pass
+            if isinstance(exc, render.RenderBusy):
+                apply_error = "渲染队列已满，操作已暂存，请稍后手动应用"
+            else:
+                apply_error = str(exc) or "应用操作失败"
+
+    # ---- phase 3 (short lock): re-check version, commit, mark applied ----
+    if prepared is not None:
+        new_version, work_path, render_dir, objects_payload, page_count, touched = prepared
+        with storage.lock_for(doc_id):
+            meta = storage.load_meta(doc_id)
+            if int(meta.get("version", 0)) != int(start_version):
+                _discard_prepared(work_path, render_dir)
+                apply_error = "文档在对话期间已更新，操作已暂存，请刷新后重试"
+            else:
+                committed = storage.commit_work(
+                    doc_id=doc_id,
+                    meta=meta,
+                    work_path=work_path,
+                    new_version=new_version,
+                    label=f"AI 对话改稿 · {len(operations)} 项",
+                    slide_count=int(page_count),
+                    slide_size=objects_payload.get("slide_size_emu")
+                    or meta.get("slide_size_emu"),
+                    objects_payload=objects_payload,
+                )
+                applied = True
+                applied_doc = _commit_result(committed, objects_payload, touched)
+                apply_message = {
+                    "id": uuid.uuid4().hex[:12],
+                    "role": "system",
+                    "content": (
+                        f"AI 对话改稿 · 已应用 {len(operations)} 条修改 · "
+                        f"保存为 {applied_doc['version_id']}"
+                    ),
+                    "at": storage.now_iso(),
+                    "kind": "apply",
+                    "version": applied_doc["version_id"],
+                    "patch_count": len(operations),
+                    "mode": "agent",
+                }
+                try:
+                    messages = storage.load_messages(doc_id)
+                    for item in messages:
+                        if item.get("id") == assistant_id:
+                            item["applied_version"] = applied_doc["version_id"]
+                    messages.append(apply_message)
+                    storage.save_messages(doc_id, messages)
+                    messages = messages[-120:]
+                    applied_doc["messages"] = messages
+                    applied_doc["message_count"] = len(messages)
+                except Exception:
+                    log.exception("append apply message failed for %s", doc_id)
+                applied_event = {
+                    "version_id": applied_doc.get("version_id"),
+                    "version": applied_doc.get("version"),
+                    "operation_count": len(operations),
+                    "operations_applied": len(operations),
+                    "touched_slides": applied_doc.get("touched_slides") or [],
+                    "doc": applied_doc,
+                    "message_id": apply_message["id"],
+                    "message_count": int(applied_doc.get("message_count") or 0),
+                    "assistant_message_id": assistant_id,
+                }
+
+    meta_after = storage.load_meta(doc_id)
+    messages_after = storage.load_messages(doc_id)
+    version_id = _version_id(meta_after)
+    fields: Dict[str, Any] = {
+        "message_id": assistant_id,
+        "at": assistant_at,
+        "content": content,
+        "summary": summary,
+        "reply": reply,
+        "question": question,
+        "trace": trace,
+        "operations": operations,
+        "version_id": version_id,
+        "base_version": int(start_version),
+        "message_count": len(messages_after),
+        "applied": applied,
+        "error": error,
+        "apply_error": apply_error,
+        "mode": "agent",
+        "model": model,
+        "auto_apply": bool(auto_apply),
+        "steps": int(done_data.get("steps") or 0),
+        "finished": bool(done_data.get("finished")),
+    }
+    if applied_event is not None:
+        fields["applied_version_id"] = applied_event["version_id"]
+        fields["touched_slides"] = applied_event["touched_slides"]
     return applied_event, apply_error, fields
 
 
@@ -523,6 +591,16 @@ def upload_document(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail=f"无法解析 PPTX：{exc}") from exc
         if not parsed.get("slide_count"):
             raise HTTPException(status_code=400, detail="PPTX 中没有幻灯片")
+        if parsed.get("truncated_slides"):
+            raise HTTPException(
+                status_code=413,
+                detail=f"页数超过解析上限（{os.getenv('PARSE_MAX_SLIDES', '500')} 页），已拒绝",
+            )
+        if parsed.get("truncated_shapes"):
+            raise HTTPException(
+                status_code=413,
+                detail=f"对象数超过解析上限（{os.getenv('PARSE_MAX_SHAPES', '5000')} 个），已拒绝",
+            )
         meta = storage.create_doc(
             file_name=safe_name,
             content=data,
@@ -608,6 +686,15 @@ def chat(doc_id: str, body: ChatIn):
         slide_index = requested_number
     scope_label = f"第 {slide_index + 1} 页" if scope == "current" else "整份文稿"
 
+    # concurrency gates before anything is persisted
+    if not _chat_slots.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="AI 并发已满，请稍后再试")
+    with _chat_inflight_lock:
+        if _chat_inflight.get(doc_id, 0) >= 1:
+            _chat_slots.release()
+            raise HTTPException(status_code=429, detail="该文档已有对话进行中，请等待完成")
+        _chat_inflight[doc_id] = _chat_inflight.get(doc_id, 0) + 1
+
     user_id = uuid.uuid4().hex[:12]
     user_at = storage.now_iso()
     with storage.lock_for(doc_id):
@@ -646,7 +733,7 @@ def chat(doc_id: str, body: ChatIn):
     def emit(name: str, data: Dict[str, Any]) -> None:
         events.put((name, data))
 
-    def worker() -> None:
+    def _chat_worker() -> None:
         try:
             state["result"] = agent.run_stream(
                 emit,
@@ -749,8 +836,15 @@ def chat(doc_id: str, body: ChatIn):
             emit("done", result)
         finally:
             events.put(None)
+            with _chat_inflight_lock:
+                remaining = _chat_inflight.get(doc_id, 1) - 1
+                if remaining <= 0:
+                    _chat_inflight.pop(doc_id, None)
+                else:
+                    _chat_inflight[doc_id] = remaining
+            _chat_slots.release()
 
-    threading.Thread(target=worker, daemon=True, name=f"agent-{doc_id[:8]}").start()
+    threading.Thread(target=_chat_worker, daemon=True, name=f"agent-{doc_id[:8]}").start()
 
     def event_stream():
         # Pure relay: all state transitions (applying/applied/done) are emitted
@@ -777,89 +871,130 @@ def chat(doc_id: str, body: ChatIn):
 @app.post("/api/docs/{doc_id}/apply")
 def apply(doc_id: str, body: ApplyIn):
     label = (body.label or "编辑").strip()[:80] or "编辑"
+    # ---- phase 1 (short lock): snapshot the optimistic base ----
     with storage.lock_for(doc_id):
         meta = storage.load_meta(doc_id)
         if body.base_version is not None and int(body.base_version) != int(meta.get("version", 0)):
             raise edits.PatchConflict("文档已经更新，请刷新后再试")
+        entry_version = int(meta.get("version", 0))
         new_version, _ = storage.next_version_id(meta)
-        work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+
+    # ---- phase 2 (no lock): apply patches, render, parse ----
+    work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+    render_dir: Optional[Path] = None
+    try:
+        touched = edits.apply_patches_to_file(
+            storage.current_path(doc_id), work_path, body.patches
+        )
+        render_dir, objects_payload, page_count = _prepare_commit(doc_id, work_path, new_version)
+    except Exception:
         try:
-            touched = edits.apply_patches_to_file(
-                storage.current_path(doc_id), work_path, body.patches
+            work_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    # ---- phase 3 (short lock): re-check base, commit, record messages ----
+    try:
+        with storage.lock_for(doc_id):
+            committed, objects_payload = _commit_prepared_locked(
+                doc_id, new_version, label, work_path, render_dir, objects_payload,
+                page_count, expected_version=entry_version,
             )
-            result = _commit_work(
-                doc_id, meta, work_path, new_version, label, touched=sorted(touched)
-            )
-        except Exception:
-            # a rejected patch used to leak the work file; _commit_work cleans
-            # up only for failures that happen inside it
-            try:
-                work_path.unlink()
-            except OSError:
-                pass
-            raise
-        # Mark exactly the message the patches came from. The legacy
-        # label-prefix scan marked the newest un-applied assistant message even
-        # when the user applied a different (or partial) set, silently
-        # un-restoring ops that were never applied.
-        mark_id = (body.assistant_message_id or "").strip()
-        if mark_id or label.startswith("AI 改稿"):
-            old_messages = storage.load_messages(doc_id)
-            target = None
-            if mark_id:
-                candidate = next(
-                    (m for m in old_messages if m.get("id") == mark_id), None
-                )
-                if candidate is not None and candidate.get("role") == "assistant":
-                    target = candidate
-            else:
-                target = next(
-                    (
-                        m
-                        for m in reversed(old_messages)
-                        if m.get("role") == "assistant"
-                        and m.get("operations")
-                        and not m.get("applied_version")
-                    ),
-                    None,
-                )
-            if target is not None and not target.get("applied_version"):
-                op_ids = {
-                    str(op.get("shape_id"))
-                    for op in (target.get("operations") or [])
-                    if isinstance(op, dict) and op.get("shape_id")
-                }
-                submitted_ids = {
-                    str(p.get("shape_id"))
-                    for p in body.patches
-                    if isinstance(p, dict) and p.get("shape_id")
-                }
-                if op_ids and op_ids <= submitted_ids:
-                    target["applied_version"] = result["version_id"]
-                    target["content"] = (
-                        f"{target.get('content') or ''}（已应用为 {result['version_id']}）"
+            result = _commit_result(committed, objects_payload, sorted(touched))
+            # Mark exactly the message the patches came from. The legacy
+            # label-prefix scan marked the newest un-applied assistant message even
+            # when the user applied a different (or partial) set, silently
+            # un-restoring ops that were never applied.
+            mark_id = (body.assistant_message_id or "").strip()
+            if mark_id or label.startswith("AI 改稿"):
+                old_messages = storage.load_messages(doc_id)
+                target = None
+                if mark_id:
+                    candidate = next(
+                        (m for m in old_messages if m.get("id") == mark_id), None
                     )
+                    if candidate is not None and candidate.get("role") == "assistant":
+                        target = candidate
                 else:
-                    target.setdefault("partial_applies", []).append(
-                        {
-                            "version_id": result["version_id"],
-                            "applied_shape_ids": sorted(op_ids & submitted_ids),
-                        }
+                    target = next(
+                        (
+                            m
+                            for m in reversed(old_messages)
+                            if m.get("role") == "assistant"
+                            and m.get("operations")
+                            and not m.get("applied_version")
+                        ),
+                        None,
                     )
-                storage.save_messages(doc_id, old_messages)
-        message = {
-            "id": uuid.uuid4().hex[:12],
-            "role": "assistant" if label.startswith("AI 改稿") else "system",
-            "content": f"{label} · 已应用 {len(body.patches)} 条修改 · 保存为 {result['version_id']}",
-            "at": storage.now_iso(),
-            "kind": "apply",
-            "version": result["version_id"],
-            "patch_count": len(body.patches),
-        }
-        result["messages"] = storage.append_messages(doc_id, [message])
-        result["message_count"] = len(result["messages"])
+                if target is not None and not target.get("applied_version"):
+                    op_ids = {
+                        str(op.get("shape_id"))
+                        for op in (target.get("operations") or [])
+                        if isinstance(op, dict) and op.get("shape_id")
+                    }
+                    submitted_ids = {
+                        str(p.get("shape_id"))
+                        for p in body.patches
+                        if isinstance(p, dict) and p.get("shape_id")
+                    }
+                    if op_ids and op_ids <= submitted_ids:
+                        target["applied_version"] = result["version_id"]
+                        target["content"] = (
+                            f"{target.get('content') or ''}（已应用为 {result['version_id']}）"
+                        )
+                    else:
+                        target.setdefault("partial_applies", []).append(
+                            {
+                                "version_id": result["version_id"],
+                                "applied_shape_ids": sorted(op_ids & submitted_ids),
+                            }
+                        )
+                    storage.save_messages(doc_id, old_messages)
+            message = {
+                "id": uuid.uuid4().hex[:12],
+                "role": "assistant" if label.startswith("AI 改稿") else "system",
+                "content": f"{label} · 已应用 {len(body.patches)} 条修改 · 保存为 {result['version_id']}",
+                "at": storage.now_iso(),
+                "kind": "apply",
+                "version": result["version_id"],
+                "patch_count": len(body.patches),
+            }
+            result["messages"] = storage.append_messages(doc_id, [message])
+            result["message_count"] = len(result["messages"])
+    except edits.PatchConflict:
+        _discard_prepared(work_path, render_dir)
+        raise
     log.info("applied %d patches to %s -> v%d", len(body.patches), doc_id, new_version)
     return result
+
+
+def _commit_prepared_locked(
+    doc_id: str,
+    new_version: int,
+    label: str,
+    work_path: Path,
+    render_dir: Path,
+    objects_payload: Dict[str, Any],
+    page_count: int,
+    expected_version: Optional[int] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Commit prepared artifacts; caller already holds the doc lock.
+    Raises PatchConflict on version drift (caller cleans up via _discard_prepared)."""
+    meta = storage.load_meta(doc_id)
+    if expected_version is not None and int(meta.get("version", 0)) != int(expected_version):
+        raise edits.PatchConflict("文档已经更新，请刷新后再试")
+    committed = storage.commit_work(
+        doc_id=doc_id,
+        meta=meta,
+        work_path=work_path,
+        new_version=new_version,
+        label=label,
+        slide_count=int(page_count),
+        slide_size=objects_payload.get("slide_size_emu") or meta.get("slide_size_emu"),
+        objects_payload=objects_payload,
+    )
+    return committed, objects_payload
 
 
 @app.get("/api/docs/{doc_id}/versions")
@@ -887,30 +1022,46 @@ def list_versions(doc_id: str):
 def restore_version(doc_id: str, version_id: str):
     if not re.fullmatch(r"v\d+", version_id or ""):
         raise HTTPException(status_code=400, detail="invalid version id")
+    # ---- phase 1 (short lock): allocate the version id ----
     with storage.lock_for(doc_id):
         meta = storage.load_meta(doc_id)
         source = storage.version_file(doc_id, version_id)
         new_version, _ = storage.next_version_id(meta)
-        work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+
+    # ---- phase 2 (no lock): copy + render + parse ----
+    work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+    render_dir: Optional[Path] = None
+    try:
+        shutil.copy2(source, work_path)
+        render_dir, objects_payload, page_count = _prepare_commit(doc_id, work_path, new_version)
+    except Exception:
         try:
-            shutil.copy2(source, work_path)
-            result = _commit_work(doc_id, meta, work_path, new_version, f"恢复 {version_id}")
-        except Exception:
-            try:
-                work_path.unlink()
-            except OSError:
-                pass
-            raise
-        message = {
-            "id": uuid.uuid4().hex[:12],
-            "role": "system",
-            "content": f"恢复了 {version_id}，并保存为 {result['version_id']}",
-            "at": storage.now_iso(),
-            "kind": "restore",
-            "version": result["version_id"],
-        }
-        result["messages"] = storage.append_messages(doc_id, [message])
-        result["message_count"] = len(result["messages"])
+            work_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    # ---- phase 3 (short lock): commit + record ----
+    try:
+        with storage.lock_for(doc_id):
+            committed, objects_payload = _commit_prepared_locked(
+                doc_id, new_version, f"恢复 {version_id}", work_path, render_dir,
+                objects_payload, page_count,
+            )
+            result = _commit_result(committed, objects_payload)
+            message = {
+                "id": uuid.uuid4().hex[:12],
+                "role": "system",
+                "content": f"恢复了 {version_id}，并保存为 {result['version_id']}",
+                "at": storage.now_iso(),
+                "kind": "restore",
+                "version": result["version_id"],
+            }
+            result["messages"] = storage.append_messages(doc_id, [message])
+            result["message_count"] = len(result["messages"])
+    except edits.PatchConflict:
+        _discard_prepared(work_path, render_dir)
+        raise
     return result
 
 

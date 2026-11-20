@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import threading
@@ -204,6 +205,34 @@ def next_version_id(meta: Dict[str, Any]) -> tuple[int, str]:
     return version, f"v{version}"
 
 
+def _max_versions() -> int:
+    try:
+        return max(2, int(os.getenv("MAX_VERSIONS", "50")))
+    except (TypeError, ValueError):
+        return 50
+
+
+def _prune_versions(doc_id: str, meta: Dict[str, Any]) -> None:
+    """Keep only the newest MAX_VERSIONS entries; drop their pptx + render dirs.
+
+    Without pruning, every apply stores a full pptx copy plus 2 PNGs per slide
+    forever — an easy path to disk exhaustion on long-lived documents."""
+    versions = meta.get("versions") or []
+    cap = _max_versions()
+    if len(versions) <= cap:
+        return
+    for old in versions[:-cap]:
+        old_id = str(old.get("id") or "")
+        if not re.fullmatch(r"v\d+", old_id):
+            continue
+        try:
+            (versions_dir(doc_id) / f"{old_id}.pptx").unlink(missing_ok=True)
+        except OSError:
+            continue
+        shutil.rmtree(render_dir(doc_id, int(old_id[1:])), ignore_errors=True)
+    meta["versions"] = versions[-cap:]
+
+
 def commit_work(
     doc_id: str,
     meta: Dict[str, Any],
@@ -236,6 +265,7 @@ def commit_work(
             "size": current_path(doc_id).stat().st_size,
         }
     )
+    _prune_versions(doc_id, meta)
     save_objects(doc_id, objects_payload)
     save_meta(doc_id, meta)
     return meta

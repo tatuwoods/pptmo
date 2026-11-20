@@ -439,11 +439,28 @@ function renderThumbs() {
     dom.thumbs.innerHTML = "";
     return;
   }
+  const existing = dom.thumbs.querySelectorAll(".thumb");
+  if (existing.length === state.doc.slide_count) {
+    // same deck shape: patch image sources only — rebuilding the DOM would
+    // re-download every thumbnail and re-attach listeners on each save
+    existing.forEach((button) => {
+      const index = Number(button.dataset.slide);
+      const img = button.querySelector("img");
+      if (!img) return;
+      const url = imageUrl(index, { thumb: true });
+      if (img.dataset.url !== url) {
+        img.src = url;
+        img.dataset.url = url;
+      }
+    });
+    return;
+  }
   const parts = [];
   for (let index = 0; index < state.doc.slide_count; index += 1) {
+    const url = imageUrl(index, { thumb: true });
     parts.push(`
       <button class="thumb" type="button" data-slide="${index}" aria-label="第 ${index + 1} 页">
-        <span class="thumb-frame"><img loading="lazy" src="${imageUrl(index, { thumb: true })}" alt=""></span>
+        <span class="thumb-frame"><img loading="lazy" src="${url}" data-url="${url}" alt=""></span>
         <span class="thumb-num">${index + 1}</span>
       </button>`);
   }
@@ -983,15 +1000,19 @@ function startBoxGesture(event, obj, box, mode) {
   const onMove = (moveEvent) => {
     const dx = moveEvent.clientX - startX;
     const dy = moveEvent.clientY - startY;
-    if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+    if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
     if (mode === "move") {
       current.left = clamp(orig.left + dx, 0, stageWidth - orig.width);
       current.top = clamp(orig.top + dy, 0, stageHeight - orig.height);
       box.style.left = `${current.left}px`;
       box.style.top = `${current.top}px`;
     } else {
-      current.width = clamp(orig.width + dx, 10, stageWidth - orig.left);
-      current.height = clamp(orig.height + dy, 10, stageHeight - orig.top);
+      // clamp the on-screen box to the same min size the commit enforces, so
+      // the re-rendered overlay doesn't jump bigger than what was positioned
+      const minPxW = Math.max(6, MIN_TEXT_EMU * stageWidth / Math.max(1, size.width));
+      const minPxH = Math.max(6, MIN_TEXT_EMU * stageHeight / Math.max(1, size.height));
+      current.width = clamp(orig.width + dx, minPxW, stageWidth - orig.left);
+      current.height = clamp(orig.height + dy, minPxH, stageHeight - orig.top);
       box.style.width = `${current.width}px`;
       box.style.height = `${current.height}px`;
     }
@@ -1012,8 +1033,10 @@ function startBoxGesture(event, obj, box, mode) {
       w: Math.max(MIN_TEXT_EMU, Math.round(current.width * pxPerEmuX)),
       h: Math.max(MIN_TEXT_EMU, Math.round(current.height * pxPerEmuY)),
     };
+    // ~20000 EMU (≈0.055 cm): stray 1px jitter must not trigger a full
+    // LibreOffice re-render of every page
     const changed = ["x", "y", "w", "h"].some(
-      (key) => Math.abs(Number(nextBbox[key]) - Number(bbox[key] || 0)) > 500
+      (key) => Math.abs(Number(nextBbox[key]) - Number(bbox[key] || 0)) > 20000
     );
     if (!changed) return;
     const patch = {
