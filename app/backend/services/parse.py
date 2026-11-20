@@ -361,6 +361,7 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
             try:
                 table_cells, table_meta = _table_cells(shape, slide_index, shape_id, bbox, slide_size)
             except Exception:
+                limits["tables_failed"] = limits.get("tables_failed", 0) + 1
                 return
             for cell in table_cells:
                 cell["shape_index"] = current_seq
@@ -417,6 +418,6 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
         "objects": objects,
         "elements": elements,
         "tables": tables,
-        **limits,
     }
+    payload.update({key: value for key, value in limits.items() if value})
     return objects, payload

@@ -508,3 +508,122 @@ def test_chat_slot_exhaustion_429(client, uploaded_doc, monkeypatch):
     r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/chat", json={"message": "改标题"})
     assert r.status_code == 429
     assert "AI 并发已满" in r.json()["detail"]
+
+import pytest
+
+from services import edits
+
+
+def _objects_of(demo_pptx):
+    from services import parse as parse_mod
+
+    objects, _payload = parse_mod.parse_pptx(str(demo_pptx))
+    return objects
+
+
+# ---------- v0.1.4: atomicity, reconciliation, pending ops, robustness ----------
+
+def test_reconcile_meta_adopts_orphaned_version(client, uploaded_doc):
+    import storage as storage_mod
+    doc_id = uploaded_doc["doc_id"]
+    # simulate a crash after the version file write but before the meta save
+    current = storage_mod.current_path(doc_id)
+    storage_mod.versions_dir(doc_id).joinpath("v9.pptx.tmp").unlink(missing_ok=True)
+    (storage_mod.versions_dir(doc_id) / "v9.pptx").write_bytes(current.read_bytes())
+    meta = storage_mod.reconcile_meta(doc_id)
+    assert meta["version"] == 9
+    assert [v["id"] for v in meta["versions"]][-1] == "v9"
+    assert any(v["label"] == "recovered" for v in meta["versions"])
+    # restored doc is consistent afterwards
+    doc = client.get(f"/api/docs/{doc_id}").json()
+    assert doc["version"] == 9
+
+
+def test_pending_operations_survives_message_window(client, uploaded_doc):
+    doc_id = uploaded_doc["doc_id"]
+    doc = client.get(f"/api/docs/{doc_id}").json()
+    op = _op_for_text(doc, "本季度完成")
+    message = _stage_assistant_message(doc_id, [op])
+    # flood the trail past the 60-message API window
+    import storage as storage_mod
+    fillers = [
+        {"id": f"f{i:03}", "role": "user", "content": f"填充消息 {i}", "kind": "chat"}
+        for i in range(80)
+    ]
+    storage_mod.append_messages(doc_id, fillers)
+    fresh = client.get(f"/api/docs/{doc_id}").json()
+    # ops no longer in the trimmed message list, but pending_operations survives
+    assert all(m.get("id") != message["id"] for m in fresh["messages"])
+    pending = fresh["pending_operations"]
+    assert pending and pending["message_id"] == message["id"]
+    assert pending["operations"][0]["shape_id"] == op["shape_id"]
+
+
+def test_restore_base_version_conflict(client, uploaded_doc):
+    doc_id = uploaded_doc["doc_id"]
+    r = client.post(f"/api/docs/{doc_id}/versions/v0/restore", json={"base_version": 42})
+    assert r.status_code == 409
+    r = client.post(f"/api/docs/{doc_id}/versions/v0/restore", json={"base_version": 0})
+    assert r.status_code == 200
+
+
+def test_bbox_zero_width_rejected(demo_pptx, tmp_path):
+    objects = _objects_of(demo_pptx)
+    target = next(o for o in objects if "本季度完成" in o["text"])
+    with pytest.raises(edits.PatchError, match="width must be positive"):
+        edits.apply_patches_to_file(
+            demo_pptx, tmp_path / "o.pptx",
+            [{"action": "geometry", "shape_id": target["shape_id"],
+              "bbox_emu": {"x": 1000000, "y": 1000000, "w": 0, "h": 500000}}],
+        )
+
+
+def test_slide_index_mismatch_rejected(demo_pptx, tmp_path):
+    objects = _objects_of(demo_pptx)
+    target = next(o for o in objects if "本季度完成" in o["text"])
+    with pytest.raises(edits.PatchError, match="does not match"):
+        edits.apply_patches_to_file(
+            demo_pptx, tmp_path / "o.pptx",
+            [{"action": "edit", "shape_id": target["shape_id"], "after": "x",
+              "slide_index": 1}],  # target lives on slide 0
+        )
+
+
+def test_trim_messages_keeps_json_valid():
+    import json as _json
+    from services import agent as agent_mod
+    observation = {"slides": [{"objects": [{"text": "长" * 9000}, {"text": "y"}]}] * 3}
+    long_content = _json.dumps(observation, ensure_ascii=False)
+    trimmed = agent_mod._trim_messages([
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        {"role": "user", "content": long_content},
+    ])
+    content = trimmed[-1]["content"]
+    assert len(content) <= 12000
+    # clipped content must still be valid JSON the model can read
+    parsed = _json.loads(content)
+    assert isinstance(parsed, dict)
+
+
+def test_streaming_done_sentinel():
+    from services import streaming as streaming_mod
+
+    class FakeResponse:
+        headers = {"content-type": "text/event-stream"}
+        def __init__(self, lines):
+            self._lines = lines
+        def iter_lines(self, decode_unicode=False):
+            return iter(self._lines)
+        def close(self):
+            pass
+
+    lines = [
+        b'data: {"choices":[{"delta":{"content":"A"}}]}',
+        b"",
+        b"data: [DONE]",  # OpenAI-style sentinel (was previously unmatched)
+        b'data: {"choices":[{"delta":{"content":"never"}}]}',  # must not arrive
+    ]
+    got = []
+    content = streaming_mod._read_sse(FakeResponse(lines), on_token=got.append)
+    assert content == "A"

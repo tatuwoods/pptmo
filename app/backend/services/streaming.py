@@ -92,7 +92,7 @@ def _read_sse(response, on_token):
         if not line.startswith("data:"):
             continue
         data = line[5:].strip()
-        if data == "DONE":
+        if data in ("DONE", "[DONE]"):
             break
         try:
             obj = json.loads(data)

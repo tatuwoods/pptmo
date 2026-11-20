@@ -245,8 +245,14 @@ def commit_work(
 ) -> Dict[str, Any]:
     """把已经渲染成功的 work 文件提交为当前版本。"""
     version_id = f"v{new_version}"
-    shutil.copy2(work_path, current_path(doc_id))
-    shutil.copy2(work_path, versions_dir(doc_id) / f"{version_id}.pptx")
+    # atomic promotion: a concurrent download of current.pptx used to be able
+    # to stream a torn copy while copy2 truncated+rewrote it in place
+    tmp_version = versions_dir(doc_id) / f"{version_id}.pptx.tmp"
+    tmp_current = current_path(doc_id).with_name("current.pptx.tmp")
+    shutil.copy2(work_path, tmp_version)
+    shutil.copy2(work_path, tmp_current)
+    os.replace(tmp_version, versions_dir(doc_id) / f"{version_id}.pptx")
+    os.replace(tmp_current, current_path(doc_id))
     try:
         work_path.unlink()
     except OSError:
@@ -269,6 +275,72 @@ def commit_work(
     save_objects(doc_id, objects_payload)
     save_meta(doc_id, meta)
     return meta
+
+
+def reconcile_meta(doc_id: str) -> Dict[str, Any]:
+    """Repair version drift: if versions/vN.pptx exists above meta.version
+    (e.g. a crash between file write and meta save), adopt it.
+
+    meta.json is written last during commit, so a crash can leave version
+    files the metadata never references; the next commit would then reuse vN
+    and clobber it. Adopting the orphan keeps history monotonic."""
+    meta = load_meta(doc_id)
+    current = int(meta.get("version", 0))
+    max_found = current
+    pattern = re.compile(r"v(\d+)\.pptx$")
+    for path in versions_dir(doc_id).glob("v*.pptx"):
+        match = pattern.fullmatch(path.name)
+        if match:
+            max_found = max(max_found, int(match.group(1)))
+    if max_found > current:
+        versions = meta.setdefault("versions", [])
+        known = {str(v.get("id")) for v in versions}
+        for number in range(current + 1, max_found + 1):
+            candidate = f"v{number}"
+            if candidate in known:
+                continue
+            candidate_path = versions_dir(doc_id) / f"{candidate}.pptx"
+            if not candidate_path.exists():
+                continue  # gapped orphan: adopt what exists, skip holes
+            versions.append(
+                {
+                    "id": candidate,
+                    "label": "recovered",
+                    "created_at": now_iso(),
+                    "size": candidate_path.stat().st_size,
+                }
+            )
+        versions.sort(key=lambda item: int(str(item.get("id"))[1:]))
+        meta["version"] = max_found
+        meta["updated_at"] = now_iso()
+        save_meta(doc_id, meta)
+    return meta
+
+
+def reconcile_all() -> int:
+    """Run reconcile_meta over every doc; returns the number repaired."""
+    ensure_dirs()
+    repaired = 0
+    for path in DOCS_DIR.iterdir():
+        if not path.is_dir() or not _DOC_ID_RE.fullmatch(path.name):
+            continue
+        try:
+            meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        try:
+            before = int(meta.get("version", 0))
+            if int(reconcile_meta(path.name).get("version", 0)) != before:
+                repaired += 1
+        except (OSError, ValueError):
+            continue
+    return repaired
+
+
+def release_lock(doc_id: str) -> None:
+    """Drop a doc's lock entry (used when a create fails and rolls back)."""
+    with _locks_guard:
+        _locks.pop(doc_id, None)
 
 
 def version_file(doc_id: str, version_id: str) -> Path:

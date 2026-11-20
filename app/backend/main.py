@@ -213,6 +213,21 @@ class RenameIn(BaseModel):
     title: str = Field(min_length=1, max_length=100)
 
 
+class RestoreIn(BaseModel):
+    base_version: Optional[int] = None
+
+
+@app.on_event("startup")
+def _startup_reconcile() -> None:
+    """Adopt orphaned version files left by a crash between pptx and meta writes."""
+    try:
+        repaired = storage.reconcile_all()
+        if repaired:
+            log.warning("startup: reconciled %d doc(s) with orphaned version files", repaired)
+    except Exception:
+        log.exception("startup reconciliation failed")
+
+
 @app.exception_handler(edits.PatchConflict)
 async def _conflict_handler(_request, exc: edits.PatchConflict):
     return JSONResponse(status_code=409, content={"detail": _sanitize_detail(exc)})
@@ -255,6 +270,39 @@ def _version_id(meta: Dict[str, Any]) -> str:
     return f"v{int(meta.get('version', 0))}"
 
 
+def _pending_from_messages(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Newest un-applied assistant operations, minus any already applied through
+    partial applies. Served explicitly so staged ops survive message trimming —
+    they used to silently disappear once chat history scrolled past the window."""
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        operations = message.get("operations")
+        if not isinstance(operations, list) or not operations:
+            continue
+        if message.get("applied_version"):
+            return None
+        applied_ids = {
+            str(sid)
+            for apply_record in (message.get("partial_applies") or [])
+            if isinstance(apply_record, dict)
+            for sid in (apply_record.get("applied_shape_ids") or [])
+        }
+        remaining = [
+            op
+            for op in operations
+            if not (isinstance(op, dict) and op.get("shape_id") and str(op["shape_id"]) in applied_ids)
+        ]
+        if not remaining:
+            return None
+        return {
+            "message_id": message.get("id"),
+            "base_version": message.get("base_version"),
+            "operations": remaining,
+        }
+    return None
+
+
 def _serialize(meta: Dict[str, Any], objects_payload: Dict[str, Any]) -> Dict[str, Any]:
     doc_id = meta["doc_id"]
     version = int(meta.get("version", 0))
@@ -278,6 +326,7 @@ def _serialize(meta: Dict[str, Any], objects_payload: Dict[str, Any]) -> Dict[st
         "download_url": f"/api/docs/{doc_id}/download",
         "messages": messages[-60:],
         "message_count": len(messages),
+        "pending_operations": _pending_from_messages(messages),
         "ai_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         "render_scale": RENDER_SCALE,
@@ -321,40 +370,6 @@ def _discard_prepared(work_path: Path, render_dir: Optional[Path]) -> None:
         pass
     if render_dir is not None:
         shutil.rmtree(render_dir, ignore_errors=True)
-
-
-def _commit_prepared(
-    doc_id: str,
-    new_version: int,
-    label: str,
-    work_path: Path,
-    render_dir: Path,
-    objects_payload: Dict[str, Any],
-    page_count: int,
-    expected_version: Optional[int] = None,
-    touched: Optional[List[int]] = None,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Take the doc lock, re-check the optimistic version, commit, and serialize.
-
-    Raises PatchConflict (cleaning up the prepared artifacts) when the doc moved
-    while rendering. Returns (committed_meta, objects_payload).
-    """
-    with storage.lock_for(doc_id):
-        meta = storage.load_meta(doc_id)
-        if expected_version is not None and int(meta.get("version", 0)) != int(expected_version):
-            _discard_prepared(work_path, render_dir)
-            raise edits.PatchConflict("文档已经更新，请刷新后再试")
-        committed = storage.commit_work(
-            doc_id=doc_id,
-            meta=meta,
-            work_path=work_path,
-            new_version=new_version,
-            label=label,
-            slide_count=int(page_count),
-            slide_size=objects_payload.get("slide_size_emu") or meta.get("slide_size_emu"),
-            objects_payload=objects_payload,
-        )
-    return committed, objects_payload
 
 
 def _commit_result(committed: Dict[str, Any], objects_payload: Dict[str, Any], touched: Optional[List[int]] = None) -> Dict[str, Any]:
@@ -618,6 +633,7 @@ def upload_document(file: UploadFile = File(...)):
     except Exception:
         if doc_id:
             shutil.rmtree(storage.doc_dir(doc_id), ignore_errors=True)
+            storage.release_lock(doc_id)
         raise
     finally:
         try:
@@ -1019,12 +1035,14 @@ def list_versions(doc_id: str):
 
 
 @app.post("/api/docs/{doc_id}/versions/{version_id}/restore")
-def restore_version(doc_id: str, version_id: str):
+def restore_version(doc_id: str, version_id: str, body: Optional[RestoreIn] = None):
     if not re.fullmatch(r"v\d+", version_id or ""):
         raise HTTPException(status_code=400, detail="invalid version id")
     # ---- phase 1 (short lock): allocate the version id ----
     with storage.lock_for(doc_id):
         meta = storage.load_meta(doc_id)
+        if body is not None and body.base_version is not None and int(body.base_version) != int(meta.get("version", 0)):
+            raise edits.PatchConflict("文档已经更新，请刷新后再试")
         source = storage.version_file(doc_id, version_id)
         new_version, _ = storage.next_version_id(meta)
 

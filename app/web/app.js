@@ -358,6 +358,23 @@ function applyDocument(doc, options = {}) {
 
 function restorePendingOperations() {
   if (state.streaming || state.patches.length || !state.doc) return;
+  // server-computed pending ops survive message trimming — prefer them
+  const pending = state.doc.pending_operations;
+  if (pending && Array.isArray(pending.operations) && pending.operations.length) {
+    state.patches = pending.operations.map((operation) => ({
+      ...operation,
+      uiState: "accepted",
+      message_id: pending.message_id || null,
+    }));
+    const baseVersion = Number.isInteger(pending.base_version)
+      ? pending.base_version
+      : state.doc.version;
+    state.patchesStale = baseVersion !== state.doc.version;
+    renderPatchList();
+    if (state.patchesStale) setNotice("待确认操作基于旧版本，请重新生成后再应用。", "error");
+    return;
+  }
+  if (pending) return; // server says nothing pending — trust it
   const messages = state.doc.messages || [];
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
@@ -1582,6 +1599,7 @@ async function sendChat() {
   state.live = live;
   const doneRef = { value: null };
   let failure = "";
+  let idleAborted = false;
   try {
     const response = await fetch(`/api/docs/${docId}/chat`, {
       method: "POST",
@@ -1612,27 +1630,54 @@ async function sendChat() {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const chunk = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const parsed = parseSseChunk(chunk);
-        if (parsed) {
-          handleChatEvent(parsed.event, parsed.data, live, doneRef);
-          if (parsed.event === "done") doneRef.value = parsed.data;
+    let idleTimer = setTimeout(() => {
+      idleAborted = true;
+      try {
+        controller.abort();
+      } catch { /* already aborted */ }
+    }, 90000); // dead-connection guard: no bytes for 90s → abort
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          idleAborted = true;
+          try {
+            controller.abort();
+          } catch { /* already aborted */ }
+        }, 90000);
+        buffer += decoder.decode(value, { stream: true });
+        // CRLF-tolerant frame delimiter: a proxy normalizing \n to \r\n must
+        // not fuse the whole stream into one unparseable buffer
+        let boundary = buffer.match(/\r?\n\r?\n/);
+        while (boundary) {
+          const chunk = buffer.slice(0, boundary.index);
+          buffer = buffer.slice(boundary.index + boundary[0].length);
+          const parsed = parseSseChunk(chunk);
+          if (parsed) {
+            handleChatEvent(parsed.event, parsed.data, live, doneRef);
+            if (parsed.event === "done") doneRef.value = parsed.data;
+          }
+          boundary = buffer.match(/\r?\n\r?\n/);
         }
-        boundary = buffer.indexOf("\n\n");
       }
+    } finally {
+      clearTimeout(idleTimer);
     }
   } catch (error) {
     if (error.name === "AbortError") {
-      failure = "已停止生成";
-      setNotice("已停止生成；已写入的用户消息会保留在会话里。", "");
-      if (!dom.chatInput.value) dom.chatInput.value = instruction;
+      if (idleAborted) {
+        setNotice("连接超过 90 秒没有数据，已中断；输入已保留，可重试。", "error");
+        if (!dom.chatInput.value) dom.chatInput.value = instruction;
+        if (live?.output) live.output.textContent = "执行中断：连接超时";
+        toast("对话连接超时", "error");
+        failure = "";
+      } else {
+        failure = "已停止生成";
+        setNotice("已停止生成；已写入的用户消息会保留在会话里。", "");
+        if (!dom.chatInput.value) dom.chatInput.value = instruction;
+      }
     } else {
       failure = error.message || "请求失败";
       if (error.status === 409 || /已经更新/.test(failure)) {
@@ -1789,13 +1834,27 @@ async function restoreVersion(versionId) {
   try {
     const doc = await api(
       `/api/docs/${state.doc.doc_id}/versions/${encodeURIComponent(versionId)}/restore`,
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base_version: state.doc.version }),
+      },
       300000
     );
     applyDocument(doc, { preserveSelection: false, clearPatches: true });
     toast(`已恢复 ${versionId}，并保存为 ${doc.version_id}`, "success");
   } catch (error) {
-    toast(error.message, "error");
+    if (error.status === 409) {
+      try {
+        const fresh = await api(`/api/docs/${state.doc.doc_id}`, {}, 60000);
+        applyDocument(fresh, { preserveSelection: true, clearPatches: true });
+        toast("文档已在别处更新，已加载最新版本；请重新选择要恢复的版本", "error");
+      } catch {
+        toast(error.message, "error");
+      }
+    } else {
+      toast(error.message, "error");
+    }
   } finally {
     setBusy(false);
   }

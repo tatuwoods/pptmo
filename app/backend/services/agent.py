@@ -1280,6 +1280,34 @@ def _trace_detail(action: str, args: Dict[str, Any], detail: Dict[str, Any]) -> 
     return _clip(str(detail), 160)
 
 
+def _clip_content(content: str, limit: int = 12000) -> str:
+    """Clip a conversation turn for the context window. Tool observations are
+    JSON; clipping the raw string mid-value feeds the model malformed JSON, so
+    clip per-field when the content parses and fall back to raw truncation."""
+    if len(content) <= limit:
+        return content
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return content[: limit - 1] + "…"
+    if isinstance(data, dict):
+        field_limit = max(200, limit // 4)
+
+        def clip_value(value: Any) -> Any:
+            if isinstance(value, str) and len(value) > field_limit:
+                return value[: field_limit - 1] + "…"
+            if isinstance(value, list):
+                return [clip_value(item) for item in value[:40]]
+            if isinstance(value, dict):
+                return {key: clip_value(item) for key, item in value.items()}
+            return value
+
+        out = json.dumps({key: clip_value(item) for key, item in data.items()}, ensure_ascii=False)
+        if len(out) <= limit:
+            return out
+    return content[: limit - 1] + "…"
+
+
 def _trim_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     if len(messages) <= 2:
         return messages
@@ -1291,7 +1319,7 @@ def _trim_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     for message in rest:
         content = str(message.get("content") or "")
         if len(content) > 12000:
-            content = content[:11999] + "…"
+            content = _clip_content(content)
         trimmed.append({**message, "content": content})
     return head + trimmed
 

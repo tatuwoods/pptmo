@@ -218,10 +218,20 @@ def _clamp_bbox(bbox: Dict[str, Any], slide_w: int, slide_h: int) -> Dict[str, i
                     return None
         return None
 
-    x = value("x", "left") or 0
-    y = value("y", "top") or 0
-    w = value("w", "width") or int(slide_w * 0.7)
-    h = value("h", "height") or int(slide_h * 0.1)
+    x = value("x", "left")
+    y = value("y", "top")
+    w = value("w", "width")
+    h = value("h", "height")
+    # defaults only for ABSENT values; an explicit 0/negative w/h used to be
+    # silently replaced by 70%/10% of the slide instead of being rejected
+    if w is not None and w <= 0:
+        raise PatchError("bbox width must be positive")
+    if h is not None and h <= 0:
+        raise PatchError("bbox height must be positive")
+    x = 0 if x is None else x
+    y = 0 if y is None else y
+    w = int(slide_w * 0.7) if w is None else w
+    h = int(slide_h * 0.1) if h is None else h
     w = max(1, w)
     h = max(1, h)
     x = max(0, min(x, slide_w - 1))
@@ -400,6 +410,17 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
     slide_index = parsed[0]
     if slide_index < 0 or slide_index >= len(prs.slides):
         raise PatchError(f"slide_index out of range: {slide_index}")
+    payload_slide = patch.get("slide_index")
+    try:
+        payload_num = int(payload_slide) if payload_slide is not None else None
+    except (TypeError, ValueError):
+        payload_num = None
+    if payload_num is not None and payload_num != slide_index:
+        # PatchError subclasses ValueError — the comparison must live outside
+        # the int-parse try/except or it would swallow itself
+        raise PatchError(
+            f"slide_index {payload_slide} does not match shape_id target slide {slide_index}"
+        )
     text_action = action in ("edit", "clear", "delete_textbox")
     if text_action and shape_id in seen:
         raise PatchError(f"duplicate patch for {shape_id}")
