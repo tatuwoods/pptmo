@@ -312,14 +312,40 @@ def _remove_shape(shape) -> None:
         parent.remove(element)
 
 
+MAX_PATCH_TEXT_CHARS = 20000
+FUZZY_BEFORE_MAX_CHARS = 10000
+
+
+def _validate_patch_sizes(patch: Dict[str, Any]) -> None:
+    """Direct /apply uploads bypass the agent's own caps; bound the strings so a
+    hostile patch list can't force quadratic CPU or huge text into the PPTX."""
+    def _check(value: Any, label: str) -> None:
+        if isinstance(value, str) and len(value) > MAX_PATCH_TEXT_CHARS:
+            raise PatchError(f"{label} too long (max {MAX_PATCH_TEXT_CHARS} chars)")
+
+    for key in ("before", "after", "text"):
+        _check(patch.get(key), key)
+    payload = patch.get("payload")
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            _check(value, f"payload.{key}")
+
+
 def _validate_before(patch: Dict[str, Any], current_text: str, shape_id: str) -> None:
     before = patch.get("before")
     if before is None or not str(before).strip():
         return
     if normalize_text(before) == normalize_text(current_text):
         return
-    ratio = difflib.SequenceMatcher(None, normalize_text(before), normalize_text(current_text)).ratio()
-    if ratio < 0.9:
+    # SequenceMatcher is quadratic; only worth it for realistically-sized texts
+    if len(before) <= FUZZY_BEFORE_MAX_CHARS:
+        ratio = difflib.SequenceMatcher(None, normalize_text(before), normalize_text(current_text)).ratio()
+        if ratio < 0.9:
+            raise PatchConflict(
+                f"shape {shape_id} changed on the server; refresh and retry"
+                f"（对象 {shape_id} 的原文已变化，请刷新后重试）"
+            )
+    else:
         raise PatchConflict(
             f"shape {shape_id} changed on the server; refresh and retry"
             f"（对象 {shape_id} 的原文已变化，请刷新后重试）"
@@ -472,6 +498,7 @@ def apply_patches_to_file(
     for patch in patches:
         if not isinstance(patch, dict):
             raise PatchError("patch must be an object")
+        _validate_patch_sizes(patch)
         touched.add(_apply_one(prs, patch, seen))
     dst.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(dst))

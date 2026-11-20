@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import shutil
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -15,9 +16,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers as StarletteHeaders
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -34,7 +36,143 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "60")) * 1024 * 1024
 RENDER_SCALE = float(os.getenv("RENDER_SCALE", "2"))
 PPTX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
-app = FastAPI(title="PPT Light", version="0.1.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
+# --- request guard configuration (v0.1.2 security hardening) ---
+# TRUSTED_HOSTS / TRUSTED_ORIGINS: extra Host/Origin values to accept, comma
+# separated. Needed when the app is reached through a reverse proxy (e.g.
+# `tailscale serve`), where the browser origin differs from the loopback Host
+# the proxy forwards. Hostnames appearing in TRUSTED_ORIGINS are trusted
+# automatically. Loopback names are always trusted.
+TRUSTED_HOSTS = [h.strip().lower() for h in os.getenv("TRUSTED_HOSTS", "").split(",") if h.strip()]
+TRUSTED_ORIGINS = [o.strip().rstrip("/") for o in os.getenv("TRUSTED_ORIGINS", "").split(",") if o.strip()]
+MAX_JSON_BODY_BYTES = int(os.getenv("MAX_JSON_BODY_MB", "2")) * 1024 * 1024
+MULTIPART_SLACK_BYTES = 8 * 1024 * 1024  # multipart framing overhead beyond the file itself
+AUTO_APPLY_DESTRUCTIVE = os.getenv("AUTO_APPLY_DESTRUCTIVE", "0").strip().lower() in ("1", "true", "yes")
+DESTRUCTIVE_ACTIONS = {"delete_textbox", "clear"}
+_LOCAL_HOST_NAMES = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "testserver", "testclient"}
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _origin_hostname(origin: str) -> str:
+    match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]+)", origin or "")
+    if not match:
+        return ""
+    return match.group(1).rsplit(":", 1)[0].strip("[]").lower()
+
+
+_TRUSTED_ORIGIN_HOSTS = {_origin_hostname(o) for o in TRUSTED_ORIGINS}
+_ALLOWED_HOST_NAMES = _LOCAL_HOST_NAMES | set(TRUSTED_HOSTS) | {h for h in _TRUSTED_ORIGIN_HOSTS if h}
+
+
+def _host_allowed(request_headers: StarletteHeaders) -> bool:
+    host = request_headers.get("host", "")
+    hostname = host.rsplit(":", 1)[0].strip("[]").lower()
+    # forwarded hosts (reverse proxy) are acceptable if trusted
+    forwarded = request_headers.get("x-forwarded-host", "")
+    forwarded_names = {value.strip().rsplit(":", 1)[0].strip("[]").lower() for value in forwarded.split(",") if value.strip()}
+    if not hostname:
+        return True  # HTTP/1.0 style or internal client; Origin check still applies
+    return hostname in _ALLOWED_HOST_NAMES or bool(forwarded_names & {h for h in _ALLOWED_HOST_NAMES if h})
+
+
+def _origin_allowed(request_headers: StarletteHeaders) -> bool:
+    origin = request_headers.get("origin", "").rstrip("/")
+    if not origin:
+        return True  # curl / native clients / same-origin GET navigations
+    if origin in TRUSTED_ORIGINS:
+        return True
+    host = request_headers.get("host", "")
+    match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]+)", origin)
+    if match and match.group(1).lower() == host.lower():
+        return True  # same host:port → same-origin request
+    return False
+
+
+def _body_cap(request_headers: StarletteHeaders) -> int:
+    content_type = request_headers.get("content-type", "").lower()
+    if content_type.startswith("multipart/form-data"):
+        return MAX_UPLOAD_BYTES + MULTIPART_SLACK_BYTES
+    return MAX_JSON_BODY_BYTES
+
+
+class RequestGuardMiddleware:
+    """Blocks browser drive-by attacks (cross-site POSTs) and DNS rebinding,
+    and caps request body sizes before they are buffered."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request_headers = StarletteHeaders(scope=scope)
+        method = (scope.get("method") or "GET").upper()
+        path = scope.get("path") or ""
+
+        if not _host_allowed(request_headers):
+            log.warning("guard: rejected host %r for %s %s", request_headers.get("host"), method, path)
+            response = JSONResponse({"detail": "host not allowed"}, status_code=421)
+            await response(scope, receive, send)
+            return
+
+        if method in _MUTATING_METHODS and path.startswith("/api/"):
+            sec_fetch_site = request_headers.get("sec-fetch-site")
+            if sec_fetch_site == "cross-site":
+                log.warning("guard: rejected cross-site %s %s", method, path)
+                response = JSONResponse({"detail": "cross-site request not allowed"}, status_code=403)
+                await response(scope, receive, send)
+                return
+            if not _origin_allowed(request_headers):
+                log.warning("guard: rejected origin %r for %s %s", request_headers.get("origin"), method, path)
+                response = JSONResponse({"detail": "origin not allowed"}, status_code=403)
+                await response(scope, receive, send)
+                return
+
+        cap = _body_cap(request_headers)
+        content_length = request_headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > cap:
+            response = JSONResponse({"detail": "request body too large"}, status_code=413)
+            await response(scope, receive, send)
+            return
+
+        if method in ("POST", "PUT", "PATCH") and not content_length:
+            # chunked / unknown length: count bytes as they stream through and
+            # reject mid-body if the cap is exceeded
+            received = 0
+
+            async def counting_receive():
+                nonlocal received
+                message = await receive()
+                if message["type"] == "http.request":
+                    received += len(message.get("body") or b"")
+                    if received > cap:
+                        raise _BodyTooLargeError()
+                return message
+
+            try:
+                await self.app(scope, counting_receive, send)
+            except _BodyTooLargeError:
+                response = JSONResponse({"detail": "request body too large"}, status_code=413)
+                await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+class _BodyTooLargeError(Exception):
+    pass
+
+
+def _sanitize_detail(text: Any) -> str:
+    """Strip server filesystem layout from error details before they reach clients."""
+    clean = str(text or "")
+    for prefix in {str(storage.DATA_DIR), str(BASE_DIR), str(APP_DIR), tempfile.gettempdir()}:
+        if prefix and prefix != "/":
+            clean = clean.replace(prefix, "<path>")
+    return clean
+
+
+app = FastAPI(title="PPT Light", version="0.1.2", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
 app.add_middleware(GZipMiddleware, minimum_size=1500)
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +181,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# added last → outermost, so the guard sees (and can reject) requests before
+# CORSMiddleware answers preflights directly
+app.add_middleware(RequestGuardMiddleware)
 
 
 class ApplyIn(BaseModel):
@@ -68,45 +209,35 @@ class RenameIn(BaseModel):
 
 @app.exception_handler(edits.PatchConflict)
 async def _conflict_handler(_request, exc: edits.PatchConflict):
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(status_code=409, content={"detail": str(exc)})
+    return JSONResponse(status_code=409, content={"detail": _sanitize_detail(exc)})
 
 
 @app.exception_handler(edits.PatchError)
 async def _patch_error_handler(_request, exc: edits.PatchError):
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(status_code=400, content={"detail": str(exc)})
+    return JSONResponse(status_code=400, content={"detail": _sanitize_detail(exc)})
 
 
 @app.exception_handler(ai.AIServiceError)
 async def _ai_error_handler(_request, exc: ai.AIServiceError):
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(status_code=502, content={"detail": str(exc)})
+    return JSONResponse(status_code=502, content={"detail": _sanitize_detail(exc)})
 
 
 @app.exception_handler(render.RenderError)
 async def _render_error_handler(_request, exc: render.RenderError):
-    from fastapi.responses import JSONResponse
-
     log.exception("render failed")
-    return JSONResponse(status_code=500, content={"detail": f"渲染失败：{exc}"})
+    return JSONResponse(status_code=500, content={"detail": f"渲染失败：{_sanitize_detail(exc)}"})
 
 
 @app.exception_handler(FileNotFoundError)
 async def _not_found_handler(_request, exc: FileNotFoundError):
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(status_code=404, content={"detail": str(exc) or "not found"})
+    # OS-level errors can embed absolute server paths; keep those server-side
+    log.info("not found: %s", exc)
+    return JSONResponse(status_code=404, content={"detail": _sanitize_detail(exc) or "not found"})
 
 
 @app.exception_handler(ValueError)
 async def _value_error_handler(_request, exc: ValueError):
-    from fastapi.responses import JSONResponse
-
-    return JSONResponse(status_code=400, content={"detail": str(exc)})
+    return JSONResponse(status_code=400, content={"detail": _sanitize_detail(exc)})
 
 
 def _version_id(meta: Dict[str, Any]) -> str:
@@ -245,6 +376,12 @@ def _finalize_chat(
         if auto_apply and operations:
             if int(meta.get("version", 0)) != int(start_version):
                 apply_error = "文档在对话期间已更新，操作已暂存，请刷新后重试"
+            elif not AUTO_APPLY_DESTRUCTIVE and any(
+                str(op.get("action")) in DESTRUCTIVE_ACTIONS for op in operations
+            ):
+                # deletion/clear can't be undone by eye on the canvas; force the
+                # review path unless explicitly enabled in .env
+                apply_error = "包含删除/清空类操作，已转为手动确认；请在操作卡片中检查后应用"
             else:
                 new_version, _ = storage.next_version_id(meta)
                 work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"

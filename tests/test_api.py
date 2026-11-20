@@ -313,3 +313,106 @@ def test_chat_disconnect_still_persists(client, uploaded_doc):
         if not found:
             time.sleep(0.3)
     assert found, "assistant message lost after client disconnect"
+
+
+# ---------- v0.1.2: request guard, body caps, patch caps, auto-apply guard ----------
+
+def test_cross_site_post_rejected(client, uploaded_doc):
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/apply",
+                    json={"patches": [_edit_patch(uploaded_doc)]},
+                    headers={"Sec-Fetch-Site": "cross-site"})
+    assert r.status_code == 403
+
+
+def test_foreign_origin_post_rejected(client, uploaded_doc):
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/apply",
+                    json={"patches": [_edit_patch(uploaded_doc)]},
+                    headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+
+
+def test_same_origin_post_allowed(client, uploaded_doc):
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/apply",
+                    json={"patches": [_edit_patch(uploaded_doc)], "base_version": 0},
+                    headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"})
+    assert r.status_code == 200
+
+
+def test_keyless_client_still_allowed(client, uploaded_doc):
+    # curl / native API clients send no Origin/Sec-Fetch-Site
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/apply",
+                    json={"patches": [_edit_patch(uploaded_doc)], "base_version": 0})
+    assert r.status_code == 200
+
+
+def test_rebinding_host_rejected(client):
+    r = client.get("/api/health", headers={"Host": "attacker.example"})
+    assert r.status_code == 421
+
+
+def test_json_body_too_large_rejected(client, uploaded_doc):
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/apply",
+                    json={"patches": [_edit_patch(uploaded_doc)],
+                          "label": "x" * (3 * 1024 * 1024)})
+    assert r.status_code == 413
+
+
+def test_multipart_too_large_rejected(client, demo_pptx, monkeypatch):
+    import main as app_module
+    monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 100 * 1024)
+    monkeypatch.setattr(app_module, "MULTIPART_SLACK_BYTES", 1000)
+    payload = demo_pptx.read_bytes() + b"\0" * 200 * 1024
+    r = client.post("/api/docs/upload",
+                    files={"file": ("big.pptx", payload, "application/octet-stream")})
+    assert r.status_code == 413
+
+
+def test_apply_patch_string_cap(client, uploaded_doc):
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/apply",
+                    json={"patches": [{"action": "edit",
+                                       "shape_id": uploaded_doc["objects"][0]["shape_id"],
+                                       "after": "长" * 25000}]})
+    assert r.status_code == 400
+    assert "too long" in r.json()["detail"]
+
+
+def test_destructive_auto_apply_requires_confirmation(client, uploaded_doc, monkeypatch):
+    import main as app_module
+
+    doc_id = uploaded_doc["doc_id"]
+    doc = client.get(f"/api/docs/{doc_id}").json()
+    target = next(o for o in doc["objects"] if o["kind"] == "text")
+    ops = [{"action": "clear", "shape_id": target["shape_id"], "slide_index": target["slide_index"]}]
+
+    # default: destructive ops force the review path, nothing is applied
+    monkeypatch.setattr(app_module, "AUTO_APPLY_DESTRUCTIVE", False)
+    applied_event, apply_error, fields = app_module._finalize_chat(
+        doc_id, auto_apply=True, start_version=0,
+        done_data={"operations": ops, "summary": "s", "reply": "r"},
+    )
+    assert applied_event is None
+    assert apply_error and "手动确认" in apply_error
+    assert client.get(f"/api/docs/{doc_id}").json()["version"] == 0
+
+    # opt-in: auto-apply proceeds
+    monkeypatch.setattr(app_module, "AUTO_APPLY_DESTRUCTIVE", True)
+    applied_event, apply_error, fields = app_module._finalize_chat(
+        doc_id, auto_apply=True, start_version=0,
+        done_data={"operations": ops, "summary": "s", "reply": "r"},
+    )
+    assert applied_event is not None and applied_event.get("version_id")
+
+
+def test_error_details_sanitized(client, uploaded_doc, tmp_path):
+    import main as app_module
+    # unit: the sanitizer masks filesystem prefixes
+    sanitized = app_module._sanitize_detail(f"boom at {tmp_path}/data/docs/x/current.pptx")
+    assert str(tmp_path) not in sanitized
+    assert "<path>" in sanitized
+    # end-to-end: missing file yields a clean 404 with no server paths
+    doc_id = uploaded_doc["doc_id"]
+    current = tmp_path / "data" / "docs" / doc_id / "current.pptx"
+    current.unlink()
+    r = client.get(f"/api/docs/{doc_id}/download")
+    assert r.status_code == 404
+    assert str(tmp_path) not in r.text
