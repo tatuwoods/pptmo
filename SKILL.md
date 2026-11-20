@@ -89,18 +89,20 @@ Useful endpoints beyond these: `GET /api/sessions`, `GET /api/docs/{id}` (object
 Best practice: keep uvicorn bound to `127.0.0.1` and publish through `tailscale serve` (auto-HTTPS, tailnet-only, streams SSE fine):
 
 ```bash
-tailscale serve --bg --https=443 http://127.0.0.1:8090
-tailscale serve status        # prints https://<host>.<tailnet>.ts.net/
+tailscale serve --bg --https=9443 http://127.0.0.1:8090
+tailscale serve status        # prints https://<host>.<tailnet>.ts.net:9443/
 ```
 
 On macOS with a **homebrew userspace** tailscaled (common on agent boxes), the CLI must point at its socket or every command fails with "failed to connect to local tailscaled":
 
 ```bash
 TS="tailscale --socket=$HOME/.local/state/tailscale/tailscaled.sock"
-$TS serve --bg --https=443 http://127.0.0.1:8090
+$TS serve --bg --https=9443 http://127.0.0.1:8090
 ```
 
-Find the socket via `ps aux | grep tailscaled` (`--socket=` flag). Userspace mode has **no tun device**, so bare connections to the machine's 100.x IP will NOT work — `serve` is the way. To test from the serving machine itself in userspace mode, route through its SOCKS5 proxy: `curl --proxy socks5h://127.0.0.1:1055 https://<host>.<tailnet>.ts.net/api/health`. Undo with `tailscale serve off`.
+Find the socket via `ps aux | grep tailscaled` (`--socket=` flag). Userspace mode has **no tun device**, so bare connections to the machine's 100.x IP will NOT work — `serve` is the way. To test from the serving machine itself in userspace mode, route through its SOCKS5 proxy: `curl --proxy socks5h://127.0.0.1:1055 https://<host>.<tailnet>.ts.net:9443/api/health`. Undo with `tailscale serve --https=9443 off`.
+
+**Coexisting with other serve users (important).** All serve entries share one config table on the node; different ports coexist by design, but the same port is **last-writer-wins** — issuing `serve --https=443 ...` silently replaces whatever 443 pointed at. Port 443 is the "default" everyone (humans and agent bots) tends to grab. So: always publish this app on a dedicated high port (9443 here) and leave 443 alone; check `tailscale serve status` first to see which ports are taken. If full isolation is ever required (multiple tenants fighting over serve), the escalation path is a second tailscaled instance with its own `--state`/`--socket` (a separate tailnet node, needs its own login), but a distinct port on the shared daemon is almost always enough.
 
 Do NOT rebind uvicorn to `0.0.0.0` instead: the app has no auth and open CORS; the tailnet HTTPS proxy is the only exposure that keeps it private.
 
