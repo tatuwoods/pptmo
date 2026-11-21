@@ -24,9 +24,10 @@
   slide-level ops unchanged
 - Agent system prompt documents the new actions, the renumbering rule and the
   recommended two-round flow for "duplicate then edit the copy"
-- 34 new tests (test_slide_ops.py): picture/table/group/notes fidelity,
+- 39 new tests (test_slide_ops.py): picture/table/group/notes fidelity,
   object-ID shift after delete, reorder, out-of-range params, API conflict
-  guard, agent op-store validation — 121 total
+  guard, agent op-store validation, partname uniqueness after delete —
+  126 total
 - Frontend renders dedicated cards for the four actions; locate jumps to the
   affected slide
 
