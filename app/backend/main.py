@@ -47,7 +47,7 @@ TRUSTED_ORIGINS = [o.strip().rstrip("/") for o in os.getenv("TRUSTED_ORIGINS", "
 MAX_JSON_BODY_BYTES = int(os.getenv("MAX_JSON_BODY_MB", "2")) * 1024 * 1024
 MULTIPART_SLACK_BYTES = 8 * 1024 * 1024  # multipart framing overhead beyond the file itself
 AUTO_APPLY_DESTRUCTIVE = os.getenv("AUTO_APPLY_DESTRUCTIVE", "0").strip().lower() in ("1", "true", "yes")
-DESTRUCTIVE_ACTIONS = {"delete_textbox", "clear"}
+DESTRUCTIVE_ACTIONS = {"delete_textbox", "clear", "delete_slide"}
 _LOCAL_HOST_NAMES = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "testserver", "testclient"}
 
 # bound concurrent agent chats: each one holds LLM connections for minutes
@@ -178,7 +178,7 @@ def _sanitize_detail(text: Any) -> str:
     return clean
 
 
-app = FastAPI(title="PPT Light", version="0.1.5", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
+app = FastAPI(title="PPT Light", version="0.2.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
 app.add_middleware(GZipMiddleware, minimum_size=1500)
 app.add_middleware(
     CORSMiddleware,
@@ -562,7 +562,7 @@ def health():
     return {
         "ok": True,
         "service": "ppt-light",
-        "version": "0.1.5",
+        "version": "0.2.0",
         "ai_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         "libreoffice": bool(shutil.which("soffice") or shutil.which("libreoffice")),
@@ -633,9 +633,9 @@ def upload_document(file: UploadFile = File(...)):
             from services.garble_fix import sanitize_wingdings
             b_fixed, t_fixed = sanitize_wingdings(storage.current_path(doc_id))
             if b_fixed or t_fixed:
-                logger.info("wingdings sanitized: %d bullets, %d chars", b_fixed, t_fixed)
+                log.info("wingdings sanitized: %d bullets, %d chars", b_fixed, t_fixed)
         except Exception as exc:  # 修复失败不阻塞上传
-            logger.warning("wingdings sanitize skipped: %s", exc)
+            log.warning("wingdings sanitize skipped: %s", exc)
         render.render_pptx(
             storage.current_path(doc_id),
             storage.render_dir(doc_id, 0),

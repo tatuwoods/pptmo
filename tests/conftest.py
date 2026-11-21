@@ -1,6 +1,7 @@
 """Shared fixtures: sys.path setup, generated pptx, TestClient with stubbed rendering."""
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 
@@ -28,7 +29,7 @@ def demo_pptx(tmp_path: Path) -> Path:
     prs.slide_height = Emu(6858000)
     blank = prs.slide_layouts[6]
 
-    # slide 0: title + body
+    # slide 0: title + body + picture + speaker notes
     s0 = prs.slides.add_slide(blank)
     tb = s0.shapes.add_textbox(Emu(1000000), Emu(500000), Emu(6000000), Emu(1000000))
     tb.text_frame.text = "项目进展汇报"
@@ -37,6 +38,8 @@ def demo_pptx(tmp_path: Path) -> Path:
         run.font.bold = True
     body = s0.shapes.add_textbox(Emu(1000000), Emu(2000000), Emu(8000000), Emu(2000000))
     body.text_frame.text = "本季度完成了三个关键里程碑。"
+    s0.shapes.add_picture(io.BytesIO(_tiny_png()), Emu(9500000), Emu(500000), Emu(2000000), Emu(1500000))
+    s0.notes_slide.notes_text_frame.text = "讲稿：先回顾里程碑。"
 
     # slide 1: table with merged cells
     s1 = prs.slides.add_slide(blank)

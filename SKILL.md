@@ -57,6 +57,7 @@ The client already retries without `response_format` once if an endpoint rejects
 2. Default is **review mode**: operations appear as cards, applied only after the user clicks apply. The "自动执行" toggle auto-applies after the turn.
 3. Guards you can rely on: ops must target real `shape_id`s from tool output; text edits carry a `before` checked against current text (page-number/footer/logo objects are protected unless the instruction names them); grouped shapes allow text/style edits but reject geometry; every apply creates a version that can be restored (restore itself creates a new version, history is never lost).
 4. Optimistic-locking: requests carry `base_version`; if the doc changed meanwhile the server answers 409 and ops stay staged.
+5. Slide-level ops (v0.2): `duplicate_slide` (full-fidelity page copy: text/styles/pictures/tables/groups/background/notes), `add_slide` (blank page), `delete_slide`, `move_slide` — page numbers are 0-based like everywhere else. In a mixed batch, shape edits resolve against the pre-batch numbering and slide ops then run in submission order; after apply every `s{n}_…` id renumbers, so "copy a page then edit the copy" is a two-round flow (duplicate → apply → re-read → edit).
 
 ## Driving it programmatically (no UI needed)
 
@@ -79,6 +80,24 @@ curl -s -X POST http://127.0.0.1:8090/api/docs/$DOC/apply -H "Content-Type: appl
 # 4. download the real pptx
 curl -sO http://127.0.0.1:8090/api/docs/$DOC/download
 ```
+
+Slide-level ops (v0.2) go through the same channels — chat tool-call or direct
+`/apply` patches (all page numbers are 0-based `slide_index`, same as shape_id
+prefixes):
+
+```json
+{"action":"duplicate_slide","source_slide":0,"position":1,"description":"copy cover after itself"}
+{"action":"add_slide","after_slide":3,"layout_index":6}
+{"action":"delete_slide","slide":2}
+{"action":"move_slide","slide":4,"to":0}
+```
+
+`duplicate_slide` copies everything (text, styles, pictures, tables, groups,
+background, notes) by re-binding relationships to the same image/chart parts.
+Shape-level ops in a mixed batch resolve against the pre-batch numbering;
+after any slide-level op commits, all `s{n}_id{m}` IDs are renumbered on the
+next parse — re-read before editing the new slides. `delete_slide` is
+destructive-guarded for auto-apply like `clear`/`delete_textbox`.
 
 Say “第 N 页” in the message and the server auto-scopes to that slide (Chinese numerals, “首页”, "page N" all work). `scope: "deck"` widens to the whole file. SSE is plain `event:`/`data:` lines — parse incrementally; the `done` payload holds `message_id`, final `operations`, `trace`, and (if auto-apply) `applied_version_id`.
 
@@ -120,7 +139,7 @@ Do NOT rebind uvicorn to `0.0.0.0` instead: the app has no auth and open CORS; t
 | `TRUSTED_HOSTS` | loopback | extra Host names accepted (reverse proxy) |
 | `TRUSTED_ORIGINS` | loopback | extra browser Origins accepted; hostnames auto-trusted |
 | `MAX_JSON_BODY_MB` | 2 | cap for JSON request bodies (apply/chat) |
-| `AUTO_APPLY_DESTRUCTIVE` | 0 | allow auto-apply of delete_textbox/clear |
+| `AUTO_APPLY_DESTRUCTIVE` | 0 | allow auto-apply of delete_textbox/clear/delete_slide |
 | `AI_CONCURRENCY` | 2 | max simultaneous agent chats (429 beyond) |
 | `RENDER_QUEUE_MAX` | 4 | queued renders before 429 |
 | `RENDER_MAX_PAGES` | 500 | LibreOffice render page cap |
@@ -144,4 +163,4 @@ Behavior notes (v0.1.1–v0.1.5): chat finalize persists even on client disconne
 
 ## Known limits (set expectations honestly)
 
-Text layer + textbox geometry only — pictures/charts/SmartArt render but can't be edited; table cells accept text/style but not move/resize; grouped text can be reworded but not repositioned; fonts may render slightly differently vs PowerPoint (LibreOffice rasterizes the preview; the downloaded file opens fine in PowerPoint/WPS). 60 MB upload cap. No multi-user auth — keep it behind localhost or a private tailnet.
+Text layer + textbox geometry only — pictures/charts/SmartArt render but can't be edited (whole slides containing them can still be duplicated/moved since v0.2); table cells accept text/style but not move/resize; grouped text can be reworded but not repositioned; fonts may render slightly differently vs PowerPoint (LibreOffice rasterizes the preview; the downloaded file opens fine in PowerPoint/WPS). 60 MB upload cap. No multi-user auth — keep it behind localhost or a private tailnet.

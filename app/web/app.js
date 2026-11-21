@@ -1212,6 +1212,20 @@ function renderPatchList() {
         const bbox = patch.bbox_emu || {};
         body = `<div class="patch-text after">新增文本框：${escapeHtml(patch.after || "")}</div>
           <div class="patch-text before">位置：x ${emuToCm(bbox.x)} cm · y ${emuToCm(bbox.y)} cm · ${emuToCm(bbox.w)} × ${emuToCm(bbox.h)} cm</div>`;
+      } else if (action === "duplicate_slide") {
+        const src = Number(patch.source_slide) + 1;
+        const pos = Number(patch.position) + 1;
+        body = `<div class="patch-text after">复制第 ${src} 页 → 插入为第 ${pos} 页</div>
+          <div class="patch-text before">整页复制（文字、图片、表格、样式、备注全保留）</div>`;
+      } else if (action === "add_slide") {
+        const after = patch.after_slide;
+        const where = after === null || after === undefined ? "加到末尾" : `插入到第 ${Number(after) + 1} 页之后`;
+        body = `<div class="patch-text after">新增空白页（${where}）</div>`;
+      } else if (action === "delete_slide") {
+        body = `<div class="patch-text after">删除第 ${Number(patch.slide) + 1} 页</div>
+          <div class="patch-text before">该页全部内容将随页面移除</div>`;
+      } else if (action === "move_slide") {
+        body = `<div class="patch-text after">第 ${Number(patch.slide) + 1} 页 → 移动到第 ${Number(patch.to) + 1} 页的位置</div>`;
       } else {
         const diff = diffPair(patch.before, patch.after);
         const afterHtml = action === "delete_textbox" ? "（将删除此文本框）" : diff.after;
@@ -1748,6 +1762,10 @@ function previewPatch(patch) {
   if (patch.action === "add_textbox") {
     setSlide(Number(patch.slide_index) || 0);
     toast(`新增文本框位置：x ${emuToCm((patch.bbox_emu || {}).x)} cm · y ${emuToCm((patch.bbox_emu || {}).y)} cm`);
+    return;
+  }
+  if (["duplicate_slide", "add_slide", "delete_slide", "move_slide"].includes(patch.action)) {
+    setSlide(Number(patch.slide_index) || 0);
     return;
   }
   if (!patch.shape_id) return;

@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.2.0 — slide-level operations (2026-11-21)
+
+- Four slide-level actions join the op pipeline (`propose_operations` → review
+  cards → `/apply`), alongside the existing shape-level ones:
+  - `duplicate_slide {source_slide, position}` — full-fidelity copy (text,
+    styles, pictures, tables incl. merged cells, groups, background,
+    transitions, speaker notes); image/chart/hyperlink relationships are
+    re-bound to the same parts in the new slide's rels
+  - `add_slide {after_slide?, layout_index?}` — blank page, appended by default
+  - `delete_slide {slide}` — rejects deleting the only slide
+  - `move_slide {slide, to}` — reorder via `_sldIdLst`
+- python-pptx 0.6.23 stays pinned (it has no slide-copy API; the implementation
+  works on the OPC relationship graph + `sldIdLst` directly)
+- Mixed batches are deterministic: shape-level ops resolve against the
+  pre-batch numbering (matching objects.json), slide-level ops then run in
+  submission order
+- `objects.json` is fully re-parsed on commit, so every `s{n}_id{m}` prefix is
+  renumbered after any slide-level op; later agent rounds see the new IDs
+- `delete_slide` joins `delete_textbox`/`clear` in the destructive auto-apply
+  guard (manual confirmation unless `AUTO_APPLY_DESTRUCTIVE=1`)
+- `base_version` conflict protection and partial-apply bookkeeping apply to
+  slide-level ops unchanged
+- Agent system prompt documents the new actions, the renumbering rule and the
+  recommended two-round flow for "duplicate then edit the copy"
+- 34 new tests (test_slide_ops.py): picture/table/group/notes fidelity,
+  object-ID shift after delete, reorder, out-of-range params, API conflict
+  guard, agent op-store validation — 121 total
+- Frontend renders dedicated cards for the four actions; locate jumps to the
+  affected slide
+
 ## v0.1.5 — UX polish & docs (2026-11-20)
 
 - Inline editor confirms before discarding typed changes on navigation-away

@@ -67,7 +67,21 @@ ACTION_ALIASES = {
     "stop": "finish",
     "answer": "finish",
     "ask": "finish",
+    "duplicate_slide": "duplicate_slide",
+    "copy_slide": "duplicate_slide",
+    "clone_slide": "duplicate_slide",
+    "duplicate": "duplicate_slide",
+    "add_slide": "add_slide",
+    "new_slide": "add_slide",
+    "insert_slide": "add_slide",
+    "delete_slide": "delete_slide",
+    "remove_slide": "delete_slide",
+    "move_slide": "move_slide",
+    "reorder_slide": "move_slide",
 }
+
+# slide-level operations submitted through propose_operations like any other op
+SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide"}
 
 TOOL_NAMES = {
     "outline",
@@ -743,6 +757,8 @@ class _OperationStore:
         self.style_targets: set = set()
         self.geometry_targets: set = set()
         self.add_keys: set = set()
+        self.slide_keys: set = set()
+        self.deleted_slides: set = set()
 
     def add_batch(self, raw: Any) -> Dict[str, Any]:
         if not isinstance(raw, list):
@@ -815,6 +831,8 @@ class _OperationStore:
                 action = "add_textbox"
             else:
                 return None, "缺少 action"
+        if action in SLIDE_ACTIONS:
+            return self._slide_op(raw, action)
         if action in TEXT_ACTIONS or action in ("style", "geometry"):
             if not shape_id:
                 return None, "缺少 shape_id"
@@ -1172,6 +1190,115 @@ class _OperationStore:
             op[key_name] = value
         return op, None
 
+    def _slide_op(
+        self, raw: Dict[str, Any], action: str
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        total = self.view.total_slides
+
+        def _slide_number(*names: str) -> Optional[int]:
+            for name in names:
+                if raw.get(name) is not None:
+                    return _as_int(raw.get(name))
+            return None
+
+        def _deleted_reason(slide: Optional[int]) -> Optional[str]:
+            if slide is not None and slide in self.deleted_slides:
+                return f"第 {slide + 1} 页已在本批操作中删除（已删除）"
+            return None
+
+        if action == "duplicate_slide":
+            source = _slide_number("source_slide", "source", "slide_index", "slide")
+            if source is None:
+                return None, "duplicate_slide 缺少 source_slide"
+            if not self.view.is_scoped(source):
+                return None, "source_slide 不在当前处理范围"
+            deleted_reason = _deleted_reason(source)
+            if deleted_reason:
+                return None, deleted_reason
+            position = _slide_number("position", "to", "insert_at")
+            if position is None:
+                position = source + 1
+            if position < 0 or position > total:
+                return None, f"position 必须在 0..{total}"
+            defaults = ("复制页面",)
+            op = {
+                "action": action,
+                "slide_index": source,
+                "source_slide": source,
+                "position": position,
+            }
+        elif action == "add_slide":
+            after = _slide_number("after_slide")
+            if after is not None:
+                if after < 0 or after >= total:
+                    return None, f"after_slide 必须在 0..{total - 1}"
+                if not self.view.is_scoped(after):
+                    return None, "after_slide 不在当前处理范围"
+                deleted_reason = _deleted_reason(after)
+                if deleted_reason:
+                    return None, deleted_reason
+            position = _slide_number("position", "insert_at")
+            if position is not None and (position < 0 or position > total):
+                return None, f"position 必须在 0..{total}"
+            layout_index = _slide_number("layout_index", "layout")
+            if layout_index is not None and layout_index < 0:
+                return None, "layout_index 不能为负"
+            anchor = after + 1 if after is not None else (position if position is not None else total)
+            op = {
+                "action": action,
+                "slide_index": anchor,
+                "after_slide": after,
+                "position": position,
+                "layout_index": layout_index,
+            }
+            defaults = ("新增空白页",)
+        elif action == "delete_slide":
+            slide = _slide_number("slide", "slide_index", "source_slide")
+            if slide is None:
+                return None, "delete_slide 缺少 slide"
+            if not self.view.is_scoped(slide):
+                return None, "该页不在当前处理范围"
+            if total <= 1:
+                return None, "演示文稿只剩唯一一页，不能删除"
+            deleted_reason = _deleted_reason(slide)
+            if deleted_reason:
+                return None, deleted_reason
+            op = {"action": action, "slide_index": slide, "slide": slide}
+            defaults = ("删除整页",)
+        else:  # move_slide
+            slide = _slide_number("slide", "slide_index", "from", "source_slide")
+            if slide is None:
+                return None, "move_slide 缺少 slide"
+            if not self.view.is_scoped(slide):
+                return None, "该页不在当前处理范围"
+            deleted_reason = _deleted_reason(slide)
+            if deleted_reason:
+                return None, deleted_reason
+            to = _slide_number("to", "position", "to_index")
+            if to is None:
+                return None, "move_slide 缺少 to"
+            if to < 0 or to >= total:
+                return None, f"to 必须在 0..{total - 1}"
+            op = {"action": action, "slide_index": slide, "slide": slide, "to": to}
+            defaults = ("调整页序",)
+
+        key = (action, op.get("source_slide"), op.get("position"), op.get("after_slide"),
+               op.get("layout_index"), op.get("slide"), op.get("to"))
+        if key in self.slide_keys:
+            return None, "已提交过相同的幻灯片级操作"
+        if action == "delete_slide":
+            self.deleted_slides.add(op["slide"])
+        op.update(
+            {
+                "id": f"op{len(self.ops) + 1}",
+                "source": "agent",
+                "before": None,
+                "description": self._description(raw, defaults[0]),
+                "meta": {"slide_index": op["slide_index"], "kind": "slide"},
+            }
+        )
+        return op, None
+
     def _register(self, op: Dict[str, Any]) -> None:
         action = op.get("action")
         shape_id = str(op.get("shape_id") or "")
@@ -1193,6 +1320,18 @@ class _OperationStore:
                     bbox.get("h"),
                 )
             )
+        elif action in SLIDE_ACTIONS:
+            self.slide_keys.add(
+                (
+                    action,
+                    op.get("source_slide"),
+                    op.get("position"),
+                    op.get("after_slide"),
+                    op.get("layout_index"),
+                    op.get("slide"),
+                    op.get("to"),
+                )
+            )
 
     def _op_summary(self, op: Dict[str, Any]) -> Dict[str, Any]:
         item = {
@@ -1205,6 +1344,10 @@ class _OperationStore:
             item["shape_id"] = op.get("shape_id")
         if op.get("action") == "add_textbox":
             item["text"] = _clip(op.get("after"), 80)
+        if op.get("action") in SLIDE_ACTIONS:
+            for key in ("source_slide", "position", "after_slide", "layout_index", "slide", "to"):
+                if op.get(key) is not None:
+                    item[key] = op.get(key)
         return item
 
 
@@ -1351,7 +1494,19 @@ SYSTEM_PROMPT = (
     '"bbox_emu":{"x":0,"y":0,"w":100,"h":100},"font_size_pt":18,"bold":false,'
     '"color":"1F4E79","alignment":"LEFT"}\n'
     '- delete_textbox：{"action":"delete_textbox","shape_id":"..."} 仅限非分组的普通文本对象，'
-    "不能删除分组内文字或表格单元格。\n\n"
+    "不能删除分组内文字或表格单元格。\n"
+    "幻灯片级操作（页码一律用 0-based slide_index，与 shape_id 前缀一致）：\n"
+    '- duplicate_slide：{"action":"duplicate_slide","source_slide":0,"position":1,"description":"复制第1页"} '
+    "复制整页（文字、样式、图片、表格、位置、备注全保留），position 默认插在源页后面。\n"
+    '- add_slide：{"action":"add_slide","after_slide":3,"layout_index":6} 新增空白页，默认加到末尾；'
+    "layout_index 可选。\n"
+    '- delete_slide：{"action":"delete_slide","slide":2} 删除整页（唯一一页时不允许）。\n'
+    '- move_slide：{"action":"move_slide","slide":4,"to":0} 把某页移动到指定位置。\n'
+    "幻灯片级操作规则：同一批里页内编辑（edit/style/geometry/…）按操作前的页码解析，"
+    "幻灯片级操作在其后按提交顺序执行；应用后所有 s{n}_id{m} 按新页码重编号，"
+    "要编辑新插入页的内容，请等本批应用后下一轮重新 read_slides 再提交。\n"
+    "典型用法：「复制第 1 页生成第 2 页并改标题」→ 本轮只提交 duplicate_slide，"
+    "应用后下一轮再 edit 新页的标题对象。\n\n"
     f"约束：单次 propose 最多 {MAX_OPS_PER_CALL} 条，本次对话最多 {MAX_OPS} 条。\n\n"
     "工作方式：\n"
     "- 先理解意图：用户点名字段或页面时优先处理该对象/页面；模糊需求先 outline/read_slides 判断。\n"

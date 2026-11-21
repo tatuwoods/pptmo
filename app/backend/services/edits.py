@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml.ns import qn
 from pptx.util import Emu, Pt
 
 
@@ -375,17 +377,7 @@ def _apply_geometry(shape, bbox: Dict[str, Any], slide_w: int, slide_h: int) -> 
 
 
 def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
-    action = str(patch.get("action") or "edit").strip().lower()
-    if action in ("update", "rewrite", "replace", "edit_text", "set_text"):
-        action = "edit"
-    if action in ("move", "resize", "layout", "set_geometry"):
-        action = "geometry"
-    if action in ("format", "format_text"):
-        action = "style"
-    if action in ("clear_text",):
-        action = "clear"
-    if action in ("delete_cell_text",):
-        action = "clear"
+    action = _canonical_action(patch)
 
     slide_w = int(prs.slide_width)
     slide_h = int(prs.slide_height)
@@ -506,6 +498,246 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
     return slide_index
 
 
+# ---------- slide-level operations (v0.2) ----------
+# python-pptx has no duplicate/delete/move API, so these work directly on the
+# sldIdLst element and the OPC relationship graph.
+
+SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide"}
+
+_ACTION_ALIASES = {
+    "update": "edit",
+    "rewrite": "edit",
+    "replace": "edit",
+    "edit_text": "edit",
+    "set_text": "edit",
+    "move": "geometry",
+    "resize": "geometry",
+    "layout": "geometry",
+    "set_geometry": "geometry",
+    "format": "style",
+    "format_text": "style",
+    "clear_text": "clear",
+    "delete_cell_text": "clear",
+    "duplicate": "duplicate_slide",
+    "copy_slide": "duplicate_slide",
+    "clone_slide": "duplicate_slide",
+    "new_slide": "add_slide",
+    "insert_slide": "add_slide",
+    "remove_slide": "delete_slide",
+    "reorder_slide": "move_slide",
+}
+
+
+def _canonical_action(patch: Dict[str, Any]) -> str:
+    action = str(patch.get("action") or patch.get("type") or "edit").strip().lower()
+    return _ACTION_ALIASES.get(action, action)
+
+
+_UNSET = object()
+
+
+def _get_slide_param(patch: Dict[str, Any], names: Tuple[str, ...], label: str, default: Any = _UNSET) -> Optional[int]:
+    for name in names:
+        value = patch.get(name)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            raise PatchError(f"{label} must be an integer: {value!r}")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise PatchError(f"{label} must be an integer: {value!r}")
+    if default is not _UNSET:
+        return default
+    raise PatchError(f"{label} is required")
+
+
+def _remap_rids(element, remap: Dict[str, str]) -> None:
+    """Rewrite rId references inside copied slide XML (r:embed / r:id / r:link ...).
+    Two-phase via unique tokens so remaps like rId2→rId3 + rId3→rId2 can't collide."""
+    tokens = {old: f"@@rmap{index}@@" for index, old in enumerate(remap)}
+    for node in element.iter():
+        for attr, value in list(node.attrib.items()):
+            if value in tokens:
+                node.set(attr, tokens[value])
+    reverse = {token: remap[old] for old, token in tokens.items()}
+    for node in element.iter():
+        for attr, value in list(node.attrib.items()):
+            if value in reverse:
+                node.set(attr, reverse[value])
+
+
+def _clone_slide(prs, source) -> Any:
+    """Deep-copy a slide into a new part reusing its layout: shapes, background,
+    relationships (images/charts/... re-bound to the same target parts) and notes."""
+    dest = prs.slides.add_slide(source.slide_layout)
+    # add_slide clones layout placeholders; the source's own shapes replace them
+    for shape in list(dest.shapes):
+        _remove_shape(shape)
+    dst_tree = dest.shapes._spTree
+    for child in source.shapes._spTree:
+        if child.tag in (qn("p:nvGrpSpPr"), qn("p:grpSpPr")):
+            continue
+        dst_tree.append(copy.deepcopy(child))
+    src_cSld = source._element.cSld
+    dst_cSld = dest._element.cSld
+    src_bg = src_cSld.find(qn("p:bg"))
+    if src_bg is not None:
+        dst_bg = dst_cSld.find(qn("p:bg"))
+        if dst_bg is not None:
+            dst_cSld.remove(dst_bg)
+        dst_cSld.insert(0, copy.deepcopy(src_bg))
+    # transition / timing live on the sld root after clrMapOvr
+    for tag in ("p:transition", "p:timing"):
+        src_el = source._element.find(qn(tag))
+        if src_el is not None:
+            dest._element.append(copy.deepcopy(src_el))
+    remap: Dict[str, str] = {}
+    for rId, rel in list(source.part.rels.items()):
+        if rel.reltype in (RT.SLIDE_LAYOUT, RT.NOTES_SLIDE):
+            continue  # layout already bound by add_slide; notes are 1:1, copied below
+        if rel.is_external:
+            new_rId = dest.part.rels.get_or_add_ext_rel(rel.reltype, rel.target_ref)
+        else:
+            new_rId = dest.part.relate_to(rel.target_part, rel.reltype)
+        remap[rId] = new_rId
+    if remap:
+        _remap_rids(dest._element, remap)
+    if source.has_notes_slide:
+        try:
+            dest.notes_slide.notes_text_frame.text = source.notes_slide.notes_text_frame.text
+        except Exception:
+            pass
+    return dest
+
+
+def _sld_ids(prs) -> List[Any]:
+    return list(prs.slides._sldIdLst)
+
+
+def _move_sld_id(prs, from_index: int, to_index: int) -> None:
+    sldIdLst = prs.slides._sldIdLst
+    element = _sld_ids(prs)[from_index]
+    sldIdLst.remove(element)
+    sldIdLst.insert(to_index, element)
+
+
+def _require_range(value: int, low: int, high: int, label: str) -> None:
+    if value < low or value > high:
+        raise PatchError(f"{label} out of range: {value} (valid {low}..{high})")
+
+
+def _add_blank_slide_at(prs, layout_index: Optional[int], new_index: int) -> None:
+    layouts = prs.slide_layouts
+    if layout_index is None:
+        # 6 is "Blank" in the standard template; fall back to the first layout
+        layout_index = 6 if len(layouts) > 6 else 0
+    if layout_index < 0 or layout_index >= len(layouts):
+        raise PatchError(
+            f"layout_index out of range: {layout_index} (deck has {len(layouts)} layouts)"
+        )
+    prs.slides.add_slide(layouts[layout_index])
+    last = len(prs.slides) - 1  # appended at the end first
+    if new_index != last:
+        _move_sld_id(prs, last, new_index)
+
+
+def _delete_slide_at(prs, index: int) -> None:
+    if len(prs.slides) <= 1:
+        raise PatchError("cannot delete the only slide in the deck")
+    element = _sld_ids(prs)[index]
+    prs.part.drop_rel(element.get(qn("r:id")))
+    prs.slides._sldIdLst.remove(element)
+
+
+def _apply_slide_patches(
+    prs, patches: List[Dict[str, Any]], n_orig: int
+) -> Set[int]:
+    """Apply slide-level patches in submission order.
+
+    Every slide number in the batch refers to the BASE deck — the state the
+    caller read, matching objects.json and the shape patches above. An anchor
+    list tracks where each original slide currently lives: entries are current
+    deck order, values are original coordinates, and inserted/moved slides take
+    ``position - 0.5`` so later ops still address base positions unambiguously.
+    """
+    anchors: List[float] = [float(i) for i in range(n_orig)]
+    touched: Set[int] = set()
+
+    def current_index(orig: int, label: str) -> int:
+        try:
+            return anchors.index(float(orig))
+        except ValueError:
+            raise PatchError(
+                f"{label} {orig} already deleted earlier in this batch"
+                f"（该页已在本批操作中删除）"
+            ) from None
+
+    def insertion_index(position: int) -> int:
+        return sum(1 for anchor in anchors if anchor < float(position))
+
+    for patch in patches:
+        action = _canonical_action(patch)
+        if action == "duplicate_slide":
+            source = _get_slide_param(
+                patch, ("source_slide", "source", "slide_index", "slide"), "source_slide"
+            )
+            position = _get_slide_param(
+                patch, ("position", "to", "insert_at"), "position", default=source + 1
+            )
+            _require_range(source, 0, n_orig - 1, "source_slide")
+            _require_range(position, 0, n_orig, "position")
+            source_index = current_index(source, "source_slide")
+            _clone_slide(prs, prs.slides[source_index])
+            new_index = insertion_index(position)
+            _move_sld_id(prs, len(anchors), new_index)  # clone was appended at the end
+            anchors.insert(new_index, position - 0.5)
+            touched.update({source_index, new_index})
+        elif action == "add_slide":
+            after = _get_slide_param(patch, ("after_slide",), "after_slide", default=None)
+            position = _get_slide_param(
+                patch, ("position", "insert_at"), "position", default=None
+            )
+            layout_index = _get_slide_param(
+                patch, ("layout_index", "layout"), "layout_index", default=None
+            )
+            if after is not None:
+                _require_range(after, 0, n_orig - 1, "after_slide")
+                if position is None:
+                    position = after + 1
+            if position is None:
+                position = n_orig
+            _require_range(position, 0, n_orig, "position")
+            new_index = insertion_index(position)
+            _add_blank_slide_at(prs, layout_index, new_index)
+            anchors.insert(new_index, position - 0.5)
+            touched.add(new_index)
+        elif action == "delete_slide":
+            slide = _get_slide_param(patch, ("slide", "slide_index", "source_slide"), "slide")
+            _require_range(slide, 0, n_orig - 1, "slide")
+            if len(anchors) <= 1:
+                raise PatchError("cannot delete the only slide（不能删除唯一一页）")
+            index = current_index(slide, "slide")
+            _delete_slide_at(prs, index)
+            anchors.pop(index)
+            touched.add(min(index, len(anchors) - 1))
+        elif action == "move_slide":
+            slide = _get_slide_param(
+                patch, ("slide", "slide_index", "from", "source_slide"), "slide"
+            )
+            to = _get_slide_param(patch, ("to", "to_index", "position"), "to")
+            _require_range(slide, 0, n_orig - 1, "slide")
+            _require_range(to, 0, n_orig - 1, "to")
+            from_index = current_index(slide, "slide")
+            _move_sld_id(prs, from_index, to)  # remove-then-insert → lands at `to`
+            anchors.pop(from_index)
+            anchors.insert(to, float(to) - 0.5)
+            touched.update({from_index, to})
+        else:
+            raise PatchError(f"unsupported slide action: {action}")
+    return touched
+
+
 def apply_patches_to_file(
     src: Path, dst: Path, patches: List[Dict[str, Any]]
 ) -> Set[int]:
@@ -514,13 +746,27 @@ def apply_patches_to_file(
     if len(patches) > 100:
         raise PatchError("too many patches (max 100)")
     prs = Presentation(str(src))
+    n_orig = len(prs.slides)
     touched: Set[int] = set()
     seen: Set[str] = set()
+    # Mixed batches: shape-level ops resolve against the ORIGINAL numbering the
+    # caller saw (matching objects.json), then slide-level ops mutate the deck
+    # in submission order. Editing content on a just-inserted slide must wait
+    # for the next round, after objects are re-parsed.
+    shape_patches: List[Dict[str, Any]] = []
+    slide_patches: List[Dict[str, Any]] = []
     for patch in patches:
         if not isinstance(patch, dict):
             raise PatchError("patch must be an object")
         _validate_patch_sizes(patch)
+        if _canonical_action(patch) in SLIDE_ACTIONS:
+            slide_patches.append(patch)
+        else:
+            shape_patches.append(patch)
+    for patch in shape_patches:
         touched.add(_apply_one(prs, patch, seen))
+    if slide_patches:
+        touched.update(_apply_slide_patches(prs, slide_patches, n_orig))
     dst.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(dst))
     return touched
