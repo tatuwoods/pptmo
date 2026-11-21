@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
-import subprocess
+import subprocess  # noqa: F401  保留给非队列路径
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -57,44 +59,40 @@ def _render_pptx_locked(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> i
     profile = out_dir / f"_lo-profile-{uuid.uuid4().hex}"
     profile.mkdir(parents=True, exist_ok=True)
 
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        raise RenderError("LibreOffice (soffice) not found")
+    # ── 队列模式（v0.2.2）：转换交给 launchd 常驻 worker（Aqua 会话直接子进程）执行。
+    # uvicorn(launchd) 直接 spawn 的 soffice 在 launchd 会话链里会丢全部 CJK 字形
+    # （只剩 ASCII），而 launchd 直接派生的 bash worker 渲染正常（实测对照）。
+    queue_dir = Path(os.getenv(
+        "PPTMO_RENDER_QUEUE",
+        "/Users/tt06/.agents/skills/pptmo/app/backend/data/render-queue",
+    ))
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    task_id = f"{uuid.uuid4().hex}"
+    task_file = queue_dir / f"{task_id}.task"
+    done_file = task_file.with_suffix(".task.done")
+    task_file.write_text(f"{pptx_path}\t{out_dir}\t{scale}\n")
 
-    cmd = [
-        soffice,
-        f"-env:UserInstallation=file://{profile}",
-        "--headless",
-        "--norestore",
-        "--nologo",
-        "--nodefault",
-        "--convert-to",
-        "pdf",
-        "--outdir",
-        str(out_dir),
-        str(pptx_path),
-    ]
-    env = os.environ.copy()
-    env["SAL_USE_VCLPLUGIN"] = "svp"
-
-    try:
-        with _CONVERSION_LOCK:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=180,
-                env=env,
-            )
-    except subprocess.TimeoutExpired as exc:
-        shutil.rmtree(profile, ignore_errors=True)
-        raise RenderError("LibreOffice conversion timed out") from exc
+    # 等待 worker 完成（task 文件被认领移除 + done 文件出现；PDF 就绪即成功）
+    deadline = time.monotonic() + 180
+    worker_failed = None
+    while time.monotonic() < deadline:
+        if done_file.exists():
+            marker = done_file.read_text().strip()
+            if marker.startswith("fail"):
+                worker_failed = marker
+            break
+        if not task_file.exists() and any(out_dir.glob("*.pdf")):
+            break  # 已被认领且产出就绪
+        time.sleep(1)
+    if worker_failed:
+        raise RenderError(f"render worker failed: {worker_failed}")
+    if time.monotonic() >= deadline and not any(out_dir.glob("*.pdf")):
+        task_file.unlink(missing_ok=True)
+        raise RenderError("render worker timed out")
 
     pdfs = sorted(out_dir.glob("*.pdf"))
-    if proc.returncode != 0 or not pdfs:
-        detail = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[-1200:]
-        shutil.rmtree(profile, ignore_errors=True)
-        raise RenderError(f"LibreOffice conversion failed: {detail}")
+    if not pdfs:
+        raise RenderError("render worker produced no PDF")
 
     pdf_path = pdfs[0]
     thumb_scale = max(0.2, min(0.5, scale * 0.16))

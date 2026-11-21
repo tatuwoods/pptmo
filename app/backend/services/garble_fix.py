@@ -104,23 +104,56 @@ def _fix_text_runs(tf) -> int:
     return fixed
 
 
+# Windows 中文字体 → 本机存在且可被 PDF 嵌入的字体（Noto Sans CJK SC，
+# OFL 授权装在 ~/Library/Fonts）。受保护系统字体（Hiragino/PingFang 的 .ttc）
+# 在 LibreOffice PDF 导出时无法子集嵌入，导致渲染 PNG 中文字形空白。
+_CJK_FONT_REMAP = {
+    "Microsoft YaHei": "Noto Sans CJK SC",
+    "Microsoft YaHei UI": "Noto Sans CJK SC",
+    "微软雅黑": "Noto Sans CJK SC",
+    "微软雅黑 Light": "Noto Sans CJK SC Light",
+    "MS YaHei": "Noto Sans CJK SC",
+    "SimSun": "Noto Sans CJK SC",
+    "宋体": "Noto Sans CJK SC",
+    "SimHei": "Noto Sans CJK SC",
+    "黑体": "Noto Sans CJK SC",
+    "等线": "Noto Sans CJK SC",
+    "DengXian": "Noto Sans CJK SC",
+}
+
+
+def _remap_cjk_fonts(tf) -> int:
+    """把 Windows 中文字体声明替换为本机可嵌入的 Noto Sans CJK SC。"""
+    fixed = 0
+    for para in tf.paragraphs:
+        for run in para.runs:
+            name = run.font.name
+            if name and name in _CJK_FONT_REMAP:
+                run.font.name = _CJK_FONT_REMAP[name]
+                fixed += 1
+    return fixed
+
+
 def sanitize_wingdings(pptx_path: str | Path) -> tuple[int, int]:
     """就地修复 PPTX 的 Wingdings 乱码隐患。返回 (修复段落符号数, 修复文本字符数)。"""
     prs = Presentation(str(pptx_path))
     bullet_fixed = 0
     text_fixed = 0
+    font_fixed = 0
 
     def walk(shapes):
-        nonlocal bullet_fixed, text_fixed
+        nonlocal bullet_fixed, text_fixed, font_fixed
         for shape in shapes:
             if shape.has_text_frame:
                 bullet_fixed += _fix_bullets_on_text_frame(shape.text_frame)
                 text_fixed += _fix_text_runs(shape.text_frame)
+                font_fixed += _remap_cjk_fonts(shape.text_frame)
             if getattr(shape, "has_table", False) and shape.has_table:
                 for row in shape.table.rows:
                     for cell in row.cells:
                         bullet_fixed += _fix_bullets_on_text_frame(cell.text_frame)
                         text_fixed += _fix_text_runs(cell.text_frame)
+                        font_fixed += _remap_cjk_fonts(cell.text_frame)
             if shape.shape_type == 6:  # GROUP
                 walk(getattr(shape, "shapes", []))
 
