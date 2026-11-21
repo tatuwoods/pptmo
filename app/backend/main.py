@@ -627,6 +627,15 @@ def upload_document(file: UploadFile = File(...)):
         )
         doc_id = meta["doc_id"]
         storage.save_objects(doc_id, parsed)
+        # Wingdings 乱码防护：macOS 无 Wingdings 字体，私用区符号在 LibreOffice
+        # 渲染里变豆腐/乱码。上传即把 buFont/buChar 换成 Unicode 等价符号。
+        try:
+            from services.garble_fix import sanitize_wingdings
+            b_fixed, t_fixed = sanitize_wingdings(storage.current_path(doc_id))
+            if b_fixed or t_fixed:
+                logger.info("wingdings sanitized: %d bullets, %d chars", b_fixed, t_fixed)
+        except Exception as exc:  # 修复失败不阻塞上传
+            logger.warning("wingdings sanitize skipped: %s", exc)
         render.render_pptx(
             storage.current_path(doc_id),
             storage.render_dir(doc_id, 0),
