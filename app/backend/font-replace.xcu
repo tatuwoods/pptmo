@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+ <item oor:path="/org.openoffice.VCL/FontSubstitutions">
+  <node oor:name="Wingdings" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>Symbol;ZapfDingbats;Apple Symbols;OpenSymbol</value>
+   </prop>
+  </node>
+  <node oor:name="Webdings" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>Symbol;ZapfDingbats;Apple Symbols;OpenSymbol</value>
+   </prop>
+  </node>
+  <node oor:name="Microsoft YaHei" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>PingFang SC;Hiragino Sans GB;STHeiti;Noto Sans SC</value>
+   </prop>
+  </node>
+  <node oor:name="微软雅黑" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>PingFang SC;Hiragino Sans GB;STHeiti;Noto Sans SC</value>
+   </prop>
+  </node>
+  <node oor:name="微软雅黑 Light" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>PingFang SC;Hiragino Sans GB;STHeiti</value>
+   </prop>
+  </node>
+  <node oor:name="SimSun" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>PingFang SC;Songti SC;STSong</value>
+   </prop>
+  </node>
+  <node oor:name="SimHei" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>PingFang SC;Heiti SC;STHeiti</value>
+   </prop>
+  </node>
+  <node oor:name="Calibri" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>Carlito;Helvetica Neue;Arial</value>
+   </prop>
+  </node>
+  <node oor:name="Cambria" oor:op="fuse">
+   <prop oor:name="SubstFonts" oor:op="fuse">
+    <value>Caladea;Times New Roman</value>
+   </prop>
+  </node>
+ </item>
+</oor:items>

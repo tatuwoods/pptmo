@@ -2043,7 +2043,9 @@ function bindEvents() {
     }
   });
   try {
-    dom.autoApplyToggle.checked = localStorage.getItem("ppt-light-auto-apply") === "1";
+    // 默认自动执行：用户要求"直接改，留还原点即可"（版本历史即是回退点）。
+    // 无记录时默认开；用户手动关过才保持关（存 "0"）。
+    dom.autoApplyToggle.checked = localStorage.getItem("ppt-light-auto-apply") !== "0";
   } catch { /* ignore */ }
   dom.autoApplyToggle.addEventListener("change", () => {
     try { localStorage.setItem("ppt-light-auto-apply", dom.autoApplyToggle.checked ? "1" : "0"); } catch { /* ignore */ }
