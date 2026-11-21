@@ -248,6 +248,79 @@ def test_add_slide_bad_params(demo_pptx, tmp_path):
         )
 
 
+# ---------- partname uniqueness ----------
+# python-pptx names new slide parts by slide COUNT (len(sldIdLst)+1). After a
+# delete (or in decks whose partnames have gaps) that count reuses an existing
+# slideN.xml and the saved zip gets DUPLICATE entries — non-conformant OPC that
+# strict consumers reject. Our wrapper must reassign a genuinely free name.
+
+def _zip_names(path):
+    import zipfile
+
+    with zipfile.ZipFile(str(path)) as zf:
+        return [info.filename for info in zf.infolist()]
+
+
+def test_add_after_delete_keeps_zip_entries_unique(demo_pptx, tmp_path):
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        demo_pptx, dst,
+        [{"action": "delete_slide", "slide": 0}, {"action": "add_slide", "after_slide": 0}],
+    )
+    names = _zip_names(dst)
+    assert len(names) == len(set(names)), "duplicate zip entries (partname collision)"
+    prs = Presentation(str(dst))
+    assert len(prs.slides) == 3
+
+
+def test_duplicate_after_delete_keeps_zip_entries_unique(demo_pptx, tmp_path):
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        demo_pptx, dst,
+        [
+            {"action": "delete_slide", "slide": 0},
+            {"action": "duplicate_slide", "source_slide": 1},  # base numbering: table page
+        ],
+    )
+    names = _zip_names(dst)
+    assert len(names) == len(set(names)), "duplicate zip entries (partname collision)"
+    prs = Presentation(str(dst))
+    assert len(prs.slides) == 3
+    assert any(s.has_table for s in prs.slides[0].shapes)
+    assert any(s.has_table for s in prs.slides[1].shapes)
+
+
+def test_duplicate_of_deleted_slide_rejected(demo_pptx, tmp_path):
+    """Batch numbering refers to the BASE deck: a slide deleted earlier in the
+    same batch can no longer be addressed."""
+    with pytest.raises(edits.PatchError, match="deleted"):
+        edits.apply_patches_to_file(
+            demo_pptx, tmp_path / "o.pptx",
+            [
+                {"action": "delete_slide", "slide": 0},
+                {"action": "duplicate_slide", "source_slide": 0},
+            ],
+        )
+
+
+def test_mixed_slide_ops_no_zip_duplicates(demo_pptx, tmp_path):
+    """Delete + duplicates + add in one batch: names must stay unique throughout."""
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        demo_pptx, dst,
+        [
+            {"action": "delete_slide", "slide": 1},
+            {"action": "duplicate_slide", "source_slide": 0},
+            {"action": "duplicate_slide", "source_slide": 2},
+            {"action": "add_slide"},
+        ],
+    )
+    names = _zip_names(dst)
+    assert len(names) == len(set(names)), "duplicate zip entries (partname collision)"
+    prs = Presentation(str(dst))
+    assert len(prs.slides) == 5  # 3 - 1 + 2 clones + 1 blank
+
+
 # ---------- delete_slide ----------
 
 def test_delete_slide_middle(demo_pptx, tmp_path):
@@ -398,9 +471,12 @@ def test_slide_partnames_stay_unique_after_delete(demo_pptx, tmp_path):
         names = z.namelist()
         dupes = {n for n in names if names.count(n) > 1}
         assert not dupes, f"duplicate zip entries: {dupes}"
-    # content survived: 2 originals - 1 delete + 1 copy + 1 blank
+    # batch numbers are BASE-deck coordinates: [title, table, group] with title
+    # deleted, table copied to position 1, blank appended → [copy(table), table, group, blank]
     assert len(prs.slides) == 4
-    assert any("目录" in t for t in _texts_of(prs.slides[0]))
+    assert any(s.has_table for s in prs.slides[0].shapes)
+    assert any(s.has_table for s in prs.slides[1].shapes)
+    assert any("目录" in t for t in _texts_of(prs.slides[2]))
 
 
 # ---------- API layer ----------

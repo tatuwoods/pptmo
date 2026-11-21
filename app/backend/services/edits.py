@@ -10,6 +10,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.packuri import PackURI
 from pptx.oxml.ns import qn
 from pptx.util import Emu, Pt
 
@@ -571,6 +572,7 @@ def _clone_slide(prs, source) -> Any:
     """Deep-copy a slide into a new part reusing its layout: shapes, background,
     relationships (images/charts/... re-bound to the same target parts) and notes."""
     dest = prs.slides.add_slide(source.slide_layout)
+    _dedupe_slide_partname(dest)
     # add_slide clones layout placeholders; the source's own shapes replace them
     for shape in list(dest.shapes):
         _remove_shape(shape)
@@ -615,6 +617,26 @@ def _sld_ids(prs) -> List[Any]:
     return list(prs.slides._sldIdLst)
 
 
+def _dedupe_slide_partname(slide) -> None:
+    """python-pptx derives new slide partnames from len(sldIdLst)+1, so after a
+    delete (or in decks with non-contiguous numbering) the next add/copy can
+    collide with a live part; the package then saves with duplicate zip entries
+    and PowerPoint reads the wrong content for one of the two slides. Renaming
+    the fresh part to a free slot is safe: rels reference parts as objects and
+    [Content_Types].xml is rebuilt from partnames at save time."""
+    part = slide.part
+    others = {
+        str(p.partname) for p in part.package.iter_parts() if p is not part
+    }
+    name = str(part.partname)
+    if name not in others:
+        return
+    index = 1
+    while f"/ppt/slides/slide{index}.xml" in others:
+        index += 1
+    part._partname = PackURI(f"/ppt/slides/slide{index}.xml")
+
+
 def _move_sld_id(prs, from_index: int, to_index: int) -> None:
     sldIdLst = prs.slides._sldIdLst
     element = _sld_ids(prs)[from_index]
@@ -637,6 +659,7 @@ def _add_blank_slide_at(prs, layout_index: Optional[int], new_index: int) -> Non
             f"layout_index out of range: {layout_index} (deck has {len(layouts)} layouts)"
         )
     prs.slides.add_slide(layouts[layout_index])
+    _dedupe_slide_partname(prs.slides[len(prs.slides) - 1])
     last = len(prs.slides) - 1  # appended at the end first
     if new_index != last:
         _move_sld_id(prs, last, new_index)
