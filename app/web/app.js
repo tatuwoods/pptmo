@@ -1276,6 +1276,15 @@ function chatTraceHtml(trace) {
     <div class="chat-trace-step"><b>${Number(step.step) || ""}</b><span>${escapeHtml(step.detail || step.action || "")}</span></div>`).join("")}</div></details>`;
 }
 
+function planListHtml(steps) {
+  const items = (Array.isArray(steps) ? steps : [])
+    .map((step) => String(step || "").trim())
+    .filter(Boolean);
+  if (!items.length) return "";
+  return `<div class="plan-block"><div class="plan-head">我将：</div><ol class="plan-list">${items
+    .map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol></div>`;
+}
+
 function chatMessageHtml(message) {
   const role = message.role === "user" ? "user" : (message.role === "system" ? "system" : "assistant");
   const content = escapeHtml(message.content || "");
@@ -1289,7 +1298,8 @@ function chatMessageHtml(message) {
   if (message.scope) tags.push(`<span>${escapeHtml(message.scope)}</span>`);
   if (message.model) tags.push(`<span>${escapeHtml(message.model)}</span>`);
   const trace = chatTraceHtml(message.trace);
-  return `<div class="chat-msg ${role}"><div class="chat-avatar">${role === "user" ? "你" : "AI"}</div><div class="chat-bubble"><div class="chat-text">${content}</div><div class="chat-meta">${tags.join("")}<span>${escapeHtml(formatDate(message.at))}</span></div>${trace}</div></div>`;
+  const plan = planListHtml(message.plan);
+  return `<div class="chat-msg ${role}"><div class="chat-avatar">${role === "user" ? "你" : "AI"}</div><div class="chat-bubble"><div class="chat-text">${content}</div>${plan}<div class="chat-meta">${tags.join("")}<span>${escapeHtml(formatDate(message.at))}</span></div>${trace}</div></div>`;
 }
 
 function renderChat() {
@@ -1409,6 +1419,8 @@ function toolLabel(action, args = {}) {
   if (action === "search_text") return `搜索「${args.query || ""}」`;
   if (action === "read_table") return `读取表格 ${args.table_shape_id || ""}`;
   if (action === "inspect_shapes") return "查看对象细节";
+  if (action === "plan") return "制定计划";
+  if (action === "undo_last") return "撤销上一轮";
   if (action === "propose_operations") return `提交 ${Number(args.count || 0)} 项操作`;
   if (action === "finish") return "完成";
   return action || "执行工具";
@@ -1420,6 +1432,7 @@ function createLiveBubble() {
       <div class="chat-bubble chat-live">
         <div class="live-head"><span class="live-dot"></span><span class="live-head-text">AI 正在连接…</span></div>
         <div class="live-thought"></div>
+        <div class="live-plan"></div>
         <div class="live-steps"></div>
         <div class="live-output"></div>
       </div>
@@ -1429,6 +1442,7 @@ function createLiveBubble() {
     root,
     head: root.querySelector(".live-head-text"),
     thought: root.querySelector(".live-thought"),
+    plan: root.querySelector(".live-plan"),
     steps: root.querySelector(".live-steps"),
     output: root.querySelector(".live-output"),
     raw: "",
@@ -1462,6 +1476,14 @@ function handleChatEvent(event, data, live, doneRef) {
     if (thought) live.thought.textContent = thought;
   } else if (event === "thought") {
     live.thought.textContent = data.text || "";
+  } else if (event === "plan") {
+    // 多步计划：先把「我将：1… 2… 3…」亮出来，后面的 tool_call 行就是逐项执行
+    live.plan.innerHTML = planListHtml(data.steps);
+    live.head.textContent = "已制定计划 · 正在逐步执行…";
+  } else if (event === "retry") {
+    // 自愈重试：丢掉上一次尝试流出的半截 token，否则会和重试输出拼成一段乱码思考
+    live.raw = "";
+    live.head.textContent = `第 ${Number(data.step) || live.step} 步 · ${data.message || "AI 服务波动，自动重试一次"}`;
   } else if (event === "tool_call") {
     addLiveStep(live, data.step, data.action, data.args || {});
     live.head.textContent = `第 ${Number(data.step) || ""} 步 · ${toolLabel(data.action, data.args || {})}`;
@@ -1544,6 +1566,19 @@ function showPendingOperations(operations, baseVersion, messageId) {
 async function finalizeChat(done, slideIndex, docId) {
   const targetDocId = docId || state.doc?.doc_id;
   if (!targetDocId) return;
+  if (done.undo) {
+    // AI 调过 undo_last：服务端已经提交了回退版本，画布和版本号必须跟上 ——
+    // 只刷新 messages 会让界面停在旧版本，下一次操作直接撞 409
+    try {
+      const doc = await api(`/api/docs/${targetDocId}`, {}, 90000);
+      if (state.doc?.doc_id === targetDocId) {
+        applyDocument(doc, { preserveSelection: false, clearPatches: true });
+        toast(`AI 已撤销上一轮，当前为 ${done.undo.new_version || doc.version_id}`, "success");
+      }
+    } catch (error) {
+      toast(`收尾失败：${error.message || error}`, "error");
+    }
+  }
   if (done.applied) {
     const doc = await api(`/api/docs/${targetDocId}`, {}, 90000);
     if (state.doc?.doc_id !== targetDocId) {

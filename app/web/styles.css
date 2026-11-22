@@ -806,6 +806,17 @@ select.mini-input { width: 82px; }
 .composer-hint { flex: 1; min-width: 0; font-size: 9px; color: var(--muted-2); line-height: 1.4; }
 .chat-composer .notice { margin-top: 6px; }
 
+/* ---------- v0.3: multi-step plan in the chat (我将：1… 2… 3…) ---------- */
+.plan-block {
+  margin-top: 7px; padding: 7px 10px 8px;
+  border-left: 2px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+}
+.plan-head { font-size: 9.5px; font-weight: 700; color: var(--accent-strong); }
+.plan-list { margin: 4px 0 0; padding-left: 16px; font-size: 10px; line-height: 1.6; color: var(--ink); }
+.plan-list li::marker { color: var(--accent-strong); font-weight: 700; }
+
 
 /* ---------- v0.3: dark mode follows the system ---------- */
 @media (prefers-color-scheme: dark) {

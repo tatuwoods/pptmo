@@ -410,6 +410,11 @@ def _finalize_chat(
     trace = done_data.get("trace")
     if not isinstance(trace, list):
         trace = []
+    plan = done_data.get("plan")
+    if isinstance(plan, list):
+        plan = [str(step)[:200] for step in plan][:12]
+    else:
+        plan = []
     summary = str(done_data.get("summary") or "")
     reply = str(done_data.get("reply") or "")
     question = str(done_data.get("question") or "")
@@ -447,6 +452,8 @@ def _finalize_chat(
             "steps": int(done_data.get("steps") or 0),
             "finished": bool(done_data.get("finished")),
             "error": str(error) if error else None,
+            # 多步计划（plan 工具）随消息落盘：刷新页面后聊天区仍能看到「我将：1… 2… 3…」
+            "plan": plan or None,
         }
         storage.append_messages(doc_id, [assistant_message])
 
