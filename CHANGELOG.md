@@ -87,6 +87,21 @@
   blocks numbering
 - `z_order front` stays before a trailing `p:extLst`
 - `table_mod` add/delete row/col keep the frame size in step with the grid
+- `table_mod merge_cells` keeps every cell's text (python-pptx already
+  concatenates them into the origin like PowerPoint; the pre-clear dropped
+  them) and accepts the two corners in either order — the origin is always
+  the top-left cell
+- `add_page_numbers` writes a live `slidenum` field when numbering from 1, so
+  numbers follow pages that are duplicated/deleted/moved (start ≠ 1 still
+  writes plain digits: LibreOffice ignores the deck's start number in fields);
+  duplicated slides/objects get fresh field ids; without `start` the deck's
+  own first-slide number is honored
+- Exports under a render-timeout degradation (E21): re-renders for export go
+  to a scratch dir and only replace the committed one on success, so a second
+  timeout can't wipe the previews the UI is showing; `export/images.zip` no
+  longer ships the previous version's stale pages; a successful re-render
+  clears `_partial` + `render_partial`; a duplicate never inherits the
+  degraded flag (ported from the `fix/v0.3-audit` branch)
 
 ## v0.2.0 — slide-level operations (2026-11-21)
 
