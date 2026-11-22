@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import PP_ALIGN
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.opc.packuri import PackURI
@@ -401,6 +402,36 @@ def _validate_before(patch: Dict[str, Any], current_text: str, shape_id: str) ->
             f"shape {shape_id} changed on the server; refresh and retry"
             f"（对象 {shape_id} 的原文已变化，请刷新后重试）"
         )
+
+
+def _own_xfrm(element):
+    """The shape's own `a:xfrm`; None when its box is inherited from the layout."""
+    for container_tag in ("p:spPr", "p:grpSpPr"):
+        container = element.find(qn(container_tag))
+        if container is not None:
+            xfrm = container.find(qn("a:xfrm"))
+            if xfrm is not None:
+                return xfrm
+    return element.find(qn("p:xfrm"))  # graphicFrame
+
+
+def _pin_inherited_box(shape) -> None:
+    """Write a shape's inherited box as an explicit a:xfrm before a coordinate is set.
+
+    Placeholders usually carry no a:xfrm and inherit position and size from
+    their layout. python-pptx resolves those for reads, but assigning e.g.
+    `.left` creates an a:xfrm holding just that value, so the shape snaps to
+    y=0 (or x=0). Writing all four resolved values first keeps the axes that
+    are not being edited where they render.
+    """
+    xfrm = _own_xfrm(shape._element)
+    if xfrm is not None and xfrm.find(qn("a:off")) is not None and xfrm.find(qn("a:ext")) is not None:
+        return
+    left, top, width, height = shape.left, shape.top, shape.width, shape.height
+    if None in (left, top, width, height):
+        return
+    box = (Emu(int(left)), Emu(int(top)), Emu(int(width)), Emu(int(height)))
+    shape.left, shape.top, shape.width, shape.height = box
 
 
 def _apply_geometry(shape, bbox: Dict[str, Any], slide_w: int, slide_h: int) -> None:
@@ -911,10 +942,22 @@ def _apply_duplicate_object(slide, shape, offset_raw: Any, slide_w: int, slide_h
     # groups (offsets live in the parent's coordinate space either way)
     new_left = max(0, int(shape.left or 0) + dx)
     new_top = max(0, int(shape.top or 0) + dy)
-    for off in new_el.iter(qn("a:off")):
+    off = next(new_el.iter(qn("a:off")), None)
+    if off is not None:
         off.set("x", str(new_left))
         off.set("y", str(new_top))
-        break
+    else:
+        # the source inherits its box (placeholder without a:xfrm): a copy
+        # without one of its own stacks exactly under the original
+        width, height = shape.width, shape.height
+        sp_pr = new_el.find(qn("p:spPr"))
+        if None in (width, height) or sp_pr is None:
+            raise PatchError("shape has no box of its own to copy")
+        xfrm = parse_xml(
+            f'<a:xfrm {nsdecls("a")}><a:off x="{new_left}" y="{new_top}"/>'
+            f'<a:ext cx="{int(width)}" cy="{int(height)}"/></a:xfrm>'
+        )
+        sp_pr.insert(0, xfrm)
     shape._element.addnext(new_el)
     # same slide part → copied rId references stay valid; no rel rebinding needed
 
@@ -950,7 +993,12 @@ def _apply_z_order(slide, shape, mode_raw: Any) -> None:  # noqa: ARG001 (slide 
     children = list(parent)
     if mode == "front":
         parent.remove(element)
-        parent.append(element)
+        # p:extLst closes spTree / grpSp; a shape after it breaks the sequence
+        ext_lst = next((c for c in parent if c.tag == qn("p:extLst")), None)
+        if ext_lst is None:
+            parent.append(element)
+        else:
+            ext_lst.addprevious(element)
     elif mode == "back":
         parent.remove(element)
         insert_at = 0
@@ -1195,6 +1243,9 @@ def _apply_align_objects(prs, patch: Dict[str, Any]) -> int:
             shapes.append(shape)
     if len(shapes) < 2:
         raise PatchError("align_objects 需要至少 2 个不同对象")
+    # a placeholder inherits its box; pin it before the first coordinate write
+    for shape in shapes:
+        _pin_inherited_box(shape)
 
     rects = [
         (int(s.left or 0), int(s.top or 0), int(s.width or 0), int(s.height or 0))
@@ -1517,6 +1568,76 @@ def _para_default_size_pt(paragraph) -> Optional[float]:
     return None
 
 
+def _sz_pt(rpr) -> Optional[float]:
+    """`sz` of an rPr-like element (rPr/defRPr/endParaRPr) in points; None when absent."""
+    if rpr is None or not rpr.get("sz"):
+        return None
+    try:
+        value = int(rpr.get("sz")) / 100.0
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _lst_style_size_pt(tx_body, level: int) -> Optional[float]:
+    """Size declared for a paragraph level (0-based) in a text body's a:lstStyle."""
+    lst_style = tx_body.find(qn("a:lstStyle")) if tx_body is not None else None
+    if lst_style is None:
+        return None
+    lvl = lst_style.find(qn(f"a:lvl{level + 1}pPr"))
+    return _sz_pt(lvl.find(qn("a:defRPr"))) if lvl is not None else None
+
+
+_TITLE_PH_TYPES = frozenset({PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE})
+_BODY_PH_TYPES = frozenset({PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT, PP_PLACEHOLDER.SUBTITLE})
+
+
+def _placeholder_size_pt(shape, level: int) -> Optional[float]:
+    """Size a placeholder run inherits: the layout placeholder's list style, the
+    master placeholder's, then the master text style for the placeholder type."""
+    try:
+        fmt = shape.placeholder_format
+        layout = shape.part.slide_layout
+        master = layout.slide_master
+        layout_base = layout.placeholders.get(idx=fmt.idx)
+    except (AttributeError, KeyError, ValueError):
+        return None
+    try:
+        master_base = master.placeholders.get(fmt.type)  # keyed by type, not idx
+    except Exception:
+        master_base = None
+    for base in (layout_base, master_base):
+        if base is not None:
+            size = _lst_style_size_pt(base._element.find(qn("p:txBody")), level)
+            if size is not None:
+                return size
+    if fmt.type in _TITLE_PH_TYPES:
+        style_tag = "p:titleStyle"
+    elif fmt.type in _BODY_PH_TYPES:
+        style_tag = "p:bodyStyle"
+    else:
+        style_tag = "p:otherStyle"
+    tx_styles = master._element.find(qn("p:txStyles"))
+    style = tx_styles.find(qn(style_tag)) if tx_styles is not None else None
+    lvl = style.find(qn(f"a:lvl{level + 1}pPr")) if style is not None else None
+    return _sz_pt(lvl.find(qn("a:defRPr"))) if lvl is not None else None
+
+
+def _effective_size_pt(shape, paragraph, run) -> float:
+    """Font size a run renders at, following where PowerPoint inherits it from:
+    the run, the paragraph defaults, the shape's list style, then — for
+    placeholders — `_placeholder_size_pt`. 18pt when nothing declares one."""
+    if run.font.size is not None:
+        return run.font.size.pt
+    level = int(paragraph.level or 0)
+    size = _para_default_size_pt(paragraph)
+    if size is None:
+        size = _lst_style_size_pt(shape.text_frame._txBody, level)
+    if size is None and getattr(shape, "is_placeholder", False):
+        size = _placeholder_size_pt(shape, level)
+    return size if size is not None else 18.0
+
+
 def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     raw_delta = merged.get("delta_pt", merged.get("delta", merged.get("by")))
     try:
@@ -1532,12 +1653,9 @@ def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
         changed = False
         for target in _iter_text_targets(slide):
             for paragraph in target.text_frame.paragraphs:
-                inherited = _para_default_size_pt(paragraph)
                 for run in paragraph.runs:
-                    current = run.font.size.pt if run.font.size is not None else inherited
-                    base = current if current is not None else 18.0
-                    new_size = max(6.0, min(400.0, base + delta))
-                    run.font.size = Pt(new_size)
+                    base = _effective_size_pt(target, paragraph, run)
+                    run.font.size = Pt(max(6.0, min(400.0, base + delta)))
                     changed = True
         if changed:
             touched.add(all_slides.index(slide))
@@ -1545,6 +1663,8 @@ def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
 
 
 PAGE_NUMBER_POSITIONS = {"bottom-left", "bottom-center", "bottom-right"}
+# name stamped on the boxes add_page_numbers creates; the repeat guard keys on it
+PAGE_NUMBER_NAME_PREFIX = "页码 "
 
 
 def _op_add_page_numbers(prs, merged: Dict[str, Any]) -> Set[int]:
@@ -1574,12 +1694,9 @@ def _op_add_page_numbers(prs, merged: Dict[str, Any]) -> Set[int]:
         # idempotency guard: a second run over an already numbered deck is a
         # user error (duplicate numbers), not a silent no-op
         for shape in slide.shapes:
-            try:
-                text = shape.text.strip() if getattr(shape, "has_text_frame", False) else ""
-                small = int(shape.width or 0) <= box_w and int(shape.height or 0) <= box_h
-            except Exception:
-                continue
-            if text == str(index + start) and small:
+            # keyed on the name this op stamps on its own boxes: matching on
+            # "text equals the page number" also caught unrelated number tiles
+            if str(getattr(shape, "name", "") or "").startswith(PAGE_NUMBER_NAME_PREFIX):
                 raise PatchError(f"第 {index + 1} 页似乎已有页码；如需重加请先删除旧页码")
         if skip_first and index == 0:
             continue
@@ -1591,6 +1708,7 @@ def _op_add_page_numbers(prs, merged: Dict[str, Any]) -> Set[int]:
         else:
             x, align = slide_w - box_w - margin, PP_ALIGN.RIGHT
         box = slide.shapes.add_textbox(Emu(x), Emu(slide_h - box_h - margin), Emu(box_w), Emu(box_h))
+        box.name = f"{PAGE_NUMBER_NAME_PREFIX}{number}"
         tf = box.text_frame
         tf.word_wrap = False
         try:

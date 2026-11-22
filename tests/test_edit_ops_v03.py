@@ -1167,3 +1167,148 @@ def test_agent_replace_image_rejected_in_chat(demo_pptx):
     store = _store_of(demo_pptx, "换掉图片")
     reason = _drop_reason(store, [{"action": "replace_image", "shape_id": "s0_id5"}])
     assert "图片" in reason or "image" in reason
+
+
+# ---------- 占位符继承 / 边界（v0.3.0 复核回归） ----------
+# 版式占位符通常不带 a:xfrm、run 不带 sz：位置、尺寸、字号都继承自版式和母版。
+# python-pptx 读取时会解析继承值，但只写一个坐标会生成「其余为 0」的 a:xfrm。
+
+
+def _placeholder_deck(path):
+    """「标题和内容」版式：标题 + 正文占位符，均不带 a:xfrm（位置继承自版式）。"""
+    from pptx.oxml.ns import qn
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    slide.shapes.title.text_frame.text = "标题"
+    slide.placeholders[1].text_frame.text = "正文"
+    for shape in (slide.shapes.title, slide.placeholders[1]):
+        assert shape._element.spPr.find(qn("a:xfrm")) is None, "测试前提：占位符不带 a:xfrm"
+    prs.save(str(path))
+    return prs, slide
+
+
+def _box(shape):
+    return (shape.left, shape.top, shape.width, shape.height)
+
+
+@pytest.mark.parametrize(
+    "mode, kept", [("left", 1), ("hcenter", 1), ("top", 0), ("vcenter", 0)]
+)
+def test_align_objects_keeps_inherited_other_axis(tmp_path, mode, kept):
+    """A3：占位符位置继承自版式时，对齐只能动一个方向。
+    kept=1 → 模式只改 x，y 必须不变；kept=0 → 模式只改 y，x 必须不变。
+    只写一个坐标会让 python-pptx 生成另一轴为 0 的 a:xfrm，对象全叠到页面边缘。"""
+    src = tmp_path / "ph.pptx"
+    _prs, slide = _placeholder_deck(src)
+    title, body = slide.shapes.title, slide.placeholders[1]
+    before = [_box(s) for s in (title, body)]
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst,
+        [{"action": "align_objects", "align": mode,
+          "shape_ids": [f"s0_id{title.shape_id}", f"s0_id{body.shape_id}"]}],
+    )
+    out = Presentation(str(dst))
+    moved = (out.slides[0].shapes.title, out.slides[0].placeholders[1])
+    assert [_box(s)[2:] for s in moved] == [b[2:] for b in before]  # 尺寸不变
+    assert [_box(s)[kept] for s in moved] == [b[kept] for b in before]  # 不动的方向不变
+
+    # 对齐方向：边缘对齐比边缘，居中对齐比中心
+    def aligned(s):
+        left, top, width, height = _box(s)
+        if mode == "hcenter":
+            return left + width // 2
+        if mode == "vcenter":
+            return top + height // 2
+        return _box(s)[1 - kept]
+
+    assert abs(aligned(moved[0]) - aligned(moved[1])) <= 1  # 允许取整误差
+
+
+def test_duplicate_object_placeholder_without_xfrm(tmp_path):
+    """A4：复制位置继承自版式的占位符，副本要带上显式位置（原位 + 偏移）；
+    否则与原对象完全重合，副本看不见。"""
+    src = tmp_path / "ph.pptx"
+    _prs, slide = _placeholder_deck(src)
+    title = slide.shapes.title
+    left, top, width, height = _box(title)
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst,
+        [{"action": "duplicate_object", "shape_id": f"s0_id{title.shape_id}",
+          "offset_emu": {"x": 457200, "y": 457200}}],
+    )
+    out = Presentation(str(dst))
+    copies = sorted((s for s in out.slides[0].shapes if s.name == title.name), key=lambda s: s.top)
+    assert len(copies) == 2
+    original, copy = copies
+    assert _box(original) == (left, top, width, height)  # 原对象不动
+    assert (copy.left, copy.top) == (left + 457200, top + 457200)
+    assert (copy.width, copy.height) == (width, height)
+
+
+def test_z_order_front_stays_before_extlst(demo_pptx, tmp_path):
+    """A5：spTree 末尾带 p:extLst 时，置顶的对象不能排到 extLst 之后（元素顺序不合规）。"""
+    from pptx.oxml.ns import qn
+
+    prs = Presentation(str(demo_pptx))
+    tree = prs.slides[0].shapes._spTree
+    tree.append(tree.makeelement(qn("p:extLst"), {}))
+    moved_id = prs.slides[0].shapes[0].shape_id
+    src = tmp_path / "ext.pptx"
+    prs.save(str(src))
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst, [{"action": "z_order", "shape_id": f"s0_id{moved_id}", "mode": "front"}]
+    )
+    children = list(Presentation(str(dst)).slides[0].shapes._spTree)
+    assert children[-1].tag == qn("p:extLst")
+    assert children[-2].find(qn("p:nvSpPr")).find(qn("p:cNvPr")).get("id") == str(moved_id)
+
+
+def test_add_page_numbers_number_text_elsewhere_not_blocked(demo_pptx, tmp_path):
+    """A9：页面上的小文本框恰好是数字（如指标卡「3」）不是页码，不能因此拒绝加页码。"""
+    prs = Presentation(str(demo_pptx))
+    tile = prs.slides[2].shapes.add_textbox(Emu(8000000), Emu(2000000), Emu(800000), Emu(300000))
+    tile.text_frame.text = "3"
+    src = tmp_path / "tile.pptx"
+    prs.save(str(src))
+    dst = tmp_path / "out.pptx"
+    touched = edits.apply_patches_to_file(src, dst, [{"action": "add_page_numbers"}])
+    assert touched == {0, 1, 2}
+    added = [
+        [s.text for s in slide.shapes if (s.name or "").startswith(edits.PAGE_NUMBER_NAME_PREFIX)]
+        for slide in Presentation(str(dst)).slides
+    ]
+    assert added == [["1"], ["2"], ["3"]]
+
+
+def test_add_page_numbers_twice_rejected_even_with_other_start(demo_pptx, tmp_path):
+    """重复加页码的拦截靠页码框自己的名字，不能靠「文字等于页码」的猜测：
+    换一个起始页号再跑，旧的编号框也必须被认出来。"""
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(demo_pptx, dst, [{"action": "add_page_numbers"}])
+    with pytest.raises(edits.PatchError, match="页码"):
+        edits.apply_patches_to_file(
+            dst, tmp_path / "o.pptx", [{"action": "add_page_numbers", "start": 5}]
+        )
+
+
+def test_font_scale_resolves_placeholder_inherited_sizes(tmp_path):
+    """A10：占位符 run 没有显式字号，实际字号继承自母版 txStyles（默认模板 44/32/28pt）。
+    必须按渲染字号缩放；按默认 18pt 起算会把 44pt 的标题变成 20pt。"""
+    src = tmp_path / "ph.pptx"
+    prs, slide = _placeholder_deck(src)
+    body = slide.placeholders[1].text_frame
+    body.paragraphs[0].runs[0].text = "一级要点"
+    second = body.add_paragraph()
+    second.level = 1
+    second.add_run().text = "二级要点"
+    prs.save(str(src))
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(src, dst, [{"action": "font_scale", "delta_pt": 2}])
+    sizes = {run.text: run.font.size.pt for run in _all_runs(Presentation(str(dst))) if run.text}
+    assert sizes["标题"] == 46  # 母版 titleStyle 一级 44pt
+    assert sizes["一级要点"] == 34  # 母版 bodyStyle 一级 32pt
+    assert sizes["二级要点"] == 30  # 母版 bodyStyle 二级 28pt
