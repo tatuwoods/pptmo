@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import pymupdf
 
@@ -22,6 +23,21 @@ class RenderBusy(RenderError):
     """Raised when the render queue is saturated; routes answer 429."""
 
 
+# v0.3: every render dir keeps one PDF under this name for /export/pdf
+EXPORT_PDF_NAME = "export.pdf"
+
+
+def keep_pdf(out_dir: Path, pdf_path: Path) -> Path:
+    """Move the freshly rendered PDF into out_dir under the export name.
+
+    Renamed (not left as the soffice basename) so the wait-loop's *.pdf glob
+    only ever sees fresh worker output; out_dir files are cleared at the start
+    of each render, so stale copies can't accumulate."""
+    target = out_dir / EXPORT_PDF_NAME
+    os.replace(pdf_path, target)
+    return target
+
+
 _queue_slots = threading.BoundedSemaphore(max(1, int(os.getenv("RENDER_QUEUE_MAX", "4"))))
 _queue_depth_lock = threading.Lock()
 _queue_depth = 0
@@ -34,7 +50,42 @@ def _max_pages() -> int:
         return 500
 
 
-def render_pptx(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> int:
+def _timeout_s() -> int:
+    """Worker wait timeout; env-tunable so tests/ops can shorten it."""
+    try:
+        return max(1, int(os.getenv("RENDER_TIMEOUT_S", "180")))
+    except (TypeError, ValueError):
+        return 180
+
+
+def partial_marker(out_dir: Path) -> Path:
+    """Marker written when a render degraded to stale pages (v0.3 E21)."""
+    return Path(out_dir) / "_partial"
+
+
+def _degrade_to_stale(out_dir: Path, stale_dir: Optional[Path]) -> Optional[int]:
+    """Timeout fallback (E21): reuse the previous version's page images.
+
+    Returns the page count restored, or None when no stale pages exist (the
+    caller then keeps the hard-fail behaviour)."""
+    if not stale_dir:
+        return None
+    pages = sorted(Path(stale_dir).glob("slide-*.png"))
+    if not pages:
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for page in pages:
+        shutil.copy2(page, out_dir / page.name)
+        thumb = page.with_name(page.name.replace("slide-", "thumb-", 1))
+        if thumb.exists():
+            shutil.copy2(thumb, out_dir / thumb.name)
+    partial_marker(out_dir).write_text("stale", encoding="utf-8")
+    return len(pages)
+
+
+def render_pptx(
+    pptx_path: Path, out_dir: Path, scale: float = 2.0, stale_dir: Optional[Path] = None
+) -> int:
     global _queue_depth
     # bound the wait queue: without this, a burst of requests queues behind a
     # 180s conversion and head-of-line blocks every mutation endpoint
@@ -43,14 +94,16 @@ def render_pptx(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> int:
     with _queue_depth_lock:
         _queue_depth += 1
     try:
-        return _render_pptx_locked(pptx_path, out_dir, scale)
+        return _render_pptx_locked(pptx_path, out_dir, scale, stale_dir=stale_dir)
     finally:
         with _queue_depth_lock:
             _queue_depth -= 1
         _queue_slots.release()
 
 
-def _render_pptx_locked(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> int:
+def _render_pptx_locked(
+    pptx_path: Path, out_dir: Path, scale: float = 2.0, stale_dir: Optional[Path] = None
+) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     for item in out_dir.iterdir():
         if item.is_file():
@@ -73,7 +126,7 @@ def _render_pptx_locked(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> i
     task_file.write_text(f"{pptx_path}\t{out_dir}\t{scale}\n")
 
     # 等待 worker 完成（task 文件被认领移除 + done 文件出现；PDF 就绪即成功）
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + _timeout_s()
     worker_failed = None
     while time.monotonic() < deadline:
         if done_file.exists():
@@ -88,6 +141,10 @@ def _render_pptx_locked(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> i
         raise RenderError(f"render worker failed: {worker_failed}")
     if time.monotonic() >= deadline and not any(out_dir.glob("*.pdf")):
         task_file.unlink(missing_ok=True)
+        # E21 超时降级：上一版页图仍可用时不整单失败，返回已生成的页并标记部分渲染
+        degraded = _degrade_to_stale(out_dir, stale_dir)
+        if degraded is not None:
+            return degraded
         raise RenderError("render worker timed out")
 
     pdfs = sorted(out_dir.glob("*.pdf"))
@@ -113,7 +170,7 @@ def _render_pptx_locked(pptx_path: Path, out_dir: Path, scale: float = 2.0) -> i
         doc.close()
     finally:
         try:
-            pdf_path.unlink()
+            keep_pdf(out_dir, pdf_path)
         except OSError:
             pass
         shutil.rmtree(profile, ignore_errors=True)

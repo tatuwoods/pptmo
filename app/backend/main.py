@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.datastructures import Headers as StarletteHeaders
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -178,7 +180,7 @@ def _sanitize_detail(text: Any) -> str:
     return clean
 
 
-app = FastAPI(title="PPT Light", version="0.2.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
+app = FastAPI(title="PPT Light", version="0.3.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
 app.add_middleware(GZipMiddleware, minimum_size=1500)
 app.add_middleware(
     CORSMiddleware,
@@ -331,6 +333,8 @@ def _serialize(meta: Dict[str, Any], objects_payload: Dict[str, Any]) -> Dict[st
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         "render_scale": RENDER_SCALE,
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+        # E21：本版渲染是否降级为旧页图（部分页渲染中）
+        "render_partial": bool(objects_payload.get("render_partial")),
     }
 
 
@@ -353,11 +357,24 @@ def _prepare_commit(doc_id: str, work_path: Path, new_version: int):
     """
     render_dir = storage.render_dir(doc_id, new_version)
     try:
-        page_count = render.render_pptx(work_path, render_dir, scale=RENDER_SCALE)
+        # E21 超时降级：把上一版渲染目录作为 stale 来源——worker 卡死时
+        # 复用旧页图继续提交，而不是整单失败
+        try:
+            current_version = int(storage.load_meta(doc_id).get("version", 0))
+        except (OSError, ValueError):
+            current_version = new_version - 1
+        stale_dir = (
+            storage.render_dir(doc_id, current_version)
+            if current_version >= 0 and current_version != new_version
+            else None
+        )
+        page_count = render.render_pptx(work_path, render_dir, scale=RENDER_SCALE, stale_dir=stale_dir)
         _objs, objects_payload = parse.parse_pptx(work_path)
         del _objs
         if page_count != objects_payload.get("slide_count"):
             page_count = objects_payload.get("slide_count", page_count)
+        if render.partial_marker(render_dir).exists():
+            objects_payload["render_partial"] = True
         return render_dir, objects_payload, int(page_count)
     except Exception:
         shutil.rmtree(render_dir, ignore_errors=True)
@@ -562,7 +579,7 @@ def health():
     return {
         "ok": True,
         "service": "ppt-light",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "ai_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         "libreoffice": bool(shutil.which("soffice") or shutil.which("libreoffice")),
@@ -585,16 +602,30 @@ def list_sessions():
 def upload_document(file: UploadFile = File(...)):
     original = Path(file.filename or "presentation.pptx").name
     safe_name = re.sub(r"[\x00-\x1f]", "", original).strip() or "presentation.pptx"
+    # E22：旧版二进制格式给出明确去向，而不是笼统的“只支持 .pptx”
+    suffix = safe_name.lower().rsplit(".", 1)[-1] if "." in safe_name else ""
+    if suffix in {"ppt", "pptm", "pps", "ppsm"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f".{suffix} 是旧版/宏格式：请先在 PowerPoint 中转存为 .pptx 再上传",
+        )
     if not safe_name.lower().endswith(".pptx"):
         raise HTTPException(status_code=400, detail="只支持 .pptx 文件")
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"文件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 限制",
+            detail=(
+                f"文件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 限制，"
+                "请压缩图片/媒体后重试"
+            ),
         )
+    if len(data) == 0:
+        raise HTTPException(status_code=400, detail="上传的文件是空的，请检查后重新选择")
     if len(data) < 100:
-        raise HTTPException(status_code=400, detail="文件为空或损坏")
+        raise HTTPException(
+            status_code=400, detail="文件过小或已损坏：请确认导出的是有效 .pptx"
+        )
 
     storage.ensure_dirs()
     tmp_dir = storage.DATA_DIR / "tmp"
@@ -779,6 +810,7 @@ def chat(doc_id: str, body: ChatIn):
                 history=history,
                 base_version=start_version,
                 auto_apply=bool(body.auto_apply),
+                undo_last=lambda base_version: _undo_core(doc_id, base_version),
             )
         except Exception as exc:
             message_text = str(exc) or "Agent 执行失败"
@@ -1095,6 +1127,73 @@ def restore_version(doc_id: str, version_id: str, body: Optional[RestoreIn] = No
     return result
 
 
+def _undo_core(doc_id: str, base_version: Optional[int]) -> Dict[str, Any]:
+    """把上一个版本快照落成新版本（撤销上一轮修改，历史不丢）。
+
+    Endpoint 与 agent 的 undo_last 工具共用；冲突时抛 PatchConflict，
+    初始版本抛 ValueError，由调用方决定 HTTP 语义。
+    """
+    # ---- phase 1 (short lock): allocate the version id ----
+    with storage.lock_for(doc_id):
+        meta = storage.load_meta(doc_id)
+        current = int(meta.get("version", 0))
+        if current < 1:
+            raise ValueError("当前是初始版本，没有可撤销的修改")
+        if base_version is not None and int(base_version) != current:
+            raise edits.PatchConflict("文档已经更新，请刷新后再撤销")
+        restored_id = f"v{current - 1}"
+        source = storage.version_file(doc_id, restored_id)
+        new_version, _ = storage.next_version_id(meta)
+
+    # ---- phase 2 (no lock): copy + render + parse ----
+    work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+    render_dir: Optional[Path] = None
+    try:
+        shutil.copy2(source, work_path)
+        render_dir, objects_payload, page_count = _prepare_commit(doc_id, work_path, new_version)
+    except Exception:
+        try:
+            work_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    # ---- phase 3 (short lock): commit + record ----
+    try:
+        with storage.lock_for(doc_id):
+            committed, objects_payload = _commit_prepared_locked(
+                doc_id, new_version, f"撤销上一轮（回到 {restored_id}）", work_path, render_dir,
+                objects_payload, page_count,
+            )
+            result = _commit_result(committed, objects_payload)
+            result["restored_from"] = restored_id
+            message = {
+                "id": uuid.uuid4().hex[:12],
+                "role": "system",
+                "content": f"已撤销上一轮修改，回到 {restored_id}（保存为 {result['version_id']}）",
+                "at": storage.now_iso(),
+                "kind": "undo",
+                "version": result["version_id"],
+            }
+            result["messages"] = storage.append_messages(doc_id, [message])
+            result["message_count"] = len(result["messages"])
+    except edits.PatchConflict:
+        _discard_prepared(work_path, render_dir)
+        raise
+    return result
+
+
+@app.post("/api/docs/{doc_id}/undo")
+def undo_last_version(doc_id: str, body: Optional[RestoreIn] = None):
+    """撤销上一轮已应用的修改（回退到上一版本快照，本身也生成新版本）。"""
+    try:
+        return _undo_core(doc_id, body.base_version if body is not None else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except edits.PatchConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/docs/{doc_id}/download")
 def download(doc_id: str):
     meta = storage.load_meta(doc_id)
@@ -1110,6 +1209,126 @@ def download(doc_id: str):
         filename=name,
         headers={"Cache-Control": "no-store"},
     )
+
+
+def _export_base_name(meta: Dict[str, Any]) -> str:
+    """Header-safe download basename: prefer the (possibly renamed) title."""
+    name = str(
+        meta.get("title")
+        or Path(str(meta.get("file_name") or "presentation.pptx")).stem
+    )
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", name).strip()
+    return name[:80] or "presentation"
+
+
+def _current_render_dir(doc_id: str, meta: Dict[str, Any]) -> Path:
+    return storage.render_dir(doc_id, int(meta.get("version", 0)))
+
+
+def _regenerate_render(doc_id: str, meta: Dict[str, Any]) -> Path:
+    """Re-run the render chain once into the current-version dir — needed for
+    render dirs produced before v0.3 (they kept no PDF) or emptied by hand."""
+    render_dir = _current_render_dir(doc_id, meta)
+    render.render_pptx(storage.current_path(doc_id), render_dir, scale=RENDER_SCALE)
+    return render_dir
+
+
+@app.get("/api/docs/{doc_id}/export/pdf")
+def export_pdf(doc_id: str):
+    meta = storage.load_meta(doc_id)
+    render_dir = _current_render_dir(doc_id, meta)
+    pdf_path = render_dir / "export.pdf"
+    if not pdf_path.exists():
+        render_dir = _regenerate_render(doc_id, meta)
+        pdf_path = render_dir / "export.pdf"
+    if not pdf_path.exists():
+        raise FileNotFoundError("PDF 尚未生成（渲染未产出 PDF），请稍后重试或先重新渲染")
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"{_export_base_name(meta)}.pdf",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/docs/{doc_id}/export/images.zip")
+def export_images_zip(doc_id: str):
+    meta = storage.load_meta(doc_id)
+    render_dir = _current_render_dir(doc_id, meta)
+    pages = sorted(render_dir.glob("slide-*.png"))
+    if not pages:
+        render_dir = _regenerate_render(doc_id, meta)
+        pages = sorted(render_dir.glob("slide-*.png"))
+    if not pages:
+        raise FileNotFoundError("暂无可打包的页面图片，请先触发一次渲染")
+    tmp_dir = storage.DATA_DIR / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"export-{uuid.uuid4().hex}.zip"
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_STORED) as zf:
+            # PNGs are already deflate-compressed; storing keeps export fast
+            for page in pages:
+                zf.write(page, arcname=page.name)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        tmp_path,
+        media_type="application/zip",
+        filename=f"{_export_base_name(meta)}-images.zip",
+        headers={"Cache-Control": "no-store"},
+        background=BackgroundTask(lambda: tmp_path.unlink(missing_ok=True)),
+    )
+
+
+@app.post("/api/docs/{doc_id}/duplicate")
+def duplicate_document(doc_id: str):
+    """另存副本：把当前版本复制成一份全新的会话（不带聊天记录/版本历史）。"""
+    meta, objects_payload = _load_doc(doc_id)
+    src = storage.current_path(doc_id)
+    if not src.exists():
+        raise FileNotFoundError("document file not found")
+    new_meta: Optional[Dict[str, Any]] = None
+    try:
+        new_meta = storage.create_doc(
+            file_name=meta.get("file_name") or "presentation.pptx",
+            content=src.read_bytes(),
+            slide_count=int(
+                meta.get("slide_count") or objects_payload.get("slide_count") or 0
+            ),
+            slide_size=objects_payload.get("slide_size_emu")
+            or meta.get("slide_size_emu")
+            or {},
+        )
+        storage.save_objects(new_meta["doc_id"], objects_payload)
+        title = str(meta.get("title") or Path(str(meta.get("file_name"))).stem)
+        storage.touch_doc(new_meta["doc_id"], title=f"{title} 副本")
+        render.render_pptx(
+            storage.current_path(new_meta["doc_id"]),
+            storage.render_dir(new_meta["doc_id"], 0),
+            scale=RENDER_SCALE,
+        )
+        # 起一条系统备注说明副本来源，聊天上下文可追溯
+        storage.append_messages(
+            new_meta["doc_id"],
+            [
+                {
+                    "id": uuid.uuid4().hex[:12],
+                    "role": "system",
+                    "content": f"已从「{title}」另存为副本，当前是独立会话（从 v0 起步）",
+                    "at": storage.now_iso(),
+                    "kind": "duplicate",
+                }
+            ],
+        )
+        return _serialize(storage.load_meta(new_meta["doc_id"]), objects_payload)
+    except Exception as exc:
+        if new_meta:
+            shutil.rmtree(storage.doc_dir(new_meta["doc_id"]), ignore_errors=True)
+            storage.release_lock(new_meta["doc_id"])
+        if isinstance(exc, (render.RenderError, render.RenderBusy)):
+            raise
+        raise HTTPException(status_code=500, detail=_sanitize_detail(exc) or "复制失败") from exc
 
 
 @app.get("/api/docs/{doc_id}/slides/{slide_index}/image")

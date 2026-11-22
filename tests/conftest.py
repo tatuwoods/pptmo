@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+STUB_PDF = b"%PDF-1.4 stub-for-tests\n%%EOF\n"
+
 BACKEND_DIR = Path(__file__).resolve().parent.parent / "app" / "backend"
 sys.path.insert(0, str(BACKEND_DIR))
 
@@ -79,7 +81,7 @@ def client(monkeypatch, demo_pptx, tmp_path):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(storage, "DOCS_DIR", data_dir / "docs")
 
-    def fake_render(pptx_path, out_dir, scale=2.0):
+    def fake_render(pptx_path, out_dir, scale=2.0, stale_dir=None):
         from pptx import Presentation
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +89,8 @@ def client(monkeypatch, demo_pptx, tmp_path):
         for i in range(count):
             (out_dir / f"slide-{i + 1:03d}.png").write_bytes(_tiny_png())
             (out_dir / f"thumb-{i + 1:03d}.png").write_bytes(_tiny_png())
+        # v0.3: the render chain now keeps a PDF copy per render dir (export)
+        (out_dir / "export.pdf").write_bytes(STUB_PDF)
         return count
 
     monkeypatch.setattr(render_mod, "render_pptx", fake_render)
