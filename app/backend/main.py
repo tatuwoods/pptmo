@@ -1194,6 +1194,83 @@ def undo_last_version(doc_id: str, body: Optional[RestoreIn] = None):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def _previous_version_id(doc_id: str, meta: Dict[str, Any], current: int) -> Optional[str]:
+    """Highest version strictly below ``current`` whose pptx still exists."""
+    numbers: List[int] = []
+    for item in meta.get("versions", []):
+        match = re.fullmatch(r"v(\d+)", str(item.get("id") or ""))
+        if match and int(match.group(1)) < current:
+            numbers.append(int(match.group(1)))
+    for number in sorted(numbers, reverse=True):
+        if (storage.versions_dir(doc_id) / f"v{number}.pptx").exists():
+            return f"v{number}"
+    return None
+
+
+def _perform_undo(doc_id: str, base_version: Optional[int] = None) -> Dict[str, Any]:
+    """撤销上一次应用：把上一版本内容提交为新版本（历史只前进，可连续撤销）。
+
+    端点与 AI 的 undo_last 工具共用这一条链路。异常语义：
+    ValueError → 400（v0 无可撤销）、PatchConflict → 409（版本已被并发更新）。
+    """
+    # ---- phase 1 (short lock): validate + allocate version id ----
+    with storage.lock_for(doc_id):
+        meta = storage.load_meta(doc_id)
+        current = int(meta.get("version", 0))
+        if current <= 0:
+            raise ValueError("已在最初版本（v0），没有可撤销的操作")
+        if base_version is not None and int(base_version) != current:
+            raise edits.PatchConflict("文档已经更新，请刷新后再试")
+        prev_id = _previous_version_id(doc_id, meta, current)
+        if prev_id is None:
+            raise ValueError("找不到可回退的历史版本，无法撤销")
+        source = storage.version_file(doc_id, prev_id)
+        new_version, _ = storage.next_version_id(meta)
+
+    # ---- phase 2 (no lock): copy + render + parse ----
+    work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+    render_dir: Optional[Path] = None
+    try:
+        shutil.copy2(source, work_path)
+        render_dir, objects_payload, page_count = _prepare_commit(doc_id, work_path, new_version)
+    except Exception:
+        try:
+            work_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    # ---- phase 3 (short lock): commit + record ----
+    try:
+        with storage.lock_for(doc_id):
+            committed, objects_payload = _commit_prepared_locked(
+                doc_id, new_version, f"撤销 v{current}（回到 {prev_id}）",
+                work_path, render_dir, objects_payload, page_count,
+                expected_version=current,
+            )
+            result = _commit_result(committed, objects_payload)
+            result["restored_from"] = prev_id
+            message = {
+                "id": uuid.uuid4().hex[:12],
+                "role": "system",
+                "content": f"已撤销 v{current} 的修改，回到 {prev_id}，保存为 v{new_version}",
+                "at": storage.now_iso(),
+                "kind": "undo",
+                "version": result["version_id"],
+            }
+            result["messages"] = storage.append_messages(doc_id, [message])
+            result["message_count"] = len(result["messages"])
+    except edits.PatchConflict:
+        _discard_prepared(work_path, render_dir)
+        raise
+    return result
+
+
+@app.post("/api/docs/{doc_id}/undo")
+def undo_last(doc_id: str, body: Optional[RestoreIn] = None):
+    return _perform_undo(doc_id, body.base_version if body else None)
+
+
 @app.get("/api/docs/{doc_id}/download")
 def download(doc_id: str):
     meta = storage.load_meta(doc_id)

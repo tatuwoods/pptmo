@@ -807,6 +807,29 @@ def _dispatch_tool(action: str, args: Dict[str, Any], view: _DeckView) -> Dict[s
     return {"error": f"未知工具：{action}"}
 
 
+def _normalize_plan(raw: Any, min_steps: int = 2) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Validate a plan step list; returns (steps, error) — exactly one set."""
+    if not isinstance(raw, list):
+        return None, 'plan 需要 steps 数组，例如 {"action":"plan","args":{"steps":["第一步","第二步"]}}'
+    steps = [_clip(str(item or "").strip(), 120) for item in raw]
+    steps = [s for s in steps if s]
+    if len(steps) < min_steps:
+        return None, f"plan 至少需要 {min_steps} 个非空步骤描述（收到 {len(steps)} 个）"
+    return steps[:12], None
+
+
+def _observation_content(detail: Dict[str, Any]) -> str:
+    """Observation message for the model; tool errors carry a retry hint so the
+    loop self-heals (换参数重试) instead of surfacing the failure to the user."""
+    text = "Observation:\n" + json.dumps(detail, ensure_ascii=False)
+    if isinstance(detail, dict) and detail.get("error"):
+        text += (
+            "\n该调用失败：请修正参数后重试（换参数或换一个等价工具），"
+            "不要因此结束任务；确实无法完成时再用 finish 说明原因。"
+        )
+    return text
+
+
 class _OperationStore:
     def __init__(self, view: _DeckView, instruction: str, limit: int) -> None:
         self.view = view
@@ -1900,7 +1923,11 @@ SYSTEM_PROMPT = (
     '5. inspect_shapes {"shape_ids":["s3_id4_c0_0"]}：查看指定文本/单元格/视觉对象的精确信息，'
     "含完整文本与 bbox_emu。\n"
     '6. propose_operations {"operations":[...]}：提交精确操作，系统会逐条校验。\n'
-    '7. finish {"summary":"...","reply":"给用户的回复","question":"可选反问"}：结束。\n\n'
+    '7. plan {"steps":["第一步","第二步","第三步"]}：复杂任务（≥2 步）先制定计划清单，'
+    "系统会把「我将：1… 2… 3…」展示给用户；之后逐步执行、逐项汇报，完成后在 finish 里总结各项结果。\n"
+    '8. undo_last {}：撤销上一轮已应用的修改（回退到上一版本快照）。用户要求“撤销/回退上一步”时调用，'
+    "撤销结果以 Observation 返回，不要重复撤销。\n"
+    '9. finish {"summary":"...","reply":"给用户的回复","question":"可选反问"}：结束。\n\n'
     "操作 schema：\n"
     '- edit：{"action":"edit","shape_id":"...","after":"新文本","before":"可选原文",'
     '"description":"...","style":{"font_size_pt":18,"font_name":"微软雅黑","bold":true,'
@@ -1951,6 +1978,7 @@ SYSTEM_PROMPT = (
     f"约束：单次 propose 最多 {MAX_OPS_PER_CALL} 条，本次对话最多 {MAX_OPS} 条。\n\n"
     "工作方式：\n"
     "- 先理解意图：用户点名字段或页面时优先处理该对象/页面；模糊需求先 outline/read_slides 判断。\n"
+    "- 复杂任务（涉及多页或多种操作组合）先用 plan 拆解成计划清单，再逐步执行、逐项汇报进度。\n"
     "- 先看再改：shape_id 必须来自工具结果；表格单元格必须用 s3_id4_c0_2 这类 ID，"
     "合并区域使用合并起始单元格。\n"
     "- 只提交有必要、可执行的少量高价值操作；不需要每页都读。整份优化时先 outline，"
@@ -2059,13 +2087,14 @@ def run_stream(
     history: Optional[List[Dict[str, Any]]] = None,
     base_version: Optional[int] = None,
     auto_apply: bool = False,
+    undo_last: Optional[Callable[[Optional[int]], Dict[str, Any]]] = None,
     undo_handler: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run the streaming AI-led tool loop and return the done payload.
 
     Events emitted synchronously through ``emit``:
     start, step, token, thought, tool_call, tool_result, operations, plan,
-    summary, error, done.
+    retry, summary, error, done.
     """
     instruction = str(instruction or "").strip()
     if not instruction:
@@ -2107,6 +2136,14 @@ def run_stream(
     view = _DeckView(objects, elements, tables, total_slides, scope_slides, slide_size)
     store = _OperationStore(view, instruction, MAX_OPS)
     model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    # undo_last 工具的后端回调：优先带 base_version 的版本（API 层注入），
+    # 兼容无参的 undo_handler（测试/嵌入场景）。
+    undo_callback: Optional[Callable[[], Dict[str, Any]]] = None
+    if undo_last is not None:
+        undo_callback = lambda: undo_last(base_version)  # noqa: E731
+    elif undo_handler is not None:
+        undo_callback = undo_handler
 
     today = datetime.now().astimezone().strftime("%Y年%m月%d日")
     conversation: List[Dict[str, str]] = [
@@ -2171,18 +2208,18 @@ def run_stream(
                 if attempt == 1:
                     _safe_emit(
                         emit,
-                        "thought",
+                        "retry",
                         {
                             "step": step,
-                            "thought": f"AI 服务波动，自动重试一次：{exc}",
-                            "text": f"AI 服务波动，自动重试一次：{exc}",
+                            "attempt": 2,
+                            "message": f"AI 服务波动，自动重试一次：{exc}",
                         },
                     )
                     trace.append(
                         {"step": step, "thought": "AI 服务波动，自动重试", "action": "retry", "detail": _clip(str(exc), 200)}
                     )
                     continue
-                error = str(exc)
+                error = f"AI 服务异常：{exc}"
                 _safe_emit(emit, "error", {"step": step, "message": error})
                 trace.append(
                     {"step": step, "thought": "", "action": "error", "detail": _clip(error, 200)}
@@ -2249,8 +2286,9 @@ def run_stream(
                     cleaned.append(text)
                 if len(cleaned) >= 12:
                     break
-            if not cleaned:
-                detail = {"error": "plan 需要 steps（非空字符串数组）"}
+            if len(cleaned) < 2:
+                # 单步/空清单不算计划：直接执行即可，别为凑数拆步骤
+                detail = {"error": "plan 需要 steps（至少 2 条非空字符串）；单步任务请直接调用对应工具"}
             else:
                 plan = cleaned
                 detail = {
@@ -2280,11 +2318,11 @@ def run_stream(
 
         if action == "undo_last":
             # 撤销上一轮已应用的操作：由调用方注入基于版本快照的回退器
-            if undo_handler is None:
+            if undo_callback is None:
                 detail = {"error": "当前环境不支持撤销（未接入版本回退）"}
             else:
                 try:
-                    detail = undo_handler() or {}
+                    detail = undo_callback() or {}
                     undo_result = detail if not detail.get("error") else None
                 except Exception as exc:  # noqa: BLE001 — handler errors become tool errors
                     detail = {"error": str(exc) or "撤销失败"}
@@ -2371,12 +2409,7 @@ def run_stream(
                     "detail": "未知工具",
                 }
             )
-            conversation.append(
-                {
-                    "role": "user",
-                    "content": "Observation:\n" + json.dumps(detail, ensure_ascii=False),
-                }
-            )
+            conversation.append({"role": "user", "content": _observation_content(detail)})
             continue
 
         before_count = len(store.ops)
@@ -2413,12 +2446,14 @@ def run_stream(
                 "detail": _trace_detail(action, args, detail),
             }
         )
-        conversation.append(
-            {
-                "role": "user",
-                "content": "Observation:\n" + json.dumps(detail, ensure_ascii=False),
-            }
-        )
+        observation = "Observation:\n" + json.dumps(detail, ensure_ascii=False)
+        if isinstance(detail, dict) and detail.get("error"):
+            # 自愈提示：让模型换参数重试一次，而不是把错误原样抛给用户
+            observation += (
+                "\n该调用失败：请修正参数后重试一次（换一种工具或参数也可以）；"
+                "若确实无法完成，用 finish 向用户说明，不要编造结果。"
+            )
+        conversation.append({"role": "user", "content": observation})
 
     operations = store.ops
     if not summary:
@@ -2477,6 +2512,8 @@ def run_stream(
         "error": error,
         "base_version": base_version,
         "auto_apply": bool(auto_apply),
+        "plan": plan or None,
+        "undo": undo_result,
     }
     _safe_emit(emit, "done", done)
     return done
