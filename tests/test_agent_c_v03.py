@@ -164,7 +164,7 @@ def test_undo_endpoint_restores_previous_version(client, uploaded_doc):
 
 def test_undo_endpoint_rejects_version_zero(client, uploaded_doc):
     r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/undo")
-    assert r.status_code == 409
+    assert r.status_code == 400  # v0 无可撤销：用户错误而非版本冲突（与 test_undo_v03 统一）
     assert "撤销" in r.json()["detail"]
 
 

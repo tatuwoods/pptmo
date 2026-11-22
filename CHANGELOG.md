@@ -1,5 +1,72 @@
 # Changelog
 
+## v0.3.0 — full capability upgrade, 22 items (2026-11-22)
+
+### A. Editing (edits.py + agent.py)
+1. `font_unify` — unify fonts across slide/deck (latin + east-asian + cs
+   typefaces; size/bold differences preserved; symbol fonts like Wingdings
+   skipped; paragraph defaults `defRPr`/`endParaRPr`/`lstStyle` covered;
+   deck scope also covers masters/layouts)
+2. `replace_text {find, replace, scope}` — deck-wide replace; per-run replace
+   keeps other runs' styles, run-boundary-spanning needles fall back to a
+   whole-text rewrite; zero matches is an explicit error
+3. `align_objects {shape_ids, align}` — left/right/top/bottom/hcenter/vcenter
+   + distribute_h/distribute_v (≥3 shapes, same slide, non-grouped)
+4. `duplicate_object {shape_id, offset_emu}` — in-page copy of textboxes,
+   pictures, groups (new cNvPr ids; same-part image rIds stay valid)
+5. `z_order {shape_id, mode}` — front/back/forward/backward
+6. `table_mod` — add/delete row/col, merge_cells (non-origin text cleared),
+   split_cells; merge-overlap and merge-intersection guards; frame ext updated
+7. `replace_image` — swap picture content by shape_id (base64 or local path;
+   png/jpg magic validated; position/size preserved)
+8. `slide_background` — solid color or two-stop gradient per slide (raw
+   `p:bg` XML, replaces existing background)
+9. `add_page_numbers {skip_first, position, start}` — batch page numbers,
+   idempotency guard, bottom-left/center/right
+10. `font_scale {delta_pt}` — slide/deck font size ±N pt (inherited sizes
+    resolved from paragraph defaults, then made explicit; 6–400 pt clamped)
+- All ten wired through the agent op store with scope validation
+  (deck-wide ops need deck scope; “全局/整份/所有页” instructions auto-expand
+  the scope), dedupe keys and op summaries; system prompt documents the schemas
+- Fixed a latent v0.2 bug: `int(x or -1)` mapped slide_index 0 to -1, so the
+  agent could never target objects on page 1
+
+### B. Import/export (main.py)
+11. `GET /api/docs/{id}/export/pdf` — render chain now keeps the produced PDF
+    (`deck.pdf` in the version's render dir); missing PDFs are regenerated once
+12. `GET /api/docs/{id}/export/images.zip` — all rendered slide PNGs zipped
+13. `POST /api/docs/{id}/duplicate` — copy the current document into a fresh
+    session (same content/objects, v0, “副本” title, system note; rollback on
+    render failure)
+
+### C. Chat experience (agent.py + main.py)
+14. `plan` tool — complex instructions get a step list first (“我将：1… 2… 3…”),
+    streamed as a `plan` event and reported step-by-step
+15. `undo_last` tool + `POST /api/docs/{id}/undo` — roll back the last applied
+    round via the version snapshot (creates a new version, so nothing is lost);
+    ⌘Z in the UI calls the endpoint
+16. Self-healing — transient AI errors retry once without consuming a step
+    (`retry` event); failed tool calls return an Observation with retry
+    guidance instead of surfacing raw errors
+
+### D. UI (web/)
+17. Shortcuts: ⌘Z undo, ⌘Enter send, Esc stops generation first
+18. Drag-drop upload anywhere on the window with a visible overlay; legacy
+    .ppt/.pptm drops get the conversion hint
+19. Thumbnail rail click switches canvas + chat scope together
+20. Dark mode follows `prefers-color-scheme` (variable groups for all core
+    surfaces; `color-scheme: light dark`)
+
+### E. Stability
+21. Render timeout (180s, `RENDER_TIMEOUT_SECONDS`) degrades instead of
+    failing the whole commit: pages already rendered / stale previews from the
+    previous version are kept, response carries `partial_render`
+22. Upload validation: .ppt/.pptm/.pps → “另存为 .pptx” hint; empty files,
+    tiny/corrupt files and oversize files get friendly, specific messages
+
+- `/api/health` reports version 0.3.0
+- python-pptx stays pinned at 0.6.23; garble_fix Wingdings remap untouched
+
 ## v0.2.0 — slide-level operations (2026-11-21)
 
 - Four slide-level actions join the op pipeline (`propose_operations` → review

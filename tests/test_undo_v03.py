@@ -45,11 +45,11 @@ def test_undo_twice_walks_back_two_versions(client, uploaded_doc):
     assert r2.json()["slide_count"] == 3
 
 
-def test_undo_at_v0_returns_friendly_409(client, uploaded_doc):
+def test_undo_at_v0_returns_friendly_400(client, uploaded_doc):
     doc_id = uploaded_doc["doc_id"]
     r = client.post(f"/api/docs/{doc_id}/undo")
-    # 与 base_version 冲突同一族：状态冲突 → 409（test_agent_c_v03 同款契约）
-    assert r.status_code == 409
+    # v0 无可撤销：用户操作错误 → 400（与 test_agent_c_v03 统一；并发冲突才是 409）
+    assert r.status_code == 400
     assert "撤销" in r.json()["detail"] or "版本" in r.json()["detail"]
 
 

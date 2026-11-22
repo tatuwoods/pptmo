@@ -810,7 +810,7 @@ def chat(doc_id: str, body: ChatIn):
                 history=history,
                 base_version=start_version,
                 auto_apply=bool(body.auto_apply),
-                undo_last=lambda base_version: _undo_core(doc_id, base_version),
+                undo_last=lambda base_version: _agent_undo(doc_id, base_version),
             )
         except Exception as exc:
             message_text = str(exc) or "Agent 执行失败"
@@ -1127,73 +1127,6 @@ def restore_version(doc_id: str, version_id: str, body: Optional[RestoreIn] = No
     return result
 
 
-def _undo_core(doc_id: str, base_version: Optional[int]) -> Dict[str, Any]:
-    """把上一个版本快照落成新版本（撤销上一轮修改，历史不丢）。
-
-    Endpoint 与 agent 的 undo_last 工具共用；冲突时抛 PatchConflict，
-    初始版本抛 ValueError，由调用方决定 HTTP 语义。
-    """
-    # ---- phase 1 (short lock): allocate the version id ----
-    with storage.lock_for(doc_id):
-        meta = storage.load_meta(doc_id)
-        current = int(meta.get("version", 0))
-        if current < 1:
-            raise ValueError("当前是初始版本，没有可撤销的修改")
-        if base_version is not None and int(base_version) != current:
-            raise edits.PatchConflict("文档已经更新，请刷新后再撤销")
-        restored_id = f"v{current - 1}"
-        source = storage.version_file(doc_id, restored_id)
-        new_version, _ = storage.next_version_id(meta)
-
-    # ---- phase 2 (no lock): copy + render + parse ----
-    work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
-    render_dir: Optional[Path] = None
-    try:
-        shutil.copy2(source, work_path)
-        render_dir, objects_payload, page_count = _prepare_commit(doc_id, work_path, new_version)
-    except Exception:
-        try:
-            work_path.unlink()
-        except OSError:
-            pass
-        raise
-
-    # ---- phase 3 (short lock): commit + record ----
-    try:
-        with storage.lock_for(doc_id):
-            committed, objects_payload = _commit_prepared_locked(
-                doc_id, new_version, f"撤销上一轮（回到 {restored_id}）", work_path, render_dir,
-                objects_payload, page_count,
-            )
-            result = _commit_result(committed, objects_payload)
-            result["restored_from"] = restored_id
-            message = {
-                "id": uuid.uuid4().hex[:12],
-                "role": "system",
-                "content": f"已撤销上一轮修改，回到 {restored_id}（保存为 {result['version_id']}）",
-                "at": storage.now_iso(),
-                "kind": "undo",
-                "version": result["version_id"],
-            }
-            result["messages"] = storage.append_messages(doc_id, [message])
-            result["message_count"] = len(result["messages"])
-    except edits.PatchConflict:
-        _discard_prepared(work_path, render_dir)
-        raise
-    return result
-
-
-@app.post("/api/docs/{doc_id}/undo")
-def undo_last_version(doc_id: str, body: Optional[RestoreIn] = None):
-    """撤销上一轮已应用的修改（回退到上一版本快照，本身也生成新版本）。"""
-    try:
-        return _undo_core(doc_id, body.base_version if body is not None else None)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except edits.PatchConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
 def _previous_version_id(doc_id: str, meta: Dict[str, Any], current: int) -> Optional[str]:
     """Highest version strictly below ``current`` whose pptx still exists."""
     numbers: List[int] = []
@@ -1268,7 +1201,26 @@ def _perform_undo(doc_id: str, base_version: Optional[int] = None) -> Dict[str, 
 
 @app.post("/api/docs/{doc_id}/undo")
 def undo_last(doc_id: str, body: Optional[RestoreIn] = None):
-    return _perform_undo(doc_id, body.base_version if body else None)
+    """撤销上一轮已应用的修改（v0 无可撤销 → 400；并发版本冲突 → 409）。"""
+    try:
+        return _perform_undo(doc_id, body.base_version if body else None)
+    except edits.PatchConflict as exc:  # PatchConflict 继承 ValueError，必须先接
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _agent_undo(doc_id: str, base_version: Optional[int]) -> Dict[str, Any]:
+    """Compact undo result for the agent's undo_last tool observation.
+
+    The full commit payload (objects/messages) would bloat the model's
+    observation; the tool only needs to report what it rolled back to."""
+    result = _perform_undo(doc_id, base_version)
+    return {
+        "restored": result.get("restored_from"),
+        "new_version": result.get("version_id"),
+        "label": f"撤销上一轮 · 回到 {result.get('restored_from')}",
+    }
 
 
 @app.get("/api/docs/{doc_id}/download")
