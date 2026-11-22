@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 WEB = Path(__file__).resolve().parent.parent / "app" / "web"
@@ -27,11 +28,17 @@ def test_keyboard_undo_shortcut_wired():
 
 def test_keyboard_cmd_enter_send_and_esc_stop():
     js = _read("app.js")
-    # ⌘Enter 发送（textarea 的 keydown 里）
-    assert "sendChat()" in js
-    # Esc 停止生成（streaming 时优先 abort）
-    assert "streamController" in js
-    assert "abort()" in js
+    # ⌘/Ctrl+Enter 发送：必须是聊天输入框 keydown 里「带修饰键的 Enter」分支。
+    # 裸 Enter 发送是 v0.2 就有的，只断言 sendChat() 存在锁不住这个功能
+    composer = js.split('dom.chatInput.addEventListener("keydown"', 1)[1][:600]
+    assert '(event.metaKey || event.ctrlKey) && event.key === "Enter"' in composer
+    assert "sendChat()" in composer
+    # Esc 停止生成：全局 keydown 里 streaming 状态下 Esc 先 abort 流，
+    # 且排在 busy 判断之前（处理中也要能停）
+    global_keys = js.split('document.addEventListener("keydown"', 1)[1]
+    esc_stop = global_keys.split("if (state.busy", 1)[0]
+    assert 'event.key === "Escape" && state.streaming' in esc_stop
+    assert "streamController.abort()" in esc_stop
 
 
 # ---------- 18. 拖拽上传 ----------
@@ -51,9 +58,15 @@ def test_drag_upload_overlay_and_friendly_reject():
 
 def test_thumb_click_switches_page_and_scope():
     js = _read("app.js")
-    assert 'data-slide' in js
-    # 点击缩略图：画布切页 + 对话范围同步到该页
-    assert "setSlide(" in js
+    # 点击缩略图：同一个 click 处理器里先切页、再把对话范围同步为「当前页」。
+    # 只切页不联动范围是 v0.2 的旧行为，所以必须断言 setScope 也在这个处理器里
+    thumbs = js.split("function renderThumbs()", 1)[1].split("\nfunction ", 1)[0]
+    assert re.search(
+        r'button\.addEventListener\("click", \(\) => \{'
+        r'[\s\S]*?setSlide\(Number\(button\.dataset\.slide\)\);'
+        r'[\s\S]*?if \(state\.scope !== "current"\) setScope\("current"\);',
+        thumbs,
+    )
 
 
 # ---------- 20. 深色模式跟随系统 ----------
