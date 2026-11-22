@@ -60,7 +60,10 @@
 ### E. Stability
 21. Render timeout (180s, `RENDER_TIMEOUT_S`) degrades instead of
     failing the whole commit: pages already rendered / stale previews from the
-    previous version are kept, response carries `render_partial`
+    previous version are kept, response carries `render_partial`; the web UI
+    surfaces it twice — a toast when the degraded state first appears and a
+    persistent status-bar note (“预览暂为上一版画面”) until the next
+    successful render, so stale previews are never mistaken for the latest
 22. Upload validation: .ppt/.pptm/.pps → “另存为 .pptx” hint; empty files,
     tiny/corrupt files and oversize files get friendly, specific messages
 
