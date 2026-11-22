@@ -70,6 +70,24 @@
 - `/api/health` reports version 0.3.0
 - python-pptx stays pinned at 0.6.23; garble_fix Wingdings remap untouched
 
+### Fixes landed on main after the v0.3.0 tag (2026-11-22)
+- `replace_text` replaced twice whenever the replacement contained the find
+  term (10 → 100 came out as 1000, `v1` → `v1.1` as `v1.1.1`), and a no-op
+  replace collapsed mixed run formatting. Decided per paragraph now: an
+  in-run hit rewrites that run only; a needle spanning runs rebuilds just that
+  paragraph from its original text
+- Placeholder inheritance (layout placeholders usually carry no `a:xfrm` and
+  their runs no `sz`): `align_objects` and `geometry` no longer pin the axis
+  they do not edit to 0; `duplicate_object` gives the copy an explicit box
+  instead of stacking it under the original; `font_scale` resolves the
+  inherited size (run → paragraph → shape list style → layout/master
+  placeholder → master text styles) instead of assuming 18pt
+- `add_page_numbers` repeat guard keys on the name it stamps on its own
+  boxes — a small text box that merely reads like a page number no longer
+  blocks numbering
+- `z_order front` stays before a trailing `p:extLst`
+- `table_mod` add/delete row/col keep the frame size in step with the grid
+
 ## v0.2.0 — slide-level operations (2026-11-21)
 
 - Four slide-level actions join the op pipeline (`propose_operations` → review
