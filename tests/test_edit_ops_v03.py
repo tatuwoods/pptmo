@@ -1422,3 +1422,71 @@ def test_font_scale_resolves_placeholder_inherited_sizes(tmp_path):
     assert sizes["标题"] == 46  # 母版 titleStyle 一级 44pt
     assert sizes["一级要点"] == 34  # 母版 bodyStyle 一级 32pt
     assert sizes["二级要点"] == 30  # 母版 bodyStyle 二级 28pt
+
+
+def test_font_scale_sample_deck_resolves_rendered_sizes(tmp_path):
+    """A10：仓库样张里没有一个 run 带显式字号。期望值是 LibreOffice 实际渲染原稿的
+    字号（52/28/20/22/16/9，表格 18pt）+2，用来锁住整条继承链。"""
+    from pathlib import Path
+
+    from pptx.oxml.ns import qn
+
+    sample = Path(__file__).resolve().parent.parent / "app" / "samples" / "demo.pptx"
+    if not sample.exists():
+        pytest.skip("sample deck not available")
+    dst = tmp_path / "demo.pptx"
+    edits.apply_patches_to_file(sample, dst, [{"action": "font_scale", "delta_pt": 2}])
+    prs = Presentation(str(dst))
+
+    def first_run_size(slide_index, name):
+        shape = next(s for s in prs.slides[slide_index].shapes if s.name == name)
+        return next(run for para in shape.text_frame.paragraphs for run in para.runs).font.size.pt
+
+    assert first_run_size(1, "标题 1") == 54  # 母版 titleStyle 52
+    assert first_run_size(1, "内容占位符 2") == 30  # 版式 lstStyle 28
+    assert first_run_size(2, "内容占位符 2") == 22  # 版式 lstStyle 20
+    assert first_run_size(5, "文本占位符 3") == 24  # 版式 lstStyle 22
+    assert first_run_size(6, "文本占位符 15") == 18  # 版式 lstStyle 16
+    assert first_run_size(1, "页脚占位符 16") == 11  # 母版页脚占位符 9
+    cell = next(s for s in prs.slides[4].shapes if getattr(s, "has_table", False)).table.cell(0, 1)
+    assert cell.text_frame.paragraphs[0].runs[0].font.size.pt == 20  # 表格默认 18
+
+
+def test_font_scale_moves_explicit_paragraph_defaults(tmp_path):
+    """A10：段落上显式写的字号（defRPr / endParaRPr）跟文字一起挪，这样之后在段落
+    末尾新打的字才和已缩放的文字一致；没显式写的不凭空发明。"""
+    from pptx.oxml.ns import qn
+
+    prs = Presentation()
+    box = prs.slides.add_slide(prs.slide_layouts[6]).shapes.add_textbox(
+        Emu(500000), Emu(500000), Emu(6000000), Emu(3000000)
+    )
+    both = box.text_frame.paragraphs[0]
+    both.add_run().text = "两处都写"
+    p_pr = both._p.get_or_add_pPr()
+    p_pr.append(p_pr.makeelement(qn("a:defRPr"), {"sz": "2000"}))
+    both._p.append(both._p.makeelement(qn("a:endParaRPr"), {"sz": "2000"}))
+    end_only = box.text_frame.add_paragraph()
+    end_only.add_run().text = "只写 endParaRPr"
+    end_only._p.append(end_only._p.makeelement(qn("a:endParaRPr"), {"sz": "2400"}))
+    plain = box.text_frame.add_paragraph()
+    plain.add_run().text = "什么都没写"
+    plain._p.append(plain._p.makeelement(qn("a:endParaRPr"), {"lang": "zh-CN"}))
+    src = tmp_path / "defaults.pptx"
+    prs.save(str(src))
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(src, dst, [{"action": "font_scale", "delta_pt": 2}])
+    paras = Presentation(str(dst)).slides[0].shapes[0].text_frame.paragraphs
+
+    def sz_of(paragraph, holder_tag, under_p_pr=False):
+        holder = paragraph._p.find(qn("a:pPr")) if under_p_pr else paragraph._p
+        found = holder.find(qn(holder_tag)) if holder is not None else None
+        return found.get("sz") if found is not None else None
+
+    assert [p.runs[0].font.size.pt for p in paras] == [22, 26, 20]
+    assert sz_of(paras[0], "a:defRPr", under_p_pr=True) == "2200"
+    assert sz_of(paras[0], "a:endParaRPr") == "2200"
+    assert paras[0]._p.find(qn("a:pPr")).find(qn("a:defRPr")) is not None
+    assert sz_of(paras[1], "a:endParaRPr") == "2600"  # run 的 24pt 是从它继承来的
+    assert sz_of(paras[2], "a:endParaRPr") is None  # 没写就不发明
+    assert paras[2]._p.find(qn("a:endParaRPr")).get("lang") == "zh-CN"  # 其余属性不动

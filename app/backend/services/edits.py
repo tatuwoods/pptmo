@@ -1640,6 +1640,27 @@ def _effective_size_pt(shape, paragraph, run) -> float:
     return size if size is not None else 18.0
 
 
+def _clamp_font_pt(size: float) -> float:
+    return max(6.0, min(400.0, size))
+
+
+def _shift_paragraph_default_sizes(paragraph, delta: float) -> bool:
+    """Move the sizes a paragraph states itself (a:pPr/a:defRPr, a:endParaRPr)
+    by `delta`, so text typed at the paragraph end afterwards matches the scaled
+    runs. Nothing is invented where no size is stated."""
+    p = paragraph._p
+    p_pr = p.find(qn("a:pPr"))
+    holders = [p_pr.find(qn("a:defRPr"))] if p_pr is not None else []
+    holders.append(p.find(qn("a:endParaRPr")))
+    changed = False
+    for holder in holders:
+        size = _sz_pt(holder)
+        if size is not None:
+            holder.set("sz", str(int(round(_clamp_font_pt(size + delta) * 100))))
+            changed = True
+    return changed
+
+
 def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     raw_delta = merged.get("delta_pt", merged.get("delta", merged.get("by")))
     try:
@@ -1657,8 +1678,9 @@ def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
             for paragraph in target.text_frame.paragraphs:
                 for run in paragraph.runs:
                     base = _effective_size_pt(target, paragraph, run)
-                    run.font.size = Pt(max(6.0, min(400.0, base + delta)))
+                    run.font.size = Pt(_clamp_font_pt(base + delta))
                     changed = True
+                changed |= _shift_paragraph_default_sizes(paragraph, delta)
         if changed:
             touched.add(all_slides.index(slide))
     return touched
