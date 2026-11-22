@@ -174,6 +174,36 @@ def set_text_preserving_style(shape_or_cell, text: Any) -> None:
             last_paragraph._p.append(end_pr)
 
 
+def _set_paragraph_text_preserving_style(paragraph, text: Any) -> None:
+    """Rewrite one paragraph's text on its first run's formatting.
+
+    Paragraph-scoped sibling of set_text_preserving_style, so the other
+    paragraphs of the text frame keep their own formatting. Same limitation:
+    mixed formatting inside the paragraph collapses to the first run.
+    """
+    value = str(text if text is not None else "").replace("\r\n", "\n").replace("\v", "\n")
+    lines = value.split("\n")
+    p = paragraph._p
+    p_pr = copy.deepcopy(p.pPr) if p.pPr is not None else None
+    end_pr = copy.deepcopy(p.endParaRPr) if p.endParaRPr is not None else None
+    first_run = paragraph.runs[0] if paragraph.runs else None
+    r_pr = copy.deepcopy(first_run._r.rPr) if first_run is not None and first_run._r.rPr is not None else None
+
+    for child in list(p):
+        p.remove(child)
+    if p_pr is not None:
+        p.append(p_pr)
+    for index, line in enumerate(lines):
+        if index > 0:
+            paragraph.add_line_break()
+        run = paragraph.add_run()
+        run.text = line
+        if r_pr is not None:
+            run._r.insert(0, copy.deepcopy(r_pr))
+    if end_pr is not None:
+        p.append(end_pr)
+
+
 def apply_text_style(shape_or_cell, payload: Dict[str, Any]) -> None:
     """Apply explicit character/paragraph style to all runs in a text frame."""
     tf = getattr(shape_or_cell, "text_frame", None)
@@ -1412,6 +1442,31 @@ def _op_font_unify(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     return touched
 
 
+def _replace_in_paragraph(paragraph, find: str, replace: str) -> bool:
+    """Replace every `find` in one paragraph; True when the paragraph changed.
+
+    Occurrences that sit inside a single run are rewritten in that run, so the
+    paragraph's other runs keep their own style. As soon as one occurrence
+    spans run boundaries the whole paragraph is rebuilt from its original text
+    on the first run's style — never from the already-rewritten text, which
+    replaced twice whenever the replacement contained the needle (10 → 100
+    came out as 1000).
+    """
+    text = paragraph.text
+    if find not in text:
+        return False
+    run_hits = sum((run.text or "").count(find) for run in paragraph.runs)
+    if text.count(find) > run_hits:
+        _set_paragraph_text_preserving_style(paragraph, text.replace(find, replace))
+        return True
+    changed = False
+    for run in paragraph.runs:
+        if find in (run.text or ""):
+            run.text = run.text.replace(find, replace)
+            changed = True
+    return changed
+
+
 def _op_replace_text(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     find = str(merged.get("find") or "").strip()
     replace = str(merged.get("replace") if merged.get("replace") is not None else "")
@@ -1429,22 +1484,9 @@ def _op_replace_text(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
         changed = False
         for target in _iter_text_targets(slide):
             for paragraph in target.text_frame.paragraphs:
-                for run in paragraph.runs:
-                    if find in (run.text or ""):
-                        # per-run replace keeps every other run's style intact
-                        run.text = (run.text or "").replace(find, replace)
-                        total_replaced += 1
-                        changed = True
-            # fallback: the needle is split across run boundaries — rebuild the
-            # whole text body on the first-run style (mixed formatting collapses)
-            try:
-                full_text = target.text_frame.text
-            except Exception:
-                full_text = ""
-            if find in full_text and "\n" not in find:
-                set_text_preserving_style(target, full_text.replace(find, replace))
-                total_replaced += 1
-                changed = True
+                if _replace_in_paragraph(paragraph, find, replace):
+                    total_replaced += 1
+                    changed = True
         if changed:
             touched.add(all_slides.index(slide))
     if total_replaced == 0:

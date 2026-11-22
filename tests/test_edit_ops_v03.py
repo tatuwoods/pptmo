@@ -679,6 +679,81 @@ def test_replace_text_spanning_runs(replace_pptx, tmp_path):
     assert any("新计划启动会" in t for t in texts)
 
 
+def _runs_deck(path, paragraphs):
+    """单文本框演示文稿；paragraphs = [[(text, bold), ...], ...]，每个元组一个 run。"""
+    prs = Presentation()
+    box = prs.slides.add_slide(prs.slide_layouts[6]).shapes.add_textbox(
+        Emu(500000), Emu(400000), Emu(8000000), Emu(800000)
+    )
+    for p_index, runs in enumerate(paragraphs):
+        para = box.text_frame.paragraphs[0] if p_index == 0 else box.text_frame.add_paragraph()
+        for text, bold in runs:
+            run = para.add_run()
+            run.text = text
+            run.font.bold = bold
+    prs.save(str(path))
+    return path
+
+
+def _runs_of(path):
+    """→ [[(text, bold), ...] 每段一个列表]，用于断言 run 结构是否保住。"""
+    prs = Presentation(str(path))
+    box = next(s for s in prs.slides[0].shapes if getattr(s, "has_text_frame", False))
+    return [[(run.text, run.font.bold) for run in para.runs] for para in box.text_frame.paragraphs]
+
+
+@pytest.mark.parametrize(
+    "find, replace, source, expected",
+    [
+        ("2024", "2024年", "年度总结 2024", "年度总结 2024年"),
+        ("v1", "v1.1", "当前版本 v1", "当前版本 v1.1"),
+        ("10", "100", "预算 10 万，共 10 项", "预算 100 万，共 100 项"),
+    ],
+)
+def test_replace_text_replacement_containing_find(tmp_path, find, replace, source, expected):
+    """新词里含旧词时只能替换一次：10 → 100 不能变成 1000。"""
+    src = _runs_deck(tmp_path / "src.pptx", [[(source, False)]])
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst, [{"action": "replace_text", "find": find, "replace": replace, "scope": "deck"}]
+    )
+    assert _runs_of(dst) == [[(expected, False)]]
+
+
+def test_replace_text_noop_keeps_run_styles(tmp_path):
+    """原样替换（新旧词相同）不能把混排段落塌成首 run 样式。"""
+    src = _runs_deck(tmp_path / "src.pptx", [[("重点", True), ("内容", False)]])
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst, [{"action": "replace_text", "find": "内容", "replace": "内容"}]
+    )
+    assert _runs_of(dst) == [[("重点", True), ("内容", False)]]
+
+
+def test_replace_text_spanning_rebuilds_only_that_paragraph(tmp_path):
+    """同页既有 run 内命中又有跨 run 命中：两段都替换，
+    run 内命中的那段保持原 run 结构，跨 run 的段才按首 run 样式重写。"""
+    src = _runs_deck(
+        tmp_path / "src.pptx",
+        [[("重点", True), ("旧词", False)], [("旧", False), ("词", True)]],
+    )
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst, [{"action": "replace_text", "find": "旧词", "replace": "新词"}]
+    )
+    assert _runs_of(dst) == [[("重点", True), ("新词", False)], [("新词", False)]]
+
+
+def test_replace_text_in_run_and_spanning_in_same_paragraph(tmp_path):
+    """同一段里既有整 run 命中又有跨 run 命中：以原文为基准替换，不重复替换。"""
+    src = _runs_deck(tmp_path / "src.pptx", [[("10", False), (" 1", False), ("0 件", False)]])
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst, [{"action": "replace_text", "find": "10", "replace": "15"}]
+    )
+    assert _runs_of(dst) == [[("15 15 件", False)]]
+
+
 # ---------- 3b. align_objects 边界 ----------
 
 
