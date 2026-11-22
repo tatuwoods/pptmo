@@ -78,10 +78,47 @@ ACTION_ALIASES = {
     "remove_slide": "delete_slide",
     "move_slide": "move_slide",
     "reorder_slide": "move_slide",
+    # v0.3 批量/增强编辑操作（与 edits 层别名保持一致）
+    "unify_font": "font_unify",
+    "unify_fonts": "font_unify",
+    "global_replace": "replace_text",
+    "replace_all": "replace_text",
+    "scale_font": "font_scale",
+    "page_numbers": "add_page_numbers",
+    "add_page_number": "add_page_numbers",
+    "align_shapes": "align_objects",
+    "distribute": "align_objects",
+    "distribute_objects": "align_objects",
+    "copy_object": "duplicate_object",
+    "clone_object": "duplicate_object",
+    "zorder": "z_order",
+    "reorder_z": "z_order",
+    "layer": "z_order",
+    "modify_table": "table_mod",
+    "table_row": "table_mod",
+    "table_col": "table_mod",
+    "swap_image": "replace_image",
+    "change_image": "replace_image",
+    "background": "slide_background",
+    "set_background": "slide_background",
 }
 
 # slide-level operations submitted through propose_operations like any other op
 SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide"}
+
+# v0.3 batch / enhanced edit operations routed to edits.apply_patches_to_file
+V03_ACTIONS = {
+    "font_unify",
+    "replace_text",
+    "align_objects",
+    "duplicate_object",
+    "z_order",
+    "table_mod",
+    "replace_image",
+    "slide_background",
+    "add_page_numbers",
+    "font_scale",
+}
 
 TOOL_NAMES = {
     "outline",
@@ -98,6 +135,12 @@ FOOTER_HINT_RE = re.compile(
     r"logo|标志|標誌|日期",
     re.IGNORECASE,
 )
+# 指令里明确要求整份生效（全局替换/统一字体等）时，自动把处理范围扩成整份，
+# 否则 deck 级批量操作会被范围校验挡下
+DECK_INTENT_RE = re.compile(
+    r"全局|整份|全文|通篇|整套|所有页|所有幻灯片|所有页面|全部页|全部幻灯片|全部页面|"
+    r"每一页|每一页|各页|跨页|全篇|所有文字|全部文字",
+)
 NUMBER_ONLY_RE = re.compile(r"^\d{1,4}$")
 COLOR_RE = re.compile(r"^[0-9A-F]{6}$")
 
@@ -109,6 +152,15 @@ def _as_int(value: Any) -> Optional[int]:
         return int(round(float(value)))
     except (TypeError, ValueError):
         return None
+
+
+def _slide_index_of(entry: Dict[str, Any]) -> int:
+    """0-based slide_index, -1 when missing. ``or -1`` would also map slide 0
+    (the first page) to -1, breaking every operation that targets it."""
+    try:
+        return int(entry.get("slide_index"))
+    except (TypeError, ValueError):
+        return -1
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -134,6 +186,15 @@ def _as_bool(value: Any) -> Optional[bool]:
         return False
     return None
 
+
+
+def _entry_slide_index(entry: Dict[str, Any]) -> int:
+    """slide_index 0 is falsy — `or -1` broke every slide-0 object (v0.2 latent bug)."""
+    raw = entry.get("slide_index")
+    try:
+        return int(raw) if raw is not None else -1
+    except (TypeError, ValueError):
+        return -1
 
 def _clip(value: Any, limit: int) -> str:
     text = str(value if value is not None else "")
@@ -292,7 +353,7 @@ def _object_detail(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _table_summary(table: Dict[str, Any]) -> Dict[str, Any]:
-    slide_index = int(table.get("slide_index") or 0)
+    slide_index = (_slide_index_of(table) if table.get("slide_index") is not None else 0)
     return {
         "shape_id": table.get("shape_id"),
         "slide_index": slide_index,
@@ -397,7 +458,7 @@ class _DeckView:
                 return None, "单元格行列超出表格范围"
             obj = self.object_by_id.get(shape_id)
             if obj is not None:
-                if not self.is_scoped(int(obj.get("slide_index") or -1)):
+                if not self.is_scoped(_slide_index_of(obj)):
                     return None, "对象不在当前处理范围"
                 return obj, None
             if (row, col) in self.covered.get(table_id, set()):
@@ -426,7 +487,7 @@ class _DeckView:
         obj = self.object_by_id.get(shape_id)
         if obj is None:
             return None, "对象不存在，请先读取页面或使用 search_text 查找"
-        if not self.is_scoped(int(obj.get("slide_index") or -1)):
+        if not self.is_scoped(_slide_index_of(obj)):
             return None, "对象不在当前处理范围"
         if obj.get("kind") not in ("text", "table_cell"):
             return None, "该对象没有可编辑文本"
@@ -437,7 +498,7 @@ class _DeckView:
             return None, "表格单元格不支持几何调整"
         obj = self.object_by_id.get(shape_id)
         if obj is not None:
-            if not self.is_scoped(int(obj.get("slide_index") or -1)):
+            if not self.is_scoped(_slide_index_of(obj)):
                 return None, "对象不在当前处理范围"
             if obj.get("kind") == "table_cell":
                 return None, "表格单元格不支持几何调整"
@@ -446,7 +507,7 @@ class _DeckView:
             return obj, None
         elem = self.element_by_id.get(shape_id)
         if elem is not None:
-            if not self.is_scoped(int(elem.get("slide_index") or -1)):
+            if not self.is_scoped(_slide_index_of(elem)):
                 return None, "对象不在当前处理范围"
             if elem.get("grouped"):
                 return None, "分组内的对象不能移动或缩放"
@@ -459,7 +520,7 @@ class _DeckView:
         obj = self.object_by_id.get(shape_id)
         if obj is None:
             return None, "对象不存在"
-        if not self.is_scoped(int(obj.get("slide_index") or -1)):
+        if not self.is_scoped(_slide_index_of(obj)):
             return None, "对象不在当前处理范围"
         if obj.get("kind") != "text" or obj.get("grouped") or not obj.get("deletable"):
             return None, "只能删除非分组的普通文本对象"
@@ -468,7 +529,7 @@ class _DeckView:
     def inspect(self, shape_id: str) -> Dict[str, Any]:
         obj = self.object_by_id.get(shape_id)
         if obj is not None:
-            if not self.is_scoped(int(obj.get("slide_index") or -1)):
+            if not self.is_scoped(_slide_index_of(obj)):
                 return {"shape_id": shape_id, "error": "对象不在当前处理范围"}
             detail = _object_detail(obj)
             if obj.get("kind") == "table_cell":
@@ -478,9 +539,9 @@ class _DeckView:
             return detail
         elem = self.element_by_id.get(shape_id)
         if elem is not None:
-            if not self.is_scoped(int(elem.get("slide_index") or -1)):
+            if not self.is_scoped(_slide_index_of(elem)):
                 return {"shape_id": shape_id, "error": "对象不在当前处理范围"}
-            slide_index = int(elem.get("slide_index") or 0)
+            slide_index = (_slide_index_of(elem) if elem.get("slide_index") is not None else 0)
             detail = {
                 "shape_id": elem.get("shape_id"),
                 "kind": elem.get("kind"),
@@ -501,7 +562,7 @@ class _DeckView:
             return detail
         table = self.table_by_id.get(shape_id)
         if table is not None:
-            if not self.is_scoped(int(table.get("slide_index") or -1)):
+            if not self.is_scoped(_slide_index_of(table)):
                 return {"shape_id": shape_id, "error": "表格不在当前处理范围"}
             return {"shape_id": shape_id, **_table_summary(table)}
         target, error = self.resolve_text_target(shape_id)
@@ -625,7 +686,7 @@ def _tool_search_text(view: _DeckView, args: Dict[str, Any]) -> Dict[str, Any]:
     matches: List[Dict[str, Any]] = []
     total = 0
     for obj in view.objects:
-        if not view.is_scoped(int(obj.get("slide_index") or -1)):
+        if not view.is_scoped(_slide_index_of(obj)):
             continue
         text = str(obj.get("text") or "")
         lower = text.casefold()
@@ -638,7 +699,7 @@ def _tool_search_text(view: _DeckView, args: Dict[str, Any]) -> Dict[str, Any]:
         item: Dict[str, Any] = {
             "shape_id": obj.get("shape_id"),
             "slide_index": obj.get("slide_index"),
-            "page": int(obj.get("slide_index") or 0) + 1,
+            "page": (_slide_index_of(obj) if obj.get("slide_index") is not None else 0) + 1,
             "kind": "table_cell" if obj.get("kind") == "table_cell" else obj.get("kind"),
             "text": _clip(text, 180),
         }
@@ -664,7 +725,7 @@ def _tool_read_table(view: _DeckView, args: Dict[str, Any]) -> Dict[str, Any]:
     table = view.table_by_id.get(table_id)
     if table is None:
         return {"error": "表格不存在，请先 read_slides 或 outline 确认"}
-    if not view.is_scoped(int(table.get("slide_index") or -1)):
+    if not view.is_scoped(_slide_index_of(table)):
         return {"error": "表格不在当前处理范围"}
     cells = [
         obj
@@ -759,6 +820,7 @@ class _OperationStore:
         self.add_keys: set = set()
         self.slide_keys: set = set()
         self.deleted_slides: set = set()
+        self.v03_keys: set = set()
 
     def add_batch(self, raw: Any) -> Dict[str, Any]:
         if not isinstance(raw, list):
@@ -833,6 +895,8 @@ class _OperationStore:
                 return None, "缺少 action"
         if action in SLIDE_ACTIONS:
             return self._slide_op(raw, action)
+        if action in V03_ACTIONS:
+            return self._v03_op(raw, action)
         if action in TEXT_ACTIONS or action in ("style", "geometry"):
             if not shape_id:
                 return None, "缺少 shape_id"
@@ -903,7 +967,7 @@ class _OperationStore:
 
     def _target_meta(self, obj: Dict[str, Any]) -> Dict[str, Any]:
         meta: Dict[str, Any] = {
-            "slide_index": int(obj.get("slide_index") or 0),
+            "slide_index": (_slide_index_of(obj) if obj.get("slide_index") is not None else 0),
             "kind": obj.get("kind"),
             "grouped": bool(obj.get("grouped")),
         }
@@ -944,7 +1008,7 @@ class _OperationStore:
             "id": f"op{len(self.ops) + 1}",
             "source": "agent",
             "action": action,
-            "slide_index": int(obj.get("slide_index") or 0),
+            "slide_index": (_slide_index_of(obj) if obj.get("slide_index") is not None else 0),
             "shape_id": shape_id,
             "shape_name": obj.get("shape_name"),
             "kind": obj.get("kind"),
@@ -1123,7 +1187,7 @@ class _OperationStore:
             "id": f"op{len(self.ops) + 1}",
             "source": "agent",
             "action": "geometry",
-            "slide_index": int(target.get("slide_index") or 0),
+            "slide_index": (_slide_index_of(target) if target.get("slide_index") is not None else 0),
             "shape_id": shape_id,
             "kind": target.get("kind"),
             "name": target.get("name") or target.get("shape_name"),
@@ -1299,6 +1363,346 @@ class _OperationStore:
         )
         return op, None
 
+    # ---------- v0.3 批量/增强操作 ----------
+
+    def _v03_merged(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else None
+        return {**payload, **raw} if payload else raw
+
+    def _v03_scope(self, merged: Dict[str, Any], deck_only: bool = False):
+        """Resolve slide_index / deck eligibility. Returns (slide_index, scope_label, error)."""
+        explicit = str(merged.get("scope") or "").strip().lower()
+        slide_raw = merged.get("slide_index")
+        if slide_raw is not None:
+            index = _as_int(slide_raw)
+            if index is None:
+                return None, None, "slide_index 无效"
+            if not self.view.is_scoped(index):
+                return None, None, "slide_index 不在当前处理范围"
+            if explicit in ("deck", "all", "document", "whole"):
+                return None, None, "slide_index 与 scope=deck 冲突，二选一"
+            return index, "slide", None
+        if explicit in ("slide", "current", "page"):
+            return None, None, "scope=slide 需要 slide_index"
+        if deck_only or explicit in ("deck", "all", "document", "whole"):
+            if len(self.view.scope_slides) >= self.view.total_slides:
+                return None, "deck", None  # full-deck scope: fine
+            return None, None, (
+                "该操作作用于整份文稿，需要整份范围；请让用户把范围切到「整份文稿」，"
+                "或在指令里明确「全局/整份」后重发"
+            )
+        if len(self.view.scope_slides) < self.view.total_slides:
+            return None, None, (
+                "该操作作用于整份文稿，需要整份范围；请让用户把范围切到「整份文稿」，"
+                "或在指令里明确「全局/整份」后重发"
+            )
+        return None, "deck", None
+
+    def _v03_resolve(self, shape_id: str, kinds=None):
+        """Find an object/element entry; returns (entry, slide_index, error)."""
+        sid = str(shape_id or "").strip()
+        if not sid:
+            return None, None, "缺少 shape_id"
+        for entry in (self.view.object_by_id.get(sid), self.view.element_by_id.get(sid)):
+            if entry is None:
+                continue
+            raw_index = entry.get("slide_index")
+            # int(x or -1) turns slide 0 into -1 — the falsy trap
+            if raw_index is None:
+                return None, None, "对象缺少 slide_index"
+            slide_index = int(raw_index)
+            if not self.view.is_scoped(slide_index):
+                return None, None, "对象不在当前处理范围"
+            return entry, slide_index, None
+        return None, None, "对象不存在，请先 read_slides / inspect_shapes 确认"
+
+    def _v03_op(
+        self, raw: Dict[str, Any], action: str
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        merged = self._v03_merged(raw)
+        defaults = {
+            "font_unify": "统一字体",
+            "replace_text": "全局替换文字",
+            "align_objects": "对齐/分布对象",
+            "duplicate_object": "复制对象",
+            "z_order": "调整层级",
+            "table_mod": "修改表格结构",
+            "replace_image": "替换图片",
+            "slide_background": "设置页面背景",
+            "add_page_numbers": "批量添加页码",
+            "font_scale": "统一调整字号",
+        }
+        op: Dict[str, Any] = {
+            "id": f"op{len(self.ops) + 1}",
+            "source": "agent",
+            "action": action,
+            "before": None,
+            "description": self._description(raw, defaults[action]),
+        }
+
+        if action == "replace_image":
+            shape_id = str(raw.get("shape_id") or raw.get("target_id") or "").strip()
+            # source check first: a chat-side replace_image without any image
+            # source can never work, so lead with that message regardless of
+            # whether the target id resolves
+            b64 = merged.get("image_base64")
+            path = merged.get("image_path")
+            if b64:
+                if not isinstance(b64, str) or not b64.strip():
+                    return None, "image_base64 必须是非空 base64 字符串"
+                if len(b64) > 12_000_000:
+                    return None, "image_base64 过大（解码前约 9 MB 上限）"
+                op["image_base64"] = b64
+            elif path:
+                if not isinstance(path, str) or not path.strip():
+                    return None, "image_path 必须是非空路径"
+                op["image_path"] = path
+            else:
+                return None, "replace_image 需要 image_base64 或 image_path（服务器本地 png/jpg 路径）"
+            entry, slide_index, error = self._v03_resolve(shape_id, kinds=("picture",))
+            if error:
+                return None, error
+            if str(entry.get("kind")) != "picture":
+                return None, "replace_image 只能作用于图片对象；请用 inspect_shapes 确认 shape_id"
+            op["shape_id"] = shape_id
+            op["slide_index"] = slide_index
+            op["meta"] = {"slide_index": slide_index, "kind": "picture"}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action in ("font_unify", "replace_text", "font_scale"):
+            slide_index, scope_label, scope_error = self._v03_scope(merged)
+            if scope_error:
+                return None, scope_error
+            op["slide_index"] = slide_index
+            op["scope"] = scope_label
+            if action == "font_unify":
+                font_name = str(merged.get("font_name") or merged.get("font") or "").strip()
+                if not font_name:
+                    return None, "font_unify 缺少 font_name"
+                if len(font_name) > 100:
+                    return None, "font_name 过长（最多 100 字符）"
+                op["font_name"] = font_name
+                op["meta"] = {"kind": "font", "font_name": font_name}
+            elif action == "replace_text":
+                find = str(merged.get("find") or "").strip()
+                replace = merged.get("replace")
+                if not find:
+                    return None, "replace_text 缺少 find"
+                if len(find) > 200:
+                    return None, "find 过长（最多 200 字符）"
+                if replace is None:
+                    return None, "replace_text 缺少 replace"
+                replace = str(replace)
+                if len(replace) > 2000:
+                    return None, "replace 过长（最多 2000 字符）"
+                op["find"] = find
+                op["replace"] = replace
+                op["meta"] = {"kind": "replace", "find": find, "replace": replace}
+            else:  # font_scale
+                delta = _as_float(
+                    merged.get("delta_pt", merged.get("delta", merged.get("by")))
+                )
+                if delta is None:
+                    return None, "font_scale 缺少 delta_pt（±50 以内）"
+                if not (-50 <= delta <= 50):
+                    return None, "delta_pt 超出 ±50 范围"
+                op["delta_pt"] = int(delta) if float(delta).is_integer() else round(delta, 1)
+                op["meta"] = {"kind": "font_scale", "delta_pt": op["delta_pt"]}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "add_page_numbers":
+            _slide_index, _scope_label, scope_error = self._v03_scope(merged, deck_only=True)
+            if scope_error:
+                return None, scope_error
+            skip_first = _as_bool(merged.get("skip_first", merged.get("skip_cover")))
+            op["skip_first"] = bool(skip_first)  # always explicit; False is meaningful
+            position = str(merged.get("position") or "bottom-right").strip().lower()
+            if position not in edits.PAGE_NUMBER_POSITIONS:
+                return None, "position 仅支持 bottom-left/bottom-center/bottom-right"
+            op["position"] = position
+            start = _as_int(merged.get("start", 1))
+            if start is None or not (0 <= start <= 9999):
+                return None, "start 必须是 0..9999 的整数"
+            op["start"] = start
+            op["meta"] = {"kind": "page_numbers", "position": position, "skip_first": op["skip_first"]}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "slide_background":
+            slide_index, scope_error = self._v03_scope_deck_required(merged)
+            if scope_error:
+                return None, scope_error
+            gradient = merged.get("gradient")
+            if isinstance(gradient, dict):
+                try:
+                    edits._bg_color(gradient.get("from", gradient.get("start")), "gradient.from")
+                    edits._bg_color(gradient.get("to", gradient.get("end")), "gradient.to")
+                except edits.PatchError as exc:
+                    return None, str(exc)
+                op["gradient"] = gradient
+            else:
+                try:
+                    color = edits._bg_color(merged.get("color"), "color")
+                except edits.PatchError as exc:
+                    return None, str(exc)
+                op["color"] = color
+            op["slide_index"] = slide_index
+            op["meta"] = {"slide_index": slide_index, "kind": "background"}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "align_objects":
+            raw_ids = merged.get("shape_ids")
+            if not isinstance(raw_ids, list) or len(raw_ids) < 2:
+                return None, "align_objects 需要至少 2 个 shape_ids"
+            if len(raw_ids) > 12:
+                return None, "align_objects 单次最多 12 个对象"
+            align = str(merged.get("align") or merged.get("mode") or "").strip().lower()
+            align = edits._ALIGN_ALIASES.get(align, align)
+            if align not in edits.ALIGN_MODES:
+                return None, "align 仅支持 left/right/top/bottom/hcenter/vcenter/distribute_h/distribute_v"
+            if align.startswith("distribute") and len(raw_ids) < 3:
+                return None, "distribute_h/distribute_v 需要至少 3 个对象"
+            slide_indices = set()
+            shape_ids: List[str] = []
+            for value in raw_ids:
+                sid = str(value or "").strip()
+                entry, slide_index, error = self._v03_resolve(sid)
+                if error:
+                    return None, f"{sid}：{error}"
+                if entry.get("grouped"):
+                    return None, f"{sid} 在分组内，不能参与对齐/分布"
+                if entry.get("kind") == "table_cell":
+                    return None, "表格单元格不能参与对齐/分布，请使用表格 shape_id"
+                slide_indices.add(slide_index)
+                shape_ids.append(sid)
+            if len(slide_indices) != 1:
+                return None, "align_objects 只支持同一页内的对象"
+            slide_index = slide_indices.pop()
+            op["slide_index"] = slide_index
+            op["shape_ids"] = shape_ids
+            op["align"] = align
+            op["meta"] = {"slide_index": slide_index, "kind": "align", "align": align}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action in ("duplicate_object", "z_order"):
+            shape_id = str(raw.get("shape_id") or raw.get("target_id") or "").strip()
+            entry, slide_index, error = self._v03_resolve(shape_id)
+            if error:
+                return None, error
+            op["shape_id"] = shape_id
+            op["slide_index"] = slide_index
+            if action == "duplicate_object":
+                offset = merged.get("offset_emu")
+                if offset is not None:
+                    if not isinstance(offset, dict):
+                        return None, "offset_emu 必须是 {x, y} 对象"
+                    x = _as_int(offset.get("x", 304800))
+                    y = _as_int(offset.get("y", 304800))
+                    if x is None or y is None or x < 0 or y < 0:
+                        return None, "offset_emu.x/y 必须是非负整数（EMU）"
+                    op["offset_emu"] = {"x": x, "y": y}
+                op["meta"] = {"slide_index": slide_index, "kind": entry.get("kind")}
+            else:
+                mode = str(merged.get("mode") or "").strip().lower()
+                mode = edits._Z_MODE_ALIASES.get(mode, mode)
+                if mode not in edits._Z_ORDER_MODES:
+                    return None, "z_order mode 仅支持 front/back/forward/backward（置顶/置底/上移/下移）"
+                op["mode"] = mode
+                op["meta"] = {"slide_index": slide_index, "kind": "z_order", "mode": mode}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "table_mod":
+            shape_id = str(raw.get("shape_id") or raw.get("table_shape_id") or "").strip()
+            table = self.view.table_by_id.get(shape_id)
+            if table is None:
+                return None, "shape_id 不是表格；请先用 read_slides/read_table 找到表格 shape_id"
+            slide_index = _slide_index_of(table)
+            if not self.view.is_scoped(slide_index):
+                return None, "表格不在当前处理范围"
+            op_name = str(merged.get("op") or merged.get("table_op") or "").strip().lower()
+            if op_name not in edits.TABLE_MOD_OPS:
+                return None, "op 仅支持 add_row/add_col/delete_row/delete_col/merge_cells/split_cells"
+            rows = int(table.get("rows") or 0)
+            cols = int(table.get("cols") or 0)
+
+            def _cell_index(*names: str, label: str) -> Optional[int]:
+                for name in names:
+                    if merged.get(name) is not None:
+                        value = _as_int(merged.get(name))
+                        if value is None:
+                            raise edits.PatchError(f"{label} 无效")
+                        return value
+                return None
+
+            try:
+                if op_name == "delete_row":
+                    index = _cell_index("index", "row", label="index")
+                    if index is None or not (0 <= index < rows):
+                        return None, f"index 必须在 0..{rows - 1}"
+                    op["index"] = index
+                elif op_name == "delete_col":
+                    index = _cell_index("index", "col", label="index")
+                    if index is None or not (0 <= index < cols):
+                        return None, f"index 必须在 0..{cols - 1}"
+                    op["index"] = index
+                elif op_name == "merge_cells":
+                    for name, high in (("row", rows), ("col", cols), ("row2", rows), ("col2", cols)):
+                        value = _as_int(merged.get(name))
+                        if value is None or not (0 <= value < high):
+                            return None, f"{name} 必须在 0..{high - 1}"
+                        op[name] = value
+                elif op_name == "split_cells":
+                    for name, high in (("row", rows), ("col", cols)):
+                        value = _as_int(merged.get(name))
+                        if value is None or not (0 <= value < high):
+                            return None, f"{name} 必须在 0..{high - 1}"
+                        op[name] = value
+            except edits.PatchError as exc:
+                return None, str(exc)
+            op["shape_id"] = shape_id
+            op["slide_index"] = slide_index
+            op["op"] = op_name
+            op["meta"] = {"slide_index": slide_index, "kind": "table_mod", "op": op_name}
+            return self._finish_v03_op(op, raw, merged)
+
+        return None, f"不支持的操作：{action}"
+
+    def _v03_scope_deck_required(self, merged: Dict[str, Any]):
+        """slide_background needs an explicit, in-scope slide_index."""
+        slide_raw = merged.get("slide_index")
+        index = _as_int(slide_raw)
+        if index is None:
+            return None, "slide_background 需要 slide_index"
+        if not self.view.is_scoped(index):
+            return None, "slide_index 不在当前处理范围"
+        return index, None
+
+    def _finish_v03_op(
+        self, op: Dict[str, Any], raw: Dict[str, Any], merged: Dict[str, Any]
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        op.setdefault("meta", {})
+        if "slide_index" in op:
+            op["meta"].setdefault("slide_index", op["slide_index"])
+        key = (
+            op.get("action"),
+            op.get("slide_index"),
+            op.get("shape_id"),
+            tuple(op.get("shape_ids") or []),
+            op.get("font_name"),
+            op.get("find"),
+            op.get("replace"),
+            op.get("delta_pt"),
+            op.get("align"),
+            op.get("mode"),
+            op.get("op"),
+            op.get("position"),
+            op.get("color"),
+            json.dumps(op.get("gradient"), ensure_ascii=False, sort_keys=True) if op.get("gradient") else None,
+        )
+        if key in self.v03_keys:
+            return None, "已提交过相同的批量操作"
+        self.v03_keys.add(key)
+        return op, None
+
     def _register(self, op: Dict[str, Any]) -> None:
         action = op.get("action")
         shape_id = str(op.get("shape_id") or "")
@@ -1346,6 +1750,14 @@ class _OperationStore:
             item["text"] = _clip(op.get("after"), 80)
         if op.get("action") in SLIDE_ACTIONS:
             for key in ("source_slide", "position", "after_slide", "layout_index", "slide", "to"):
+                if op.get(key) is not None:
+                    item[key] = op.get(key)
+        if op.get("action") in V03_ACTIONS:
+            for key in (
+                "font_name", "find", "replace", "delta_pt", "align", "mode", "op",
+                "shape_ids", "skip_first", "position", "start", "color", "gradient",
+                "offset_emu",
+            ):
                 if op.get(key) is not None:
                     item[key] = op.get(key)
         return item
@@ -1401,7 +1813,7 @@ def _trace_detail(action: str, args: Dict[str, Any], detail: Dict[str, Any]) -> 
         pages = []
         for section in detail.get("slides") or []:
             if isinstance(section, dict):
-                pages.append(str(section.get("page") or (int(section.get("slide_index") or 0) + 1)))
+                pages.append(str(section.get("page") or ((_slide_index_of(section) if section.get("slide_index") is not None else 0) + 1)))
         return f"读取第 {', '.join(pages)} 页" if pages else "读取页面"
     if action == "search_text":
         return f"搜索「{detail.get('query', '')}」命中 {detail.get('count', 0)} 处"
@@ -1506,7 +1918,29 @@ SYSTEM_PROMPT = (
     "幻灯片级操作在其后按提交顺序执行；应用后所有 s{n}_id{m} 按新页码重编号，"
     "要编辑新插入页的内容，请等本批应用后下一轮重新 read_slides 再提交。\n"
     "典型用法：「复制第 1 页生成第 2 页并改标题」→ 本轮只提交 duplicate_slide，"
-    "应用后下一轮再 edit 新页的标题对象。\n\n"
+    "应用后下一轮再 edit 新页的标题对象。\n"
+    "v0.3 批量/增强操作：\n"
+    '- font_unify：{"action":"font_unify","font_name":"微软雅黑","slide_index":可选} '
+    "统一字体（保留字号/加粗差异）；不填 slide_index 作用于整份。\n"
+    '- replace_text：{"action":"replace_text","find":"旧词","replace":"新词"} 跨页全量替换，'
+    "建议先 search_text 确认命中位置；找不到会报错。\n"
+    '- align_objects：{"action":"align_objects","shape_ids":["s0_id2","s0_id3"],'
+    '"align":"left|right|top|bottom|hcenter|vcenter|distribute_h|distribute_v"} '
+    "同页非分组对象对齐/等间距分布（分布需 ≥3 个）。\n"
+    '- duplicate_object：{"action":"duplicate_object","shape_id":"...","offset_emu":{"x":300000,"y":300000}} '
+    "页内复制文本框/图片等（默认向右下偏移约 0.85cm）。\n"
+    '- z_order：{"action":"z_order","shape_id":"...","mode":"front|back|forward|backward"} 置顶/置底/上移/下移。\n'
+    '- table_mod：{"action":"table_mod","shape_id":"表格id","op":"add_row|add_col|delete_row|delete_col|'
+    'merge_cells|split_cells","index/row/col/row2/col2":...} 表格结构修改（行列增删、合并/拆分）。\n'
+    '- slide_background：{"action":"slide_background","slide_index":0,"color":"1F4E79"}，'
+    '或 {"gradient":{"from":"0F172A","to":"2563EB","angle":45}} 纯色/渐变背景。\n'
+    '- add_page_numbers：{"action":"add_page_numbers","skip_first":true,"position":"bottom-right"} '
+    "批量加页码（skip_first 可跳过封面）。\n"
+    '- font_scale：{"action":"font_scale","delta_pt":2} 整页/整份字号统一 +N/-N 磅。\n'
+    "批量操作规则：font_unify/replace_text/font_scale 不填 slide_index、以及 add_page_numbers，"
+    "都会作用于整份文稿，需要整份范围（用户指令含「全局/整份/所有页」时系统会自动扩大范围）；"
+    "replace_image 需要图片来源（image_base64 或服务器可读的 image_path，png/jpg）；"
+    "对话里拿不到图片来源时，用 finish 引导用户通过 /api/docs/{id}/apply 提供图片。\n\n"
     f"约束：单次 propose 最多 {MAX_OPS_PER_CALL} 条，本次对话最多 {MAX_OPS} 条。\n\n"
     "工作方式：\n"
     "- 先理解意图：用户点名字段或页面时优先处理该对象/页面；模糊需求先 outline/read_slides 判断。\n"
@@ -1581,7 +2015,7 @@ def _initial_prompt(
         selection = view.inspect(str(selected_shape_id))
         if selection.get("error"):
             selection = {"shape_id": selected_shape_id, "error": selection.get("error")}
-        elif not view.is_scoped(int(selection.get("slide_index") or -1)):
+        elif not view.is_scoped(_slide_index_of(selection)):
             selection = {
                 "shape_id": selected_shape_id,
                 "note": "已选对象不在本次处理范围，仅作参考",
@@ -1657,6 +2091,9 @@ def run_stream(
         value = _as_int(slide_index)
         target_slide = 0 if value is None else value
         target_slide = max(0, min(target_slide, total_slides - 1))
+        if scope == "current" and DECK_INTENT_RE.search(instruction):
+            # 用户点名「全局/整份/所有页…」→ 自动扩大范围，允许 deck 级批量操作
+            scope = "deck"
     scope_slides = [target_slide] if scope == "current" else list(range(total_slides))
 
     view = _DeckView(objects, elements, tables, total_slides, scope_slides, slide_size)

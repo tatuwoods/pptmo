@@ -11,7 +11,8 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.opc.packuri import PackURI
-from pptx.oxml.ns import qn
+from pptx.oxml import parse_xml
+from pptx.oxml.ns import nsdecls, qn
 from pptx.util import Emu, Pt
 
 
@@ -326,6 +327,7 @@ def _remove_shape(shape) -> None:
 
 
 MAX_PATCH_TEXT_CHARS = 20000
+MAX_PATCH_IMAGE_B64_CHARS = 41 * 1024 * 1024  # ≈30 MB binary after base64
 FUZZY_BEFORE_MAX_CHARS = 10000
 
 
@@ -333,10 +335,16 @@ def _validate_patch_sizes(patch: Dict[str, Any]) -> None:
     """Direct /apply uploads bypass the agent's own caps; bound the strings so a
     hostile patch list can't force quadratic CPU or huge text into the PPTX."""
     def _check(value: Any, label: str) -> None:
-        if isinstance(value, str) and len(value) > MAX_PATCH_TEXT_CHARS:
+        if not isinstance(value, str):
+            return
+        if label.endswith("image_base64"):
+            if len(value) > MAX_PATCH_IMAGE_B64_CHARS:
+                raise PatchError("payload.image_base64 too large (max ~30 MB)")
+            return
+        if len(value) > MAX_PATCH_TEXT_CHARS:
             raise PatchError(f"{label} too long (max {MAX_PATCH_TEXT_CHARS} chars)")
 
-    for key in ("before", "after", "text"):
+    for key in ("before", "after", "text", "find", "replace"):
         _check(patch.get(key), key)
     payload = patch.get("payload")
     if isinstance(payload, dict):
@@ -391,6 +399,18 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
         if slide_index < 0 or slide_index >= len(prs.slides):
             raise PatchError(f"slide_index out of range: {slide_index}")
         _add_textbox(prs.slides[slide_index], slide_w, slide_h, patch)
+        return slide_index
+
+    if action == "slide_background":
+        payload = patch.get("payload") or {}
+        merged = {**patch, **payload}
+        try:
+            slide_index = int(merged.get("slide_index"))
+        except (TypeError, ValueError):
+            raise PatchError("slide_background requires slide_index")
+        if slide_index < 0 or slide_index >= len(prs.slides):
+            raise PatchError(f"slide_index out of range: {slide_index}")
+        _apply_slide_background(prs.slides[slide_index], merged)
         return slide_index
 
     shape_id = str(patch.get("shape_id") or "")
@@ -449,6 +469,20 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
     if shape is None:
         raise PatchConflict(f"shape not found: {shape_id}")
     grouped = bool(getattr(shape, "shape_type", None) == 6)
+    if action == "replace_image":
+        _apply_replace_image(slide, shape, merged)
+        return slide_index
+    if action == "table_mod":
+        if not getattr(shape, "has_table", False):
+            raise PatchError(f"shape is not a table: {shape_id}")
+        _apply_table_mod(shape.table, merged)
+        return slide_index
+    if action == "duplicate_object":
+        _apply_duplicate_object(slide, shape, merged.get("offset_emu"), slide_w, slide_h)
+        return slide_index
+    if action == "z_order":
+        _apply_z_order(slide, shape, merged.get("mode"))
+        return slide_index
     # A nested shape is found recursively; moving nested shapes in group coordinate
     # space is unsafe, so only text/style actions are allowed for groups.
     is_grouped = False
@@ -505,6 +539,10 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
 
 SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide"}
 
+# deck-wide bulk ops (v0.3): run after shape patches but BEFORE slide-level ops
+# so slide_index parameters still refer to the base deck the caller read
+DECK_ACTIONS = {"font_unify", "replace_text", "font_scale", "add_page_numbers"}
+
 _ACTION_ALIASES = {
     "update": "edit",
     "rewrite": "edit",
@@ -526,6 +564,38 @@ _ACTION_ALIASES = {
     "insert_slide": "add_slide",
     "remove_slide": "delete_slide",
     "reorder_slide": "move_slide",
+    "unify_font": "font_unify",
+    "font_unify": "font_unify",
+    "unify_fonts": "font_unify",
+    "replace_text": "replace_text",
+    "global_replace": "replace_text",
+    "replace_all": "replace_text",
+    "font_scale": "font_scale",
+    "scale_font": "font_scale",
+    "page_numbers": "add_page_numbers",
+    "add_page_number": "add_page_numbers",
+    "add_page_numbers": "add_page_numbers",
+    "align_objects": "align_objects",
+    "align_shapes": "align_objects",
+    "distribute": "align_objects",
+    "distribute_objects": "align_objects",
+    "duplicate_object": "duplicate_object",
+    "copy_object": "duplicate_object",
+    "clone_object": "duplicate_object",
+    "z_order": "z_order",
+    "zorder": "z_order",
+    "reorder_z": "z_order",
+    "layer": "z_order",
+    "table_mod": "table_mod",
+    "modify_table": "table_mod",
+    "table_row": "table_mod",
+    "table_col": "table_mod",
+    "replace_image": "replace_image",
+    "swap_image": "replace_image",
+    "change_image": "replace_image",
+    "slide_background": "slide_background",
+    "background": "slide_background",
+    "set_background": "slide_background",
 }
 
 
@@ -761,6 +831,716 @@ def _apply_slide_patches(
     return touched
 
 
+# ---------- multi-shape operations (v0.3) ----------
+
+ALIGN_MODES = {
+    "left", "right", "top", "bottom",
+    "hcenter", "vcenter", "center_h", "center_v",
+    "distribute_h", "distribute_v",
+}
+_ALIGN_ALIASES = {"center": "hcenter", "middle": "vcenter", "center_x": "hcenter", "center_y": "vcenter"}
+
+
+_SHAPE_TAGS = ("}sp", "}pic", "}graphicFrame", "}grpSp", "}cxnSp")
+
+
+def _is_shape_element(element) -> bool:
+    return any(element.tag.endswith(suffix) for suffix in _SHAPE_TAGS)
+
+
+def _max_shape_id(slide) -> int:
+    """Largest cNvPr id anywhere in the slide tree (groups included)."""
+    best = 1
+    for node in slide.shapes._spTree.iter():
+        if node.tag.endswith("}cNvPr"):
+            try:
+                best = max(best, int(node.get("id")))
+            except (TypeError, ValueError):
+                continue
+    return best
+
+
+def _apply_duplicate_object(slide, shape, offset_raw: Any, slide_w: int, slide_h: int) -> None:
+    if shape._element.getparent() is None:
+        raise PatchError("shape has no parent")
+    offset = offset_raw if isinstance(offset_raw, dict) else {}
+    try:
+        dx = int(round(float(offset.get("x", 304800))))
+        dy = int(round(float(offset.get("y", 304800))))
+    except (TypeError, ValueError):
+        raise PatchError("offset_emu.x/y must be numbers")
+    if dx < 0 or dy < 0 or dx > slide_w or dy > slide_h:
+        raise PatchError("offset_emu 超出画布范围")
+    new_el = copy.deepcopy(shape._element)
+    next_id = _max_shape_id(slide) + 1
+    for node in new_el.iter():
+        if node.tag.endswith("}cNvPr"):
+            node.set("id", str(next_id))
+            next_id += 1
+    # shift the copy before insertion: works the same at top level and inside
+    # groups (offsets live in the parent's coordinate space either way)
+    new_left = max(0, int(shape.left or 0) + dx)
+    new_top = max(0, int(shape.top or 0) + dy)
+    for off in new_el.iter(qn("a:off")):
+        off.set("x", str(new_left))
+        off.set("y", str(new_top))
+        break
+    shape._element.addnext(new_el)
+    # same slide part → copied rId references stay valid; no rel rebinding needed
+
+
+_Z_ORDER_MODES = {"front", "back", "forward", "backward"}
+_Z_MODE_ALIASES = {
+    "bring_to_front": "front",
+    "bring_front": "front",
+    "top": "front",
+    "置顶": "front",
+    "send_to_back": "back",
+    "send_back": "back",
+    "bottom": "back",
+    "置底": "back",
+    "up": "forward",
+    "上移": "forward",
+    "down": "backward",
+    "下移": "backward",
+}
+
+
+def _apply_z_order(slide, shape, mode_raw: Any) -> None:  # noqa: ARG001 (slide kept for symmetry)
+    mode = str(mode_raw or "").strip().lower()
+    mode = _Z_MODE_ALIASES.get(mode, mode)
+    if mode not in _Z_ORDER_MODES:
+        raise PatchError(
+            f"unsupported z_order mode: {mode_raw!r} (支持 front/back/forward/backward)"
+        )
+    element = shape._element
+    parent = element.getparent()
+    if parent is None:
+        raise PatchError("shape has no parent")
+    children = list(parent)
+    if mode == "front":
+        parent.remove(element)
+        parent.append(element)
+    elif mode == "back":
+        parent.remove(element)
+        insert_at = 0
+        for index, child in enumerate(children):
+            if _is_shape_element(child):
+                insert_at = index
+                break
+        else:
+            insert_at = len(children)
+        # insert where the first shape was (children captured before removal)
+        parent.insert(insert_at, element)
+    elif mode == "forward":
+        idx = children.index(element)
+        nxt = next((c for c in children[idx + 1:] if _is_shape_element(c)), None)
+        if nxt is not None:
+            parent.remove(element)
+            nxt.addnext(element)
+    else:  # backward
+        idx = children.index(element)
+        prev = next((c for c in reversed(children[:idx]) if _is_shape_element(c)), None)
+        if prev is not None:
+            parent.remove(element)
+            prev.addprevious(element)
+
+
+# ---------- table row/col/merge operations (v0.3) ----------
+
+TABLE_MOD_OPS = {"add_row", "add_col", "delete_row", "delete_col", "merge_cells", "split_cells"}
+TABLE_MAX_ROWS = 60
+TABLE_MAX_COLS = 30
+
+
+def _tc_attr(tc, name: str) -> int:
+    try:
+        return int(tc.get(name) or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _strip_merge_flags(tr) -> None:
+    """Make a cloned row a plain row: drop merge attrs so the copy can't
+    dangle references to merges that don't span it."""
+    for tc in tr.findall(qn("a:tc")):
+        for attr in ("rowSpan", "gridSpan", "hMerge", "vMerge"):
+            if tc.get(attr) is not None:
+                del tc.attrib[attr]
+
+
+def _clear_tr_text(tr) -> None:
+    """Empty every cell of a cloned row, keeping pPr/tcPr (styling) intact."""
+    for tc in tr.findall(qn("a:tc")):
+        _clear_tc_text(tc)
+
+
+def _clear_tc_text(tc) -> None:
+    txBody = tc.find(qn("a:txBody"))
+    if txBody is None:
+        return
+    paragraphs = txBody.findall(qn("a:p"))
+    for paragraph in paragraphs[1:]:
+        txBody.remove(paragraph)
+    if paragraphs:
+        for child in list(paragraphs[0]):
+            if child.tag != qn("a:pPr"):
+                paragraphs[0].remove(child)
+
+
+def _merge_origins(tbl) -> List[Tuple[int, int, int, int]]:
+    """(origin_row, origin_col, rowSpan, gridSpan) for every merged range."""
+    origins = []
+    for r, tr in enumerate(tbl.tr_lst):
+        for c, tc in enumerate(tr.findall(qn("a:tc"))):
+            row_span = _tc_attr(tc, "rowSpan")
+            grid_span = _tc_attr(tc, "gridSpan")
+            if row_span > 1 or grid_span > 1:
+                origins.append((r, c, row_span, grid_span))
+    return origins
+
+
+def _require_index(value: Any, high: int, label: str) -> int:
+    if value is None:
+        raise PatchError(f"table_mod.{label} is required")
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        raise PatchError(f"table_mod.{label} must be an integer: {value!r}")
+    if index < 0 or index >= high:
+        raise PatchError(f"table_mod.{label} out of range: {index} (0..{high - 1})")
+    return index
+
+
+def _apply_table_mod(table, merged: Dict[str, Any]) -> None:
+    op = str(merged.get("op") or merged.get("table_op") or "").strip().lower()
+    if op not in TABLE_MOD_OPS:
+        raise PatchError(f"unsupported table_mod op: {op!r} (支持 {'/'.join(sorted(TABLE_MOD_OPS))})")
+    tbl = table._tbl
+    rows = len(table.rows)
+    cols = len(table.columns)
+
+    if op == "add_row":
+        if rows >= TABLE_MAX_ROWS:
+            raise PatchError(f"表格行数已达上限（{TABLE_MAX_ROWS}）")
+        tr_new = copy.deepcopy(tbl.tr_lst[-1])
+        _strip_merge_flags(tr_new)
+        _clear_tr_text(tr_new)
+        tbl.append(tr_new)
+        return
+    if op == "add_col":
+        if cols >= TABLE_MAX_COLS:
+            raise PatchError(f"表格列数已达上限（{TABLE_MAX_COLS}）")
+        grid = tbl.find(qn("a:tblGrid"))
+        if grid is None:
+            raise PatchError("table grid not found")
+        widths = [int(gc.get("w") or 0) for gc in grid.findall(qn("a:gridCol"))]
+        width = max(360000, int(sum(widths) / max(1, len(widths))) if widths else 720000)
+        grid.append(grid.makeelement(qn("a:gridCol"), {"w": str(width)}))
+        for tr in tbl.tr_lst:
+            tcs = tr.findall(qn("a:tc"))
+            template = tcs[-1] if tcs else None
+            if template is None:
+                raise PatchError("table row has no cells")
+            tc_new = copy.deepcopy(template)
+            # strip merge attrs on the CLONE only — the copy is a plain cell
+            for attr in ("rowSpan", "gridSpan", "hMerge", "vMerge"):
+                if tc_new.get(attr) is not None:
+                    del tc_new.attrib[attr]
+            _clear_tc_text(tc_new)
+            tr.append(tc_new)
+        return
+    if op == "delete_row":
+        index = _require_index(merged.get("index") if merged.get("index") is not None else merged.get("row"), rows, "index")
+        for r0, c0, row_span, grid_span in _merge_origins(tbl):
+            if r0 <= index < r0 + max(1, row_span):
+                raise PatchError(
+                    f"第 {index} 行与合并单元格（起点 R{r0 + 1}C{c0 + 1}）相交，请先拆分再删除"
+                )
+        tbl.remove(tbl.tr_lst[index])
+        return
+    if op == "delete_col":
+        index = _require_index(merged.get("index") if merged.get("index") is not None else merged.get("col"), cols, "index")
+        for r0, c0, row_span, grid_span in _merge_origins(tbl):
+            if c0 <= index < c0 + max(1, grid_span):
+                raise PatchError(
+                    f"第 {index} 列与合并单元格（起点 R{r0 + 1}C{c0 + 1}）相交，请先拆分再删除"
+                )
+        grid = tbl.find(qn("a:tblGrid"))
+        grid.remove(grid.findall(qn("a:gridCol"))[index])
+        for tr in tbl.tr_lst:
+            tcs = tr.findall(qn("a:tc"))
+            tr.remove(tcs[index])
+        return
+    if op == "merge_cells":
+        row = _require_index(merged.get("row"), rows, "row")
+        col = _require_index(merged.get("col"), cols, "col")
+        row2 = _require_index(merged.get("row2"), rows, "row2")
+        col2 = _require_index(merged.get("col2"), cols, "col2")
+        # python-pptx merge concatenates every cell's text into the origin;
+        # clearing the non-origin cells first keeps the merged text clean
+        for r in range(min(row, row2), max(row, row2) + 1):
+            for c in range(min(col, col2), max(col, col2) + 1):
+                if (r, c) != (row, col):
+                    try:
+                        table.cell(r, c).text = ""
+                    except Exception:
+                        pass
+        try:
+            table.cell(row, col).merge(table.cell(row2, col2))
+        except ValueError as exc:
+            raise PatchError(f"merge_cells 失败：{exc}") from exc
+        return
+    # split_cells
+    row = _require_index(merged.get("row"), rows, "row")
+    col = _require_index(merged.get("col"), cols, "col")
+    cell = table.cell(row, col)
+    if not cell.is_merge_origin:
+        raise PatchError(f"R{row + 1}C{col + 1} 不是合并单元格的起始格，无法拆分")
+    try:
+        cell.split()
+    except ValueError as exc:
+        raise PatchError(f"split_cells 失败：{exc}") from exc
+
+
+def _apply_align_objects(prs, patch: Dict[str, Any]) -> int:
+    payload = patch.get("payload") or {}
+    merged = {**patch, **payload}
+    raw_ids = merged.get("shape_ids")
+    if not isinstance(raw_ids, list) or len(raw_ids) < 2:
+        raise PatchError("align_objects 需要至少 2 个 shape_ids")
+    if len(raw_ids) > 12:
+        raise PatchError("align_objects 单次最多 12 个对象")
+    align = str(merged.get("align") or merged.get("mode") or "").strip().lower()
+    align = _ALIGN_ALIASES.get(align, align)
+    if align not in ALIGN_MODES:
+        raise PatchError(
+            f"unsupported align mode: {align!r} (支持 {'/'.join(sorted(ALIGN_MODES))})"
+        )
+    parsed = [parse_shape_id(str(sid)) for sid in raw_ids]
+    if any(p is None for p in parsed):
+        raise PatchError("align_objects 的 shape_ids 含无效 ID")
+    slides = {p[0] for p in parsed}
+    if len(slides) != 1:
+        raise PatchError("align_objects 只支持同一页内的对象")
+    slide_index = slides.pop()
+    if slide_index < 0 or slide_index >= len(prs.slides):
+        raise PatchError(f"slide_index out of range: {slide_index}")
+    slide = prs.slides[slide_index]
+    shapes = []
+    for sid in raw_ids:
+        shape = find_shape(slide, str(sid))
+        if shape is None:
+            raise PatchConflict(f"shape not found: {sid}")
+        parent = shape._element.getparent()
+        if parent is not None and parent.tag.endswith("grpSp"):
+            raise PatchError(f"对象 {sid} 在分组内，不能参与对齐/分布")
+        if shape not in shapes:
+            shapes.append(shape)
+    if len(shapes) < 2:
+        raise PatchError("align_objects 需要至少 2 个不同对象")
+
+    rects = [
+        (int(s.left or 0), int(s.top or 0), int(s.width or 0), int(s.height or 0))
+        for s in shapes
+    ]
+    if align == "left":
+        target = min(r[0] for r in rects)
+        for s in shapes:
+            s.left = target
+    elif align == "right":
+        target = max(r[0] + r[2] for r in rects)
+        for s in shapes:
+            s.left = target - int(s.width or 0)
+    elif align == "top":
+        target = min(r[1] for r in rects)
+        for s in shapes:
+            s.top = target
+    elif align == "bottom":
+        target = max(r[1] + r[3] for r in rects)
+        for s in shapes:
+            s.top = target - int(s.height or 0)
+    elif align in ("hcenter", "center_h"):
+        target = round(sum(r[0] + r[2] / 2 for r in rects) / len(rects))
+        for s in shapes:
+            s.left = round(target - int(s.width or 0) / 2)
+    elif align in ("vcenter", "center_v"):
+        target = round(sum(r[1] + r[3] / 2 for r in rects) / len(rects))
+        for s in shapes:
+            s.top = round(target - int(s.height or 0) / 2)
+    elif align in ("distribute_h", "distribute_v"):
+        if len(shapes) < 3:
+            raise PatchError("distribute_h/distribute_v 需要至少 3 个对象")
+        # first and last stay fixed; middle shapes get equal gaps
+        order = sorted(range(len(shapes)), key=lambda i: rects[i][0] if align == "distribute_h" else rects[i][1])
+        if len(order) > 2:
+            if align == "distribute_h":
+                start = rects[order[0]][0]
+                end = rects[order[-1]][0] + rects[order[-1]][2]
+                total_w = sum(rects[i][2] for i in order)
+                gap = (end - start - total_w) / (len(order) - 1)
+                cursor = start
+                for i in order:
+                    shapes[i].left = round(cursor)
+                    cursor += rects[i][2] + gap
+            else:
+                start = rects[order[0]][1]
+                end = rects[order[-1]][1] + rects[order[-1]][3]
+                total_h = sum(rects[i][3] for i in order)
+                gap = (end - start - total_h) / (len(order) - 1)
+                cursor = start
+                for i in order:
+                    shapes[i].top = round(cursor)
+                    cursor += rects[i][3] + gap
+    return slide_index
+
+
+
+
+
+def _iter_text_targets(container):
+    """Yield every text-bearing shape / table cell on a slide (groups included)."""
+    def walk(shapes):
+        for shape in shapes:
+            try:
+                if getattr(shape, "shape_type", None) == 6:
+                    yield from walk(shape.shapes)
+                    continue
+            except Exception:
+                pass
+            if getattr(shape, "has_table", False):
+                try:
+                    for row in shape.table.rows:
+                        for cell in row.cells:
+                            yield cell
+                    continue
+                except Exception:
+                    continue
+            if getattr(shape, "has_text_frame", False):
+                yield shape
+
+    try:
+        yield from walk(container.shapes)
+    except AttributeError:
+        yield container  # a bare cell from a previous walk level
+
+
+def _set_run_font_name(run, name: str) -> None:
+    """Set latin + east-asian + complex-script typefaces (font.name only writes latin)."""
+    font = run.font
+    font.name = name
+    rPr = run._r.get_or_add_rPr()
+    latin = rPr.find(qn("a:latin"))
+    anchor = latin
+    for tag in ("a:ea", "a:cs"):
+        el = rPr.find(qn(tag))
+        if el is None:
+            el = rPr.makeelement(qn(tag), {})
+            if anchor is not None:
+                anchor.addnext(el)
+            else:
+                rPr.append(el)
+        el.set("typeface", name)
+        anchor = el
+
+
+def _resolve_bulk_slides(prs, merged: Dict[str, Any], n_orig: int) -> List[Any]:
+    """Resolve the target slide list for a bulk op against base numbering.
+
+    slide_index wins over scope; scope must be "deck" or "slide"; the default
+    for bulk ops is the whole deck."""
+    slide_index = merged.get("slide_index")
+    scope = str(merged.get("scope") or "").strip().lower()
+    if slide_index is not None:
+        try:
+            index = int(slide_index)
+        except (TypeError, ValueError):
+            raise PatchError(f"slide_index must be an integer: {slide_index!r}")
+        if index < 0 or index >= n_orig:
+            raise PatchError(f"slide_index out of range: {index} (deck has {n_orig})")
+        return [prs.slides[index]]
+    if scope in ("", "deck", "all", "document", "whole"):
+        return list(prs.slides)
+    if scope in ("slide", "current", "page"):
+        raise PatchError("scope=slide 需要 slide_index")
+    raise PatchError(f"invalid scope: {scope}")
+
+
+def _op_font_unify(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    font_name = str(merged.get("font_name") or merged.get("font") or "").strip()
+    if not font_name:
+        raise PatchError("font_unify requires font_name")
+    if len(font_name) > 100:
+        raise PatchError("font_name too long (max 100 chars)")
+    slides = _resolve_bulk_slides(prs, merged, n_orig)
+    touched: Set[int] = set()
+    all_slides = list(prs.slides)
+    for slide in slides:
+        changed = False
+        for target in _iter_text_targets(slide):
+            for paragraph in target.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    _set_run_font_name(run, font_name)
+                    changed = True
+        if changed:
+            touched.add(all_slides.index(slide))
+    return touched
+
+
+def _op_replace_text(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    find = str(merged.get("find") or "").strip()
+    replace = str(merged.get("replace") if merged.get("replace") is not None else "")
+    if not find:
+        raise PatchError("replace_text requires a non-empty find")
+    if len(find) > 500:
+        raise PatchError("find too long (max 500 chars)")
+    if len(replace) > 5000:
+        raise PatchError("replace too long (max 5000 chars)")
+    slides = _resolve_bulk_slides(prs, merged, n_orig)
+    all_slides = list(prs.slides)
+    touched: Set[int] = set()
+    total_replaced = 0
+    for slide in slides:
+        changed = False
+        for target in _iter_text_targets(slide):
+            for paragraph in target.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    if find in (run.text or ""):
+                        # per-run replace keeps every other run's style intact
+                        run.text = (run.text or "").replace(find, replace)
+                        total_replaced += 1
+                        changed = True
+            # fallback: the needle is split across run boundaries — rebuild the
+            # whole text body on the first-run style (mixed formatting collapses)
+            try:
+                full_text = target.text_frame.text
+            except Exception:
+                full_text = ""
+            if find in full_text and "\n" not in find:
+                set_text_preserving_style(target, full_text.replace(find, replace))
+                total_replaced += 1
+                changed = True
+        if changed:
+            touched.add(all_slides.index(slide))
+    if total_replaced == 0:
+        raise PatchError(f"未找到要替换的内容：「{find}」（请先 search_text 确认原文）")
+    return touched
+
+
+def _para_default_size_pt(paragraph) -> Optional[float]:
+    """Paragraph-level default size (a:pPr/a:defRPr or a:endParaRPr @sz)."""
+    pPr = paragraph._p.find(qn("a:pPr"))
+    if pPr is not None:
+        defRPr = pPr.find(qn("a:defRPr"))
+        if defRPr is not None and defRPr.get("sz"):
+            try:
+                value = int(defRPr.get("sz")) / 100.0
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+    end = paragraph._p.find(qn("a:endParaRPr"))
+    if end is not None and end.get("sz"):
+        try:
+            value = int(end.get("sz")) / 100.0
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    raw_delta = merged.get("delta_pt", merged.get("delta", merged.get("by")))
+    try:
+        delta = float(raw_delta)
+    except (TypeError, ValueError):
+        raise PatchError("font_scale requires a numeric delta_pt")
+    if not (-50 <= delta <= 50):
+        raise PatchError("delta_pt must be within ±50 pt")
+    slides = _resolve_bulk_slides(prs, merged, n_orig)
+    all_slides = list(prs.slides)
+    touched: Set[int] = set()
+    for slide in slides:
+        changed = False
+        for target in _iter_text_targets(slide):
+            for paragraph in target.text_frame.paragraphs:
+                inherited = _para_default_size_pt(paragraph)
+                for run in paragraph.runs:
+                    current = run.font.size.pt if run.font.size is not None else inherited
+                    base = current if current is not None else 18.0
+                    new_size = max(6.0, min(400.0, base + delta))
+                    run.font.size = Pt(new_size)
+                    changed = True
+        if changed:
+            touched.add(all_slides.index(slide))
+    return touched
+
+
+PAGE_NUMBER_POSITIONS = {"bottom-left", "bottom-center", "bottom-right"}
+
+
+def _op_add_page_numbers(prs, merged: Dict[str, Any]) -> Set[int]:
+    skip_first = bool(merged.get("skip_first") or merged.get("skip_cover") or False)
+    position = str(merged.get("position") or "bottom-right").strip().lower()
+    if position not in PAGE_NUMBER_POSITIONS:
+        raise PatchError(f"position must be one of {'/'.join(sorted(PAGE_NUMBER_POSITIONS))}")
+    try:
+        start = int(merged.get("start", 1))
+    except (TypeError, ValueError):
+        raise PatchError("start must be an integer")
+    if not (0 <= start <= 9999):
+        raise PatchError("start out of range (0..9999)")
+    try:
+        size = float(merged.get("font_size_pt", 12))
+    except (TypeError, ValueError):
+        raise PatchError("font_size_pt must be numeric")
+    if not (6 <= size <= 72):
+        raise PatchError("font_size_pt out of range (6..72)")
+    slide_w = int(prs.slide_width)
+    slide_h = int(prs.slide_height)
+    box_w = min(1200000, slide_w // 8)
+    box_h = min(420000, slide_h // 12)
+    margin = min(300000, slide_w // 40)
+    touched: Set[int] = set()
+    for index, slide in enumerate(prs.slides):
+        # idempotency guard: a second run over an already numbered deck is a
+        # user error (duplicate numbers), not a silent no-op
+        for shape in slide.shapes:
+            try:
+                text = shape.text.strip() if getattr(shape, "has_text_frame", False) else ""
+                small = int(shape.width or 0) <= box_w and int(shape.height or 0) <= box_h
+            except Exception:
+                continue
+            if text == str(index + start) and small:
+                raise PatchError(f"第 {index + 1} 页似乎已有页码；如需重加请先删除旧页码")
+        if skip_first and index == 0:
+            continue
+        number = str(index + start)
+        if position == "bottom-left":
+            x, align = margin, PP_ALIGN.LEFT
+        elif position == "bottom-center":
+            x, align = (slide_w - box_w) // 2, PP_ALIGN.CENTER
+        else:
+            x, align = slide_w - box_w - margin, PP_ALIGN.RIGHT
+        box = slide.shapes.add_textbox(Emu(x), Emu(slide_h - box_h - margin), Emu(box_w), Emu(box_h))
+        tf = box.text_frame
+        tf.word_wrap = False
+        try:
+            tf.auto_size = None
+        except Exception:
+            pass
+        paragraph = tf.paragraphs[0]
+        paragraph.alignment = align
+        run = paragraph.add_run()
+        run.text = number
+        run.font.size = Pt(size)
+        touched.add(index)
+    return touched
+
+
+_IMAGE_MAGIC_PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def _decode_image_payload(merged: Dict[str, Any]) -> bytes:
+    b64 = merged.get("image_base64")
+    path = merged.get("image_path")
+    if b64:
+        import base64
+        import binascii
+
+        if not isinstance(b64, str):
+            raise PatchError("image_base64 must be a base64 string")
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise PatchError("image_base64 解码失败：不是合法的 base64")
+    elif path:
+        source = Path(str(path))
+        if not source.is_file():
+            raise PatchError(f"image_path 不存在或不可读：{source.name}")
+        if source.stat().st_size > 30 * 1024 * 1024:
+            raise PatchError("图片超过 30 MB 限制")
+        data = source.read_bytes()
+    else:
+        raise PatchError("replace_image 需要 image_base64 或 image_path")
+    if len(data) > 30 * 1024 * 1024:
+        raise PatchError("图片超过 30 MB 限制")
+    if not (data.startswith(_IMAGE_MAGIC_PNG) or data.startswith(b"\xff\xd8\xff")):
+        raise PatchError("只支持 png / jpg 图片（检测到其他格式）")
+    return data
+
+
+def _apply_replace_image(slide, shape, merged: Dict[str, Any]) -> None:
+    import io
+
+    if str(getattr(shape, "shape_type", "")).find("PICTURE") < 0:
+        # shape_type for pictures renders as "PICTURE (13)"
+        raise PatchError(f"shape 不是图片对象：{merged.get('shape_id')}")
+    data = _decode_image_payload(merged)
+    image_part, rId = slide.part.get_or_add_image_part(io.BytesIO(data))
+    blip = shape._element.blipFill.blip
+    blip.set(qn("r:embed"), rId)
+
+
+_COLOR_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+
+
+def _bg_color(value: Any, label: str) -> str:
+    text = str(value or "").strip().lstrip("#")
+    if not _COLOR_RE.fullmatch(text):
+        raise PatchError(f"{label} must be a 6-digit hex color (RRGGBB)")
+    return text.upper()
+
+
+def _apply_slide_background(slide, merged: Dict[str, Any]) -> None:
+    gradient = merged.get("gradient")
+    cSld = slide._element.cSld
+    old_bg = cSld.find(qn("p:bg"))
+    if old_bg is not None:
+        cSld.remove(old_bg)
+    if isinstance(gradient, dict):
+        start = _bg_color(gradient.get("from", gradient.get("start")), "gradient.from")
+        end = _bg_color(gradient.get("to", gradient.get("end")), "gradient.to")
+        try:
+            angle = float(gradient.get("angle", 90))
+        except (TypeError, ValueError):
+            angle = 90.0
+        angle = max(0.0, min(359.9, angle))
+        fill_xml = (
+            f'<a:gradFill {nsdecls("a")} rotWithShape="1"><a:gsLst>'
+            f'<a:gs pos="0"><a:srgbClr val="{start}"/></a:gs>'
+            f'<a:gs pos="100000"><a:srgbClr val="{end}"/></a:gs>'
+            f'</a:gsLst><a:lin ang="{int(angle * 60000)}" scaled="1"/></a:gradFill>'
+        )
+    else:
+        color = _bg_color(merged.get("color"), "color")
+        fill_xml = f'<a:solidFill {nsdecls("a")}><a:srgbClr val="{color}"/></a:solidFill>'
+    bg = parse_xml(f'<p:bg {nsdecls("p", "a")}><p:bgPr>{fill_xml}<a:effectLst/></p:bgPr></p:bg>')
+    cSld.insert(0, bg)
+
+
+def _apply_deck_patches(
+    prs, patches: List[Dict[str, Any]], n_orig: int
+) -> Set[int]:
+    touched: Set[int] = set()
+    for patch in patches:
+        action = _canonical_action(patch)
+        payload = patch.get("payload") or {}
+        merged = {**patch, **payload}
+        if action == "font_unify":
+            touched.update(_op_font_unify(prs, merged, n_orig))
+        elif action == "replace_text":
+            touched.update(_op_replace_text(prs, merged, n_orig))
+        elif action == "font_scale":
+            touched.update(_op_font_scale(prs, merged, n_orig))
+        elif action == "add_page_numbers":
+            touched.update(_op_add_page_numbers(prs, merged))
+        else:
+            raise PatchError(f"unsupported bulk action: {action}")
+    return touched
+
+
 def apply_patches_to_file(
     src: Path, dst: Path, patches: List[Dict[str, Any]]
 ) -> Set[int]:
@@ -778,16 +1558,27 @@ def apply_patches_to_file(
     # for the next round, after objects are re-parsed.
     shape_patches: List[Dict[str, Any]] = []
     slide_patches: List[Dict[str, Any]] = []
+    deck_patches: List[Dict[str, Any]] = []
     for patch in patches:
         if not isinstance(patch, dict):
             raise PatchError("patch must be an object")
         _validate_patch_sizes(patch)
-        if _canonical_action(patch) in SLIDE_ACTIONS:
+        action = _canonical_action(patch)
+        if action in SLIDE_ACTIONS:
             slide_patches.append(patch)
+        elif action in DECK_ACTIONS:
+            deck_patches.append(patch)
         else:
             shape_patches.append(patch)
     for patch in shape_patches:
-        touched.add(_apply_one(prs, patch, seen))
+        if _canonical_action(patch) == "align_objects":
+            touched.add(_apply_align_objects(prs, patch))
+        else:
+            touched.add(_apply_one(prs, patch, seen))
+    if deck_patches:
+        # deck ops still resolve against base numbering → must run before
+        # slide-level ops mutate the deck
+        touched.update(_apply_deck_patches(prs, deck_patches, n_orig))
     if slide_patches:
         touched.update(_apply_slide_patches(prs, slide_patches, n_orig))
     dst.parent.mkdir(parents=True, exist_ok=True)
