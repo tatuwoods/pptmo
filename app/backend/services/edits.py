@@ -435,6 +435,8 @@ def _pin_inherited_box(shape) -> None:
 
 
 def _apply_geometry(shape, bbox: Dict[str, Any], slide_w: int, slide_h: int) -> None:
+    # a placeholder inherits its box; pin it before the first coordinate write
+    _pin_inherited_box(shape)
     clamped = _clamp_bbox(bbox, slide_w, slide_h)
     if any(bbox.get(k) is not None for k in ("x", "left")):
         shape.left = Emu(clamped["x"])

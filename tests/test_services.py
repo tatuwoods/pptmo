@@ -148,6 +148,25 @@ def test_apply_geometry_patch(demo_pptx, tmp_path):
     )
 
 
+def test_apply_geometry_partial_move_keeps_inherited_position(tmp_path):
+    """占位符位置继承自版式（不带 a:xfrm）：只给 x 时只动 x。
+    直接写 left 会让 python-pptx 生成 y=0 的 a:xfrm，对象跳到页面顶部。"""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    title = slide.shapes.title
+    title.text_frame.text = "标题"
+    top, width, height = title.top, title.width, title.height
+    src = tmp_path / "ph.pptx"
+    prs.save(str(src))
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        src, dst,
+        [{"action": "geometry", "shape_id": f"s0_id{title.shape_id}", "bbox_emu": {"x": 1000000}}],
+    )
+    moved = Presentation(str(dst)).slides[0].shapes.title
+    assert (moved.left, moved.top, moved.width, moved.height) == (1000000, top, width, height)
+
+
 def test_apply_duplicate_patch_rejected(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
     target = next(o for o in objects if "本季度完成" in o["text"])
