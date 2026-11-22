@@ -51,7 +51,8 @@ def _run(emit, payload, **kw):
         total_slides=int(payload.get("slide_count") or 1),
         slide_size=payload.get("slide_size_emu") or {},
         instruction=kw.pop("instruction", "整份字体统一为微软雅黑，然后全局替换旧词"),
-        scope="deck",
+        scope=kw.pop("scope", "deck"),
+        slide_index=kw.pop("slide_index", 0),
         **kw,
     )
 
@@ -316,3 +317,99 @@ def test_chat_undo_last_rolls_back_through_version_chain(client, uploaded_doc, m
     doc = client.get(f"/api/docs/{doc_id}").json()
     assert doc["version_id"] == "v2"
     assert original in [o["text"] for o in doc["objects"]]
+
+
+# ---------- 14b. 范围：显式「整份文稿」不被页码提及降级 ----------
+#
+# 多步指令常常既点名某页、又包含整份步骤（“第 1 页标题改成 X，再给所有页加页码”）。
+# 页码提及曾无条件把 scope 改写成 current，于是整份步骤全被范围校验挡下，用户在
+# 界面上切到「整份文稿」也救不回来（chat 路由与 run_stream 各有一处同样的改写）。
+
+
+_PAGE_AND_DECK = "把第 1 页的标题改成「新标题」，然后给所有页面底部添加页码"
+
+
+def _start_scope(events):
+    start = [data for name, data in events if name == "start"][0]
+    return start["scope"], start["scope_slides"]
+
+
+def test_explicit_deck_scope_survives_a_page_mention(demo_pptx, monkeypatch):
+    payload = _deck(demo_pptx)
+    title = next(o for o in payload["objects"] if o["kind"] == "text" and o["slide_index"] == 0)
+    seen = _stub_llm(monkeypatch, [
+        {"thought": "拆解", "action": "plan", "args": {"steps": ["改第 1 页标题", "所有页加页码"]}},
+        {"thought": "提交", "action": "propose_operations", "args": {"operations": [
+            {"action": "edit", "shape_id": title["shape_id"], "slide_index": 0, "after": "新标题"},
+            {"action": "add_page_numbers", "skip_first": True, "position": "bottom-right"},
+        ]}},
+        {"thought": "完成", "action": "finish", "args": {"reply": "两步都已完成"}},
+    ])
+    emit, events = _collect()
+    done = _run(emit, payload, instruction=_PAGE_AND_DECK, scope="deck", slide_index=0)
+    assert _start_scope(events) == ("deck", [0, 1, 2])
+    assert [op["action"] for op in done["operations"]] == ["edit", "add_page_numbers"]
+    assert done["dropped"] == 0
+    # the model is told the whole deck is in play (the named page is still in the instruction)
+    assert "整份文稿（3 页）" in json.dumps(seen[0], ensure_ascii=False)
+
+
+def test_current_scope_still_follows_a_page_mention(demo_pptx, monkeypatch):
+    """默认「当前页」范围下点名第 2 页 → 仍只处理第 2 页（v0.1.1 起的既有行为）。"""
+    payload = _deck(demo_pptx)
+    _stub_llm(monkeypatch, [{"action": "finish", "args": {"reply": "好的"}}])
+    emit, events = _collect()
+    _run(emit, payload, instruction="把第 2 页的表格加一行", scope="current", slide_index=0)
+    assert _start_scope(events) == ("current", [1])
+
+
+def test_deck_op_scope_hint_only_offers_a_path_that_works(demo_pptx):
+    """整份操作在当前页范围被拒时，指引必须是走得通的路。
+
+    旧文案还建议「在指令里明确全局/整份后重发」，但指令一旦点名了页面，
+    自动扩范围不会生效，照做只会再被拒一次。"""
+    payload = _deck(demo_pptx)
+    view = agent._DeckView(
+        objects=payload["objects"], elements=payload["elements"], tables=payload["tables"],
+        total_slides=int(payload["slide_count"]), scope_slides=[0],
+        slide_size=payload["slide_size_emu"] or {},
+    )
+    store = agent._OperationStore(view, _PAGE_AND_DECK, 24)
+    result = store.add_batch([{"action": "add_page_numbers", "skip_first": True}])
+    assert result["accepted"] == 0
+    reasons = json.dumps(result["reasons"], ensure_ascii=False)
+    assert "整份文稿" in reasons and "指令里明确" not in reasons
+
+
+def _chat_scope_recorded(client, doc_id, body):
+    with client.stream("POST", f"/api/docs/{doc_id}/chat", json=body) as resp:
+        assert resp.status_code == 200, resp.text
+        for _ in resp.iter_lines():
+            pass  # drain: tests run without an API key, so the round ends at once
+    messages = client.get(f"/api/docs/{doc_id}/messages").json()["messages"]
+    user = [m for m in messages if m["role"] == "user"][-1]
+    return user["scope"], user["slide_index"]
+
+
+def test_chat_endpoint_keeps_explicit_deck_scope_despite_page_mention(client, uploaded_doc):
+    doc_id = uploaded_doc["doc_id"]
+    scope, slide_index = _chat_scope_recorded(client, doc_id, {
+        "message": _PAGE_AND_DECK.replace("第 1 页", "第 2 页"), "scope": "deck",
+        "slide_index": 0, "base_version": 0,
+    })
+    assert (scope, slide_index) == ("整份文稿", 0)
+
+
+def test_chat_endpoint_narrows_current_scope_to_the_named_page(client, uploaded_doc):
+    doc_id = uploaded_doc["doc_id"]
+    scope, slide_index = _chat_scope_recorded(client, doc_id, {
+        "message": "把第 2 页的表格加一行", "scope": "current", "slide_index": 0, "base_version": 0,
+    })
+    assert (scope, slide_index) == ("第 2 页", 1)
+
+
+def test_chat_endpoint_still_rejects_out_of_range_page_in_deck_scope(client, uploaded_doc):
+    r = client.post(f"/api/docs/{uploaded_doc['doc_id']}/chat",
+                    json={"message": "帮我改一下第 99 页的标题", "scope": "deck", "base_version": 0})
+    assert r.status_code == 400
+    assert "超出范围" in r.json()["detail"]

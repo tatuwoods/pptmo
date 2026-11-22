@@ -747,7 +747,8 @@ def chat(doc_id: str, body: ChatIn):
             status_code=400,
             detail=f"指令提到的页码（第 {requested_number} 页）超出范围：文档共 {total_slides} 页",
         )
-    if requested_state == "ok":
+    if requested_state == "ok" and scope != "deck":
+        # 点名页面只收窄「当前页」范围；显式的整份范围不降级（与 agent.run_stream 一致）
         scope = "current"
         slide_index = requested_number
     scope_label = f"第 {slide_index + 1} 页" if scope == "current" else "整份文稿"

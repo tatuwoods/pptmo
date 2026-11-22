@@ -152,6 +152,9 @@ DECK_INTENT_RE = re.compile(
 )
 NUMBER_ONLY_RE = re.compile(r"^\d{1,4}$")
 COLOR_RE = re.compile(r"^[0-9A-F]{6}$")
+# 只给走得通的路：指令一旦点名了页面，自动扩范围不会生效，
+# 所以不再建议「在指令里写全局/整份后重发」
+_DECK_SCOPE_HINT = "该操作作用于整份文稿，需要整份范围；请让用户把范围切到「整份文稿」后重发"
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -1415,15 +1418,9 @@ class _OperationStore:
         if deck_only or explicit in ("deck", "all", "document", "whole"):
             if len(self.view.scope_slides) >= self.view.total_slides:
                 return None, "deck", None  # full-deck scope: fine
-            return None, None, (
-                "该操作作用于整份文稿，需要整份范围；请让用户把范围切到「整份文稿」，"
-                "或在指令里明确「全局/整份」后重发"
-            )
+            return None, None, _DECK_SCOPE_HINT
         if len(self.view.scope_slides) < self.view.total_slides:
-            return None, None, (
-                "该操作作用于整份文稿，需要整份范围；请让用户把范围切到「整份文稿」，"
-                "或在指令里明确「全局/整份」后重发"
-            )
+            return None, None, _DECK_SCOPE_HINT
         return None, "deck", None
 
     def _v03_resolve(self, shape_id: str, kinds=None):
@@ -1972,7 +1969,8 @@ SYSTEM_PROMPT = (
     "批量加页码（skip_first 可跳过封面）。\n"
     '- font_scale：{"action":"font_scale","delta_pt":2} 整页/整份字号统一 +N/-N 磅。\n'
     "批量操作规则：font_unify/replace_text/font_scale 不填 slide_index、以及 add_page_numbers，"
-    "都会作用于整份文稿，需要整份范围（用户指令含「全局/整份/所有页」时系统会自动扩大范围）；"
+    "都会作用于整份文稿，需要整份范围（当前页范围下，指令含「全局/整份/所有页」且没有点名具体页面时，"
+    "系统会自动扩大范围；否则需用户把范围切到「整份文稿」）；"
     "replace_image 需要图片来源（image_base64 或服务器可读的 image_path，png/jpg）；"
     "对话里拿不到图片来源时，用 finish 引导用户通过 /api/docs/{id}/apply 提供图片。\n\n"
     f"约束：单次 propose 最多 {MAX_OPS_PER_CALL} 条，本次对话最多 {MAX_OPS} 条。\n\n"
@@ -2121,7 +2119,9 @@ def run_stream(
     raw_scope = str(scope or "").strip().lower()
     scope = "deck" if raw_scope in ("deck", "all", "document", "whole") else "current"
     requested = ai.extract_requested_slide(instruction, total_slides)
-    if requested is not None:
+    if requested is not None and scope != "deck":
+        # 点名页面只收窄「当前页」范围。用户明确选了整份时不降级：多步指令常常
+        # 既点名某页又包含整份步骤，降级会让整份步骤全被范围校验挡下
         scope = "current"
         target_slide = requested
     else:
