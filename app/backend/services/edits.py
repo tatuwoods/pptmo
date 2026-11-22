@@ -1625,18 +1625,24 @@ def _placeholder_size_pt(shape, level: int) -> Optional[float]:
     return _sz_pt(lvl.find(qn("a:defRPr"))) if lvl is not None else None
 
 
+def _inherited_size_pt(shape, paragraph, level: int) -> Optional[float]:
+    """Size stated below the run level: paragraph defaults, the shape's list
+    style, then — for placeholders — `_placeholder_size_pt`."""
+    size = _para_default_size_pt(paragraph)
+    if size is None:
+        size = _lst_style_size_pt(shape.text_frame._txBody, level)
+    if size is None and getattr(shape, "is_placeholder", False):
+        size = _placeholder_size_pt(shape, level)
+    return size
+
+
 def _effective_size_pt(shape, paragraph, run) -> float:
     """Font size a run renders at, following where PowerPoint inherits it from:
     the run, the paragraph defaults, the shape's list style, then — for
     placeholders — `_placeholder_size_pt`. 18pt when nothing declares one."""
     if run.font.size is not None:
         return run.font.size.pt
-    level = int(paragraph.level or 0)
-    size = _para_default_size_pt(paragraph)
-    if size is None:
-        size = _lst_style_size_pt(shape.text_frame._txBody, level)
-    if size is None and getattr(shape, "is_placeholder", False):
-        size = _placeholder_size_pt(shape, level)
+    size = _inherited_size_pt(shape, paragraph, int(paragraph.level or 0))
     return size if size is not None else 18.0
 
 
@@ -1661,6 +1667,22 @@ def _shift_paragraph_default_sizes(paragraph, delta: float) -> bool:
     return changed
 
 
+def _shift_field_size(shape, paragraph, fld, delta: float) -> bool:
+    """Move a page-number/date `a:fld` with the text around it: resolve the size
+    the field renders at (its own rPr, else the same inheritance chain as runs)
+    and pin it explicitly so the field can't stay behind at the old size."""
+    size = _sz_pt(fld.find(qn("a:rPr")))
+    if size is None:
+        size = _inherited_size_pt(shape, paragraph, int(paragraph.level or 0))
+    base = size if size is not None else 18.0
+    rpr = fld.find(qn("a:rPr"))
+    if rpr is None:
+        rpr = fld.makeelement(qn("a:rPr"), {})
+        fld.insert(0, rpr)
+    rpr.set("sz", str(int(round(_clamp_font_pt(base + delta) * 100))))
+    return True
+
+
 def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     raw_delta = merged.get("delta_pt", merged.get("delta", merged.get("by")))
     try:
@@ -1680,6 +1702,8 @@ def _op_font_scale(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
                     base = _effective_size_pt(target, paragraph, run)
                     run.font.size = Pt(_clamp_font_pt(base + delta))
                     changed = True
+                for fld in paragraph._p.findall(qn("a:fld")):
+                    changed |= _shift_field_size(target, paragraph, fld, delta)
                 changed |= _shift_paragraph_default_sizes(paragraph, delta)
         if changed:
             touched.add(all_slides.index(slide))

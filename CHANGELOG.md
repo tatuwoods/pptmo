@@ -102,6 +102,11 @@
   longer ships the previous version's stale pages; a successful re-render
   clears `_partial` + `render_partial`; a duplicate never inherits the
   degraded flag (ported from the `fix/v0.3-audit` branch)
+- `font_scale` moves `a:fld` fields (the live page-number) with the text
+  around them — the field's rendered size is resolved through the same
+  inheritance chain as runs and pinned explicitly, so a footer line can't
+  end up with two font sizes after a shift (acceptance pass on
+  samples/demo.pptx, `test_accept_a10_font_scale.py`)
 
 ## v0.2.0 — slide-level operations (2026-11-21)
 
