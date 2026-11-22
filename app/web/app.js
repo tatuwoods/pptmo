@@ -326,6 +326,7 @@ function applyDocument(doc, options = {}) {
   const sameDoc = state.doc && state.doc.doc_id === doc.doc_id;
   const previousSlide = state.slideIndex;
   const previousSelected = state.selectedId;
+  const wasPartial = Boolean(sameDoc && state.doc.render_partial);
 
   state.doc = doc;
   state.slideIndex = resetSlide || !sameDoc
@@ -354,6 +355,10 @@ function applyDocument(doc, options = {}) {
   if (clearPatches) restorePendingOperations();
   updateThumbsActive();
   updateStatus();
+  // 本版渲染超时、画布上是上一版的旧页图：刚进入这个状态时当场说一声（状态栏随后常驻）
+  if (doc.render_partial && !wasPartial) {
+    toast("渲染超时：修改已保存，预览暂为上一版画面，下次保存后自动更新", "error");
+  }
   requestAnimationFrame(fitStage);
 }
 
@@ -446,8 +451,12 @@ function renderChrome() {
 function updateStatus() {
   if (!state.doc) return;
   const count = state.doc.objects.filter((obj) => obj.slide_index === state.slideIndex).length;
+  // render_partial：本版渲染超时，预览降级为上一版页图 —— 换页/保存后提示仍在，直到下一次渲染成功
+  const savedState = state.doc.render_partial
+    ? "渲染超时，预览暂为上一版画面"
+    : "所有修改直接写入原 PPTX";
   setStatus(
-    `已保存 ${state.doc.version_id} · 所有修改直接写入原 PPTX`,
+    `已保存 ${state.doc.version_id} · ${savedState}`,
     `第 ${state.slideIndex + 1} 页 · ${count} 个文本 · 共 ${state.doc.objects.length} 个`
   );
 }

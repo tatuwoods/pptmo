@@ -6,8 +6,16 @@ apply/上传链路拿到的是降级预览而不是异常；没有旧页图时�
 from __future__ import annotations
 
 import shutil
+from pathlib import Path
 
 import pytest
+
+WEB_JS = Path(__file__).resolve().parent.parent / "app" / "web" / "app.js"
+
+
+def _function_body(name: str) -> str:
+    js = WEB_JS.read_text(encoding="utf-8")
+    return js.split(f"function {name}(", 1)[1].split("\nfunction ", 1)[0]
 
 
 PNG = bytes.fromhex(
@@ -92,3 +100,16 @@ def test_apply_survives_render_timeout_with_stale_previews(client, uploaded_doc,
     body = r.json()
     assert body["version_id"] == "v1"
     assert body.get("render_partial") is True  # 前端可提示“部分页渲染中”
+
+
+def test_partial_render_hint_is_shown_in_ui():
+    """E21 的另一半：后端给了 render_partial，前端必须把它提示出来。
+
+    超时降级后画布上是上一版的旧页图；不提示的话用户会把旧画面当成最新结果。"""
+    # 状态栏常驻提示（aiNotice 在 AI 页签里，文本页签下看不到）
+    status = _function_body("updateStatus")
+    assert "render_partial" in status
+    assert "渲染超时" in status and "上一版" in status
+    # 刚进入降级状态时再弹一次 toast，保证用户当场注意到
+    apply_doc = _function_body("applyDocument")
+    assert "render_partial" in apply_doc and "toast(" in apply_doc
