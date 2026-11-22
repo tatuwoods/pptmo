@@ -81,3 +81,41 @@ def test_dark_mode_follows_system():
     dark_block = css.split("@media (prefers-color-scheme: dark)", 1)[1]
     for var in ("--bg:", "--panel:", "--ink:", "--line:"):
         assert var in dark_block, f"dark block missing {var}"
+
+
+# ---------- 14b / 16b：后端发的 plan / retry 事件，界面上必须接得住 ----------
+
+
+def test_plan_event_is_rendered_and_kept_in_chat_log():
+    js = _read("app.js")
+    css = _read("styles.css")
+    handler = js.split("function handleChatEvent(", 1)[1].split("\nfunction ", 1)[0]
+    assert 'event === "plan"' in handler
+    plan_branch = handler.split('event === "plan"', 1)[1].split("} else if", 1)[0]
+    assert "live.plan" in plan_branch
+    # 刷新页面后仍可见：会话记录里的 assistant 消息要渲染 message.plan
+    message_html = js.split("function chatMessageHtml(", 1)[1].split("\nfunction ", 1)[0]
+    assert "message.plan" in message_html
+    assert "我将" in js and "plan-list" in js and ".plan-list" in css
+
+
+def test_retry_event_is_surfaced():
+    js = _read("app.js")
+    handler = js.split("function handleChatEvent(", 1)[1].split("\nfunction ", 1)[0]
+    assert 'event === "retry"' in handler
+    retry_branch = handler.split('event === "retry"', 1)[1].split("} else if", 1)[0]
+    # 上一次尝试流出的半截 token 必须丢掉，否则会和重试输出拼成一段乱码思考
+    assert 'live.raw = ""' in retry_branch
+    assert "data.message" in retry_branch
+
+
+# ---------- 15b：AI 撤销后画布要跟上 ----------
+
+
+def test_ai_undo_refreshes_document():
+    js = _read("app.js")
+    finalize = js.split("function finalizeChat(", 1)[1].split("\nfunction ", 1)[0]
+    match = re.search(r"if \(done\.undo\) \{([\s\S]*?)\n  \}", finalize)
+    assert match, "finalizeChat 没有处理 AI 撤销（done.undo）"
+    # 服务端已提交回退版本：必须重新拉文档上屏，只刷新 messages 会让画布停在旧版本
+    assert "applyDocument(" in match.group(1)

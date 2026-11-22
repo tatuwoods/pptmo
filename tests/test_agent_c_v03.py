@@ -222,3 +222,97 @@ def test_failed_tool_gets_retry_guidance(demo_pptx, monkeypatch):
     assert done["error"] is None
     observations = [m["content"] for m in seen[-1] if m.get("role") == "user"]
     assert any("重试" in obs or "调整" in obs for obs in observations)
+
+
+# ---------- 会话记录 / 真实回退链路（API 级） ----------
+
+
+def _stream_events(client, doc_id, body):
+    events = []
+    with client.stream("POST", f"/api/docs/{doc_id}/chat", json=body) as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if line.startswith("event: "):
+                events.append([line[7:].strip(), None])
+            elif line.startswith("data: ") and events:
+                events[-1][1] = json.loads(line[6:])
+    return events
+
+
+def _done_payload(**overrides):
+    payload = {
+        "mode": "agent", "model": "stub", "scope": "deck", "scope_slides": [0, 1, 2],
+        "total_slides": 3, "summary": "", "reply": "", "question": "",
+        "operations": [], "trace": [], "steps": 1, "finished": True, "dropped": 0,
+        "error": None, "base_version": 0, "auto_apply": False, "plan": None, "undo": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_plan_is_persisted_in_assistant_message(client, uploaded_doc, monkeypatch):
+    """计划不能只活在 SSE 里：会话记录里也要有，刷新页面后还看得到「我将：1… 2… 3…」。"""
+    import main as app_module
+
+    doc_id = uploaded_doc["doc_id"]
+    plan = ["统一字体为微软雅黑", "全局替换旧项目", "逐页核对页码"]
+
+    def fake_run_stream(emit, **kwargs):
+        emit("start", {"mode": "agent"})
+        emit("plan", {"step": 1, "steps": plan})
+        return _done_payload(plan=plan, reply="我先制定计划")
+
+    monkeypatch.setattr(app_module.agent, "run_stream", fake_run_stream)
+    events = _stream_events(
+        client, doc_id, {"message": "先统一字体，再全局替换，最后核对页码", "scope": "deck"}
+    )
+    assert ["plan", {"step": 1, "steps": plan}] in events
+    assistant = client.get(f"/api/docs/{doc_id}/messages").json()["messages"][-1]
+    assert assistant["role"] == "assistant"
+    assert assistant["plan"] == plan
+
+
+def test_round_without_plan_leaves_no_plan_field(client, uploaded_doc, monkeypatch):
+    import main as app_module
+
+    doc_id = uploaded_doc["doc_id"]
+    monkeypatch.setattr(
+        app_module.agent, "run_stream", lambda emit, **kwargs: _done_payload(reply="没有计划")
+    )
+    _stream_events(client, doc_id, {"message": "把标题改短", "scope": "current"})
+    assistant = client.get(f"/api/docs/{doc_id}/messages").json()["messages"][-1]
+    assert not assistant.get("plan")
+
+
+def test_chat_undo_last_rolls_back_through_version_chain(client, uploaded_doc, monkeypatch):
+    """AI 的 undo_last 走真实回退链路：文档回到上一版本，done 带 undo 结果供前端刷新画布。"""
+    import main as app_module
+
+    doc_id = uploaded_doc["doc_id"]
+    target = next(o for o in uploaded_doc["objects"] if o["kind"] == "text")
+    original = target["text"]
+    applied = client.post(
+        f"/api/docs/{doc_id}/apply",
+        json={"patches": [{"action": "edit", "shape_id": target["shape_id"],
+                           "after": "要被撤销的修改", "before": original}]},
+    )
+    assert applied.json()["version_id"] == "v1"
+
+    seen = {}
+
+    def fake_run_stream(emit, **kwargs):
+        seen["base_version"] = kwargs["base_version"]
+        result = kwargs["undo_last"](kwargs["base_version"])
+        return _done_payload(base_version=1, reply="已撤销", undo=result)
+
+    monkeypatch.setattr(app_module.agent, "run_stream", fake_run_stream)
+    events = _stream_events(
+        client, doc_id, {"message": "撤销刚才的修改", "scope": "current", "base_version": 1}
+    )
+    assert seen["base_version"] == 1
+    done = next(data for name, data in events if name == "done")
+    assert done["undo"]["restored"] == "v0" and done["undo"]["new_version"] == "v2"
+    assert done["applied"] is False
+    doc = client.get(f"/api/docs/{doc_id}").json()
+    assert doc["version_id"] == "v2"
+    assert original in [o["text"] for o in doc["objects"]]
