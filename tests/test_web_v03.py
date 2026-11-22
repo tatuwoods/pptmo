@@ -83,6 +83,98 @@ def test_dark_mode_follows_system():
         assert var in dark_block, f"dark block missing {var}"
 
 
+def _dark_block(css: str) -> str:
+    return css.split("@media (prefers-color-scheme: dark)", 1)[1].split("\n}", 1)[0]
+
+
+def _outside_theme_blocks(css: str) -> str:
+    """CSS with :root {...} and the dark media block removed — what is left must be mode-independent."""
+    kept, depth, skipping = [], 0, False
+    for line in css.splitlines():
+        stripped = line.strip()
+        if depth == 0 and (stripped.startswith(":root") or stripped.startswith("@media (prefers-color-scheme: dark)")):
+            skipping = True
+        depth += line.count("{") - line.count("}")
+        if not skipping:
+            kept.append(line)
+        if skipping and depth == 0:
+            skipping = False
+    return "\n".join(kept)
+
+
+# 深色模式只靠变量组切换，所以主题块之外不能再写死随主题变化的文字色/底色——
+# 写死的值在深色下不会跟着变。v0.3.0 实测深色下 AI 回复正文、顶部按钮、文档名的
+# 对比度只有 1.7:1，范围切换器、对话工具栏等还是浅色底。
+_THEME_TEXT = {
+    "#334155", "#475569", "#64748b", "#94a3b8", "#3f453f",  # 中性文字
+    "#0f172a", "#0b1220", "#262b27",                         # 标题
+    "#1d4ed8", "#1e3a8a",                                    # 浅强调底上的文字
+    "#9a3412", "#92400e",                                    # 提示底上的文字
+    "#175c32", "#a52a12", "#0c5c2d",                         # 修改前后对比的文字
+}
+_THEME_SURFACE = {
+    "#e9eef7", "#eef2f8", "#f8fafc", "#f7f9fc", "#fbfcff", "#f8fbff",  # 中性浅底
+    "#eef2ff", "#eff6ff", "#fcfffd", "#fff6f6",                         # 着色浅底
+    "#fffbeb", "#faf8f4", "#f0fbf4", "#ffe3dc", "#c9f2d8",
+}
+
+
+def test_dark_mode_has_no_theme_dependent_hardcoded_colors():
+    body = _outside_theme_blocks(_read("styles.css"))
+    offenders = []
+    for prop, value in re.findall(r"([\w-]+)\s*:\s*([^;{}]+)", body):
+        palette = _THEME_TEXT if prop == "color" else _THEME_SURFACE if prop in ("background", "background-color") else None
+        if palette is None:
+            continue
+        offenders += [f"{prop}: {value.strip()}" for token in re.findall(r"#[0-9a-fA-F]{3,8}\b", value) if token.lower() in palette]
+    assert offenders == [], f"写死的随主题变化颜色（深色下不跟随）: {offenders}"
+
+
+def _luminance(hex_color: str) -> float:
+    channels = [int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast(fg: str, bg: str) -> float:
+    hi, lo = sorted((_luminance(fg), _luminance(bg)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_dark_canvas_backdrop_stays_dark():
+    """--dark 是幻灯片四周的画布衬底，不是文字色：深色模式下也必须保持深色。"""
+    dark_block = _dark_block(_read("styles.css"))
+    value = re.search(r"--dark:\s*(#[0-9a-fA-F]{6})", dark_block).group(1)
+    channels = [int(value[i:i + 2], 16) for i in (1, 3, 5)]
+    assert max(channels) <= 0x20, f"深色模式下画布衬底应为深色，实际 {value}"
+
+
+def test_dark_text_tokens_are_readable_on_dark_surfaces():
+    """深色文字色压在深色表面上要达到 4.5:1（正文可读的最低线）。"""
+    css = _read("styles.css")
+    tokens = dict(re.findall(r"(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{6})", _dark_block(css)))
+    pairs = [
+        ("--ink", "--panel"), ("--ink-2", "--panel"), ("--ink-3", "--panel-2"),
+        ("--muted", "--panel-2"), ("--muted-2", "--panel-2"), ("--muted", "--well"),
+        ("--accent-strong", "--chip-soft"), ("--amber", "--amber-soft"),
+        ("--ink-accent-soft", "--accent-soft"),
+    ]
+    unreadable = [
+        f"{fg} on {bg} = {_contrast(tokens[fg], tokens[bg]):.2f}:1"
+        for fg, bg in pairs if fg in tokens and bg in tokens and _contrast(tokens[fg], tokens[bg]) < 4.5
+    ]
+    missing = [name for pair in pairs for name in pair if name not in tokens]
+    assert not missing and not unreadable, f"缺少深色变量 {missing}；对比度不足 {unreadable}"
+
+
+def test_dark_mode_keeps_white_on_accent_text_readable():
+    """深色的 --accent 更亮，白字压上去只剩 3:1：按钮/头像的底色在深色块里要压回深一档。"""
+    dark_block = _dark_block(_read("styles.css"))
+    for selector in (".btn\\.primary", ".chat-avatar"):
+        rule = re.search(rf"{selector}\s*\{{[^}}]*\}}", dark_block)
+        assert rule and "background" in rule.group(0) and "#2563eb" in rule.group(0), f"深色块缺少 {selector} 的底色覆盖"
+
+
 # ---------- 14b / 16b：后端发的 plan / retry 事件，界面上必须接得住 ----------
 
 
