@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <title>PPT Light · 轻量高保真 PPT 改稿</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Cpath d='M20 48V16h14c8 0 13 4 13 11s-5 11-13 11h-6v10H20zm8-17h5c4 0 6-1.5 6-4s-2-4-6-4h-5v8z' fill='%23ffffff'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
@@ -227,6 +227,14 @@
   </div>
 
   <input type="file" id="fileInput" accept=".pptx" hidden>
+
+  <div class="drop-overlay is-hidden" id="dropOverlay" aria-hidden="true">
+    <div class="drop-overlay-card">
+      <svg viewBox="0 0 24 24" style="width:34px;height:34px"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+      松开以上传 PPTX
+      <small>仅支持 .pptx · 旧格式请先转存</small>
+    </div>
+  </div>
 
   <div class="busy is-hidden" id="busy" role="status" aria-live="polite">
     <div class="busy-card">

@@ -78,6 +78,7 @@ const dom = {
   historyDialog: $id("historyDialog"),
   closeHistoryBtn: $id("closeHistoryBtn"),
   versionList: $id("versionList"),
+  dropOverlay: $id("dropOverlay"),
 };
 
 const state = {
@@ -483,7 +484,11 @@ function renderThumbs() {
   }
   dom.thumbs.innerHTML = parts.join("");
   dom.thumbs.querySelectorAll(".thumb").forEach((button) => {
-    button.addEventListener("click", () => setSlide(Number(button.dataset.slide)));
+    button.addEventListener("click", () => {
+      // 画布切页 + 对话范围联动：点缩略图后「当前页」即该页
+      setSlide(Number(button.dataset.slide));
+      if (state.scope !== "current") setScope("current");
+    });
   });
 }
 
@@ -1814,8 +1819,44 @@ async function applyAcceptedPatches() {
   }
 }
 
-/* version history */
-async function openHistory() {
+/* undo last applied round (⌘Z / AI undo_last share the same endpoint) */
+async function undoLastApplied() {
+  if (!state.doc || state.busy || state.streaming) return;
+  if (state.doc.version <= 0) {
+    toast("当前是初始版本，没有可撤销的修改", "error");
+    return;
+  }
+  setBusy(true, "正在撤销上一轮", "回退到上一版本并重新渲染…");
+  try {
+    const doc = await api(
+      `/api/docs/${state.doc.doc_id}/undo`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base_version: state.doc.version }),
+      },
+      300000
+    );
+    applyDocument(doc, { preserveSelection: false, clearPatches: true });
+    toast(`已撤销上一轮，当前为 ${doc.version_id}`, "success");
+  } catch (error) {
+    if (error.status === 409) {
+      try {
+        const fresh = await api(`/api/docs/${state.doc.doc_id}`, {}, 60000);
+        applyDocument(fresh, { preserveSelection: true, clearPatches: true });
+        toast("文档已在别处更新，已加载最新版本", "error");
+      } catch {
+        toast(error.message, "error");
+      }
+    } else {
+      toast(error.message, "error");
+    }
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* version history */async function openHistory() {
   if (!state.doc) return;
   dom.historyDialog.showModal();
   dom.versionList.innerHTML = '<div class="version-empty">正在读取版本…</div>';
@@ -1889,13 +1930,23 @@ async function restoreVersion(versionId) {
 /* upload */
 async function handleFile(file) {
   if (!file || state.busy) return;
-  if (!file.name.toLowerCase().endsWith(".pptx")) {
+  const lowerName = file.name.toLowerCase();
+  if (/\.(ppt|pptm|pps|ppsx|pot|potx|potm)$/.test(lowerName)) {
+    // 旧二进制格式 / 放映格式：LibreOffice 也能转，但解析链只认 pptx，给出去向明确的指引
+    toast("检测到旧格式（.ppt/.pptm 等），请先用 PowerPoint 或 WPS「另存为 .pptx」再上传", "error");
+    return;
+  }
+  if (!lowerName.endsWith(".pptx")) {
     toast("只支持 .pptx 文件", "error");
+    return;
+  }
+  if (file.size === 0) {
+    toast("文件是空的（0 字节），请检查下载是否完整", "error");
     return;
   }
   const capMb = Number(state.doc?.max_upload_mb) || 60;
   if (file.size > capMb * 1024 * 1024) {
-    toast(`文件超过 ${capMb} MB 限制`, "error");
+    toast(`文件超过 ${capMb} MB 限制，请压缩图片或拆分后重试`, "error");
     return;
   }
   const form = new FormData();
@@ -1974,10 +2025,31 @@ function bindEvents() {
   document.addEventListener("dragover", (event) => event.preventDefault());
   document.addEventListener("drop", (event) => {
     event.preventDefault();
+    hideDropOverlay();
     if (dom.dropzone.contains(event.target)) return;
     const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
     if (file) void handleFile(file);
   });
+  // full-window drag overlay: counter-based so nested dragenter/leave don't flicker
+  let dragDepth = 0;
+  function showDropOverlay() {
+    if (dom.dropOverlay) dom.dropOverlay.classList.remove("is-hidden");
+  }
+  function hideDropOverlay() {
+    if (dom.dropOverlay) dom.dropOverlay.classList.add("is-hidden");
+  }
+  window.addEventListener("dragenter", (event) => {
+    event.preventDefault();
+    if (!event.dataTransfer || !Array.from(event.dataTransfer.types || []).includes("Files")) return;
+    dragDepth += 1;
+    showDropOverlay();
+  });
+  window.addEventListener("dragleave", (event) => {
+    event.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) hideDropOverlay();
+  });
+  window.addEventListener("dragend", hideDropOverlay);
 
   dom.recentList.addEventListener("click", (event) => {
     const deleteButton = event.target.closest("[data-delete]");
@@ -2040,6 +2112,10 @@ function bindEvents() {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       void sendChat();
+    } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      // ⌘Enter 也发送（输入法组合期间不触发）
+      event.preventDefault();
+      if (!event.isComposing) void sendChat();
     }
   });
   try {
@@ -2103,12 +2179,22 @@ function bindEvents() {
   });
 
   document.addEventListener("keydown", (event) => {
+    // Esc stops a running stream before anything else (works even while busy)
+    if (event.key === "Escape" && state.streaming) {
+      event.preventDefault();
+      if (state.streamController) state.streamController.abort();
+      return;
+    }
     if (state.busy || state.inline || dom.historyDialog.open) return;
     const target = event.target;
     const typing = target instanceof HTMLElement
       && (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable);
     if (typing) return;
-    if (event.key === "ArrowLeft") {
+    if ((event.metaKey || event.ctrlKey) && (event.key === "z" || event.key === "Z")) {
+      // ⌘Z / Ctrl+Z — undo the last applied round (server-side version rollback)
+      event.preventDefault();
+      void undoLastApplied();
+    } else if (event.key === "ArrowLeft") {
       event.preventDefault();
       setSlide(state.slideIndex - 1);
     } else if (event.key === "ArrowRight") {
