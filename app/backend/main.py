@@ -1278,11 +1278,38 @@ def _current_render_dir(doc_id: str, meta: Dict[str, Any]) -> Path:
 
 
 def _regenerate_render(doc_id: str, meta: Dict[str, Any]) -> Path:
-    """Re-run the render chain once into the current-version dir — needed for
-    render dirs produced before v0.3 (they kept no PDF) or emptied by hand."""
-    render_dir = _current_render_dir(doc_id, meta)
-    render.render_pptx(storage.current_path(doc_id), render_dir, scale=RENDER_SCALE)
+    """Re-render the current version once; returns its render dir.
+
+    Needed for render dirs produced before v0.3 (they kept no PDF), emptied by
+    hand, or degraded to the previous version's pages by a render timeout (E21).
+    The render goes to a scratch dir beside the real one: the committed dir
+    keeps whatever previews the UI is showing until a complete render exists to
+    take their place, so a second timeout can't leave the document without a
+    single page. A completed render also clears the degraded state."""
+    version = int(meta.get("version", 0))
+    render_dir = storage.render_dir(doc_id, version)
+    scratch = render_dir.with_name(f"{render_dir.name}.regen-{uuid.uuid4().hex}")
+    try:
+        render.render_pptx(storage.current_path(doc_id), scratch, scale=RENDER_SCALE)
+        with storage.lock_for(doc_id):
+            if int(storage.load_meta(doc_id).get("version", 0)) != version:
+                raise edits.PatchConflict("文档在渲染期间已更新，请重试")
+            render_dir.mkdir(parents=True, exist_ok=True)
+            for item in scratch.iterdir():
+                if item.is_file():
+                    os.replace(item, render_dir / item.name)
+            render.partial_marker(render_dir).unlink(missing_ok=True)
+            objects_payload = storage.load_objects(doc_id)
+            if objects_payload.pop("render_partial", None):
+                storage.save_objects(doc_id, objects_payload)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     return render_dir
+
+
+def _is_degraded(render_dir: Path) -> bool:
+    """E21: the pages in this render dir are the previous version's."""
+    return render.partial_marker(render_dir).exists()
 
 
 @app.get("/api/docs/{doc_id}/export/pdf")
@@ -1290,7 +1317,7 @@ def export_pdf(doc_id: str):
     meta = storage.load_meta(doc_id)
     render_dir = _current_render_dir(doc_id, meta)
     pdf_path = render_dir / "export.pdf"
-    if not pdf_path.exists():
+    if not pdf_path.exists() or _is_degraded(render_dir):
         render_dir = _regenerate_render(doc_id, meta)
         pdf_path = render_dir / "export.pdf"
     if not pdf_path.exists():
@@ -1308,7 +1335,9 @@ def export_images_zip(doc_id: str):
     meta = storage.load_meta(doc_id)
     render_dir = _current_render_dir(doc_id, meta)
     pages = sorted(render_dir.glob("slide-*.png"))
-    if not pages:
+    if not pages or _is_degraded(render_dir):
+        # pages parked there by a render timeout belong to the previous version
+        # (E21): re-render rather than ship them as this version's images
         render_dir = _regenerate_render(doc_id, meta)
         pages = sorted(render_dir.glob("slide-*.png"))
     if not pages:
@@ -1340,6 +1369,9 @@ def duplicate_document(doc_id: str):
     src = storage.current_path(doc_id)
     if not src.exists():
         raise FileNotFoundError("document file not found")
+    # the copy is rendered from scratch, so the source's "preview is the
+    # previous version" flag (E21) must not travel with its objects
+    objects_payload = {k: v for k, v in objects_payload.items() if k != "render_partial"}
     new_meta: Optional[Dict[str, Any]] = None
     try:
         new_meta = storage.create_doc(

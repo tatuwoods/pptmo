@@ -206,3 +206,125 @@ def test_duplicate_leaves_no_orphan_on_render_failure(client, uploaded_doc, monk
     ids = {d["doc_id"] for d in client.get("/api/docs").json()["docs"]}
     assert doc_id in ids and all(i != r.json().get("doc_id", None) for i in ids)
     assert len(ids) == 1
+
+
+# ---------- B11/B12 × E21：渲染降级状态下的导出 ----------
+
+STALE = b"page image of the PREVIOUS version"
+FRESH = b"page image of the CURRENT version"
+
+
+def _degrade(client, doc_id, monkeypatch):
+    """Commit one edit whose render times out (E21): v1 is committed, its render
+    dir holds v0's page images plus the _partial marker, and there is no PDF."""
+    import shutil
+    from pathlib import Path
+
+    import main as app_module
+    import storage
+    from services import render as render_mod
+
+    for png in storage.render_dir(doc_id, 0).glob("*.png"):
+        png.write_bytes(STALE)
+
+    def timing_out(pptx_path, out_dir, scale=2.0, stale_dir=None):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for png in sorted(Path(stale_dir).glob("*.png")):
+            shutil.copy2(png, out_dir / png.name)
+            count += 1
+        render_mod.partial_marker(out_dir).write_text("partial", encoding="utf-8")
+        return count
+
+    monkeypatch.setattr(app_module.render, "render_pptx", timing_out)
+    target = next(o for o in client.get(f"/api/docs/{doc_id}").json()["objects"] if o["kind"] == "text")
+    r = client.post(
+        f"/api/docs/{doc_id}/apply",
+        json={"patches": [{"action": "edit", "shape_id": target["shape_id"],
+                           "after": "降级状态下应用", "before": target["text"]}]},
+    )
+    assert r.status_code == 200 and r.json()["render_partial"] is True
+    v1 = storage.render_dir(doc_id, 1)
+    assert (v1 / "slide-001.png").read_bytes() == STALE
+    assert not (v1 / "export.pdf").exists()
+    return v1
+
+
+def _fresh_render(monkeypatch):
+    """A render that now completes: recognizable current-version pages + a PDF."""
+    import main as app_module
+
+    def fresh(pptx_path, out_dir, scale=2.0, stale_dir=None):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i in (1, 2, 3):
+            (out_dir / f"slide-{i:03d}.png").write_bytes(FRESH)
+            (out_dir / f"thumb-{i:03d}.png").write_bytes(FRESH)
+        (out_dir / "export.pdf").write_bytes(b"%PDF-current")
+        return 3
+
+    monkeypatch.setattr(app_module.render, "render_pptx", fresh)
+
+
+def test_export_pdf_keeps_previews_when_the_rerender_times_out_again(client, uploaded_doc, monkeypatch, tmp_path):
+    """降级状态下导出 PDF 会重新渲染；这次再超时，不能把界面正在显示的旧预览清空。"""
+    import main as app_module
+    from services import render as render_mod
+
+    doc_id = uploaded_doc["doc_id"]
+    v1 = _degrade(client, doc_id, monkeypatch)
+    monkeypatch.setenv("RENDER_TIMEOUT_S", "1")
+    monkeypatch.setenv("PPTMO_RENDER_QUEUE", str(tmp_path / "queue"))
+    monkeypatch.setattr(app_module.render, "render_pptx", render_mod._render_pptx_locked)  # 真实超时路径
+    r = client.get(f"/api/docs/{doc_id}/export/pdf")
+    assert r.status_code >= 400  # 导出本身如实失败
+    assert (v1 / "slide-001.png").read_bytes() == STALE  # 预览原样保留
+    assert (v1 / "thumb-003.png").exists()
+    assert render_mod.partial_marker(v1).exists()
+    assert client.get(f"/api/docs/{doc_id}/slides/0/image").status_code == 200
+
+
+def test_export_images_zip_regenerates_instead_of_shipping_stale_pages(client, uploaded_doc, monkeypatch):
+    """降级状态下渲染目录里是上一版的旧页图：不能把旧图当成当前版打包出去。"""
+    _degrade(client, uploaded_doc["doc_id"], monkeypatch)
+    _fresh_render(monkeypatch)
+    r = client.get(f"/api/docs/{uploaded_doc['doc_id']}/export/images.zip")
+    assert r.status_code == 200, r.text
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        assert {zf.read(name) for name in zf.namelist()} == {FRESH}
+
+
+def test_export_images_zip_refuses_stale_pages_when_the_rerender_fails(client, uploaded_doc, monkeypatch):
+    from services import render as render_mod
+
+    doc_id = uploaded_doc["doc_id"]
+    v1 = _degrade(client, doc_id, monkeypatch)
+
+    def timing_out(*a, **k):
+        raise render_mod.RenderError("render worker timed out")
+
+    monkeypatch.setattr("main.render.render_pptx", timing_out)
+    r = client.get(f"/api/docs/{doc_id}/export/images.zip")
+    assert r.status_code >= 400  # 明确失败，而不是给一份旧图
+    assert (v1 / "slide-001.png").read_bytes() == STALE
+
+
+def test_successful_regeneration_clears_the_degraded_state(client, uploaded_doc, monkeypatch):
+    """补渲染成功后：磁盘上是新页图，_partial 标记与 render_partial 标志一并清除。"""
+    from services import render as render_mod
+
+    doc_id = uploaded_doc["doc_id"]
+    v1 = _degrade(client, doc_id, monkeypatch)
+    _fresh_render(monkeypatch)
+    assert client.get(f"/api/docs/{doc_id}/export/pdf").status_code == 200
+    assert (v1 / "slide-001.png").read_bytes() == FRESH
+    assert not render_mod.partial_marker(v1).exists()
+    assert client.get(f"/api/docs/{doc_id}").json()["render_partial"] is False
+
+
+def test_duplicate_of_a_degraded_doc_does_not_inherit_the_flag(client, uploaded_doc, monkeypatch):
+    """副本是全新渲染的，不该带着源文档的「预览为上一版」标志。"""
+    doc_id = uploaded_doc["doc_id"]
+    _degrade(client, doc_id, monkeypatch)
+    _fresh_render(monkeypatch)
+    dup = client.post(f"/api/docs/{doc_id}/duplicate").json()
+    assert dup["render_partial"] is False
