@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import difflib
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -713,7 +714,9 @@ def _clone_slide(prs, source) -> Any:
     for child in source.shapes._spTree:
         if child.tag in (qn("p:nvGrpSpPr"), qn("p:grpSpPr")):
             continue
-        dst_tree.append(copy.deepcopy(child))
+        copied = copy.deepcopy(child)
+        _renew_field_ids(copied)
+        dst_tree.append(copied)
     src_cSld = source._element.cSld
     dst_cSld = dest._element.cSld
     src_bg = src_cSld.find(qn("p:bg"))
@@ -960,6 +963,7 @@ def _apply_duplicate_object(slide, shape, offset_raw: Any, slide_w: int, slide_h
             f'<a:ext cx="{int(width)}" cy="{int(height)}"/></a:xfrm>'
         )
         sp_pr.insert(0, xfrm)
+    _renew_field_ids(new_el)
     shape._element.addnext(new_el)
     # same slide part → copied rId references stay valid; no rel rebinding needed
 
@@ -1183,17 +1187,13 @@ def _apply_table_mod(table, merged: Dict[str, Any]) -> None:
         col = _require_index(merged.get("col"), cols, "col")
         row2 = _require_index(merged.get("row2"), rows, "row2")
         col2 = _require_index(merged.get("col2"), cols, "col2")
-        # python-pptx merge concatenates every cell's text into the origin;
-        # clearing the non-origin cells first keeps the merged text clean
-        for r in range(min(row, row2), max(row, row2) + 1):
-            for c in range(min(col, col2), max(col, col2) + 1):
-                if (r, c) != (row, col):
-                    try:
-                        table.cell(r, c).text = ""
-                    except Exception:
-                        pass
+        # either corner may come first; the region is the same and its origin
+        # is the top-left cell. python-pptx moves every cell's text into the
+        # origin as paragraphs, like PowerPoint's own merge — nothing is lost
+        top, bottom = min(row, row2), max(row, row2)
+        left, right = min(col, col2), max(col, col2)
         try:
-            table.cell(row, col).merge(table.cell(row2, col2))
+            table.cell(top, left).merge(table.cell(bottom, right))
         except ValueError as exc:
             raise PatchError(f"merge_cells 失败：{exc}") from exc
         return
@@ -1669,17 +1669,36 @@ PAGE_NUMBER_POSITIONS = {"bottom-left", "bottom-center", "bottom-right"}
 PAGE_NUMBER_NAME_PREFIX = "页码 "
 
 
+def _field_id() -> str:
+    return "{%s}" % str(uuid.uuid4()).upper()
+
+
+def _renew_field_ids(element) -> None:
+    """Give every a:fld in a copied element a fresh id — field ids are meant to
+    be unique, and a copied slide or shape would otherwise share them."""
+    for fld in element.iter(qn("a:fld")):
+        fld.set("id", _field_id())
+
+
 def _op_add_page_numbers(prs, merged: Dict[str, Any]) -> Set[int]:
     skip_first = bool(merged.get("skip_first") or merged.get("skip_cover") or False)
     position = str(merged.get("position") or "bottom-right").strip().lower()
     if position not in PAGE_NUMBER_POSITIONS:
         raise PatchError(f"position must be one of {'/'.join(sorted(PAGE_NUMBER_POSITIONS))}")
+    presentation = prs.part._element
+    explicit_start = merged.get("start")
     try:
-        start = int(merged.get("start", 1))
+        # without `start`, keep numbering from where the deck already does
+        start = int(explicit_start) if explicit_start is not None else int(presentation.get("firstSlideNum") or 1)
     except (TypeError, ValueError):
         raise PatchError("start must be an integer")
     if not (0 <= start <= 9999):
         raise PatchError("start out of range (0..9999)")
+    # A slidenum field is live but ignores the deck's "number slides from" in
+    # LibreOffice — the renderer behind the preview and the PDF export — so a
+    # start other than 1 can only be shown the same way everywhere as plain
+    # digits (which then don't follow pages that are added, removed or moved).
+    live_fields = start == 1
     try:
         size = float(merged.get("font_size_pt", 12))
     except (TypeError, ValueError):
@@ -1696,6 +1715,9 @@ def _op_add_page_numbers(prs, merged: Dict[str, Any]) -> Set[int]:
         # idempotency guard: a second run over an already numbered deck is a
         # user error (duplicate numbers), not a silent no-op
         for shape in slide.shapes:
+            # a slidenum field from a template numbers the deck just as well
+            if any(fld.get("type") == "slidenum" for fld in shape._element.iter(qn("a:fld"))):
+                raise PatchError(f"第 {index + 1} 页已有页码；如需重加请先删除旧页码")
             # keyed on the name this op stamps on its own boxes: matching on
             # "text equals the page number" also caught unrelated number tiles
             if str(getattr(shape, "name", "") or "").startswith(PAGE_NUMBER_NAME_PREFIX):
@@ -1722,6 +1744,15 @@ def _op_add_page_numbers(prs, merged: Dict[str, Any]) -> Set[int]:
         run = paragraph.add_run()
         run.text = number
         run.font.size = Pt(size)
+        if live_fields:
+            # a real slide-number field rather than the digit itself, so the
+            # number follows its page when slides are added, removed or reordered
+            fld = parse_xml(f'<a:fld {nsdecls("a")} id="{_field_id()}" type="slidenum"/>')
+            for tag in ("a:rPr", "a:t"):
+                child = run._r.find(qn(tag))
+                if child is not None:
+                    fld.append(child)
+            paragraph._p.replace(run._r, fld)
         touched.add(index)
     return touched
 
