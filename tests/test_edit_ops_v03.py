@@ -955,9 +955,16 @@ def test_agent_font_unify_deck_scope(demo_pptx):
 
 def test_agent_font_unify_slide_scope_needs_index_in_scope(demo_pptx):
     store = _store_of(demo_pptx, scope_slides=[0])  # 当前页范围
-    reason = _drop_reason(store, [{"action": "font_unify", "font_name": "微软雅黑"}])
+    # v0.3 复核后：当前页范围 + 未写范围 → 默认只改这一页（不再要求整份）
+    result = _accept(store, [{"action": "font_unify", "font_name": "微软雅黑"}])
+    op = result["accepted_operations"][0]
+    assert op["scope"] == "slide" and op["slide_index"] == 0
+    # 明确要整份、但当前范围只有一页 → 拒绝并提示怎么切换
+    reason = _drop_reason(store, [{"action": "font_unify", "font_name": "微软雅黑", "scope": "deck"}])
     assert "整份" in reason
-    result = _accept(store, [{"action": "font_unify", "font_name": "微软雅黑", "slide_index": 0}])
+    # 显式 slide_index 指到范围内页面仍然可用（与默认等价，幂等去重由 store 保证）
+    store2 = _store_of(demo_pptx, scope_slides=[0])
+    result = _accept(store2, [{"action": "font_unify", "font_name": "微软雅黑", "slide_index": 0}])
     assert result["accepted_operations"][0]["slide_index"] == 0
 
 

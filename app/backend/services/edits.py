@@ -1225,32 +1225,76 @@ def _iter_text_targets(container):
         yield container  # a bare cell from a previous walk level
 
 
-def _set_run_font_name(run, name: str) -> None:
-    """Set latin + east-asian + complex-script typefaces (font.name only writes latin)."""
-    font = run.font
-    font.name = name
-    rPr = run._r.get_or_add_rPr()
+def _set_typefaces_on(rPr, name: str, create: bool = True) -> bool:
+    """Set latin+ea+cs typefaces on an rPr-like element (rPr/defRPr/endParaRPr).
+
+    With create=False only pre-existing latin declarations are rewritten —
+    used for paragraph defaults, where inventing new defRPr nodes would be noise."""
     latin = rPr.find(qn("a:latin"))
+    if latin is None:
+        if not create:
+            return False
+        latin = rPr.makeelement(qn("a:latin"), {})
+        rPr.append(latin)
+    latin.set("typeface", name)
     anchor = latin
     for tag in ("a:ea", "a:cs"):
         el = rPr.find(qn(tag))
         if el is None:
+            if not create:
+                continue
             el = rPr.makeelement(qn(tag), {})
-            if anchor is not None:
-                anchor.addnext(el)
-            else:
-                rPr.append(el)
+            anchor.addnext(el)
         el.set("typeface", name)
         anchor = el
+    return True
+
+
+def _set_run_font_name(run, name: str) -> None:
+    """Set latin + east-asian + complex-script typefaces (font.name only writes latin)."""
+    run.font.name = name
+    _set_typefaces_on(run._r.get_or_add_rPr(), name)
+
+
+# Symbol/icon fonts must survive font_unify: their glyphs (check marks, arrows,
+# PUA icons) render as garbage letters under a normal text face.
+SYMBOL_FONT_NAMES = {
+    "wingdings", "wingdings 2", "wingdings 3", "webdings", "symbol",
+    "bookshelf symbol 7", "segoe mdl2 assets", "segoe fluent icons",
+    "segoe ui symbol", "segoe ui emoji", "outlook", "marlett",
+}
+
+
+def _is_icon_text(text: str) -> bool:
+    """True when every char lives in the Unicode private-use/icon planes."""
+    stripped = (text or "").replace(" ", "").replace("\u00a0", "")
+    if not stripped:
+        return False
+    for ch in stripped:
+        code = ord(ch)
+        if not (0xE000 <= code <= 0xF8FF or 0xF0000 <= code <= 0x1FFFFD):
+            return False
+    return True
+
+
+def _run_uses_symbol_font(run) -> bool:
+    rPr = run._r.find(qn("a:rPr"))
+    latin = rPr.find(qn("a:latin")) if rPr is not None else None
+    if latin is not None and str(latin.get("typeface") or "").strip().lower() in SYMBOL_FONT_NAMES:
+        return True
+    return _is_icon_text(run.text or "")
 
 
 def _resolve_bulk_slides(prs, merged: Dict[str, Any], n_orig: int) -> List[Any]:
     """Resolve the target slide list for a bulk op against base numbering.
 
-    slide_index wins over scope; scope must be "deck" or "slide"; the default
-    for bulk ops is the whole deck."""
-    slide_index = merged.get("slide_index")
+    An explicit scope=deck wins over slide_index (agents attach a card-locator
+    slide_index to deck-wide ops — the anchor must not narrow the blast radius);
+    scope must be "deck" or "slide"; the default for bulk ops is the whole deck."""
     scope = str(merged.get("scope") or "").strip().lower()
+    slide_index = merged.get("slide_index")
+    if scope in ("deck", "all", "document", "whole"):
+        return list(prs.slides)
     if slide_index is not None:
         try:
             index = int(slide_index)
@@ -1259,11 +1303,60 @@ def _resolve_bulk_slides(prs, merged: Dict[str, Any], n_orig: int) -> List[Any]:
         if index < 0 or index >= n_orig:
             raise PatchError(f"slide_index out of range: {index} (deck has {n_orig})")
         return [prs.slides[index]]
-    if scope in ("", "deck", "all", "document", "whole"):
-        return list(prs.slides)
     if scope in ("slide", "current", "page"):
         raise PatchError("scope=slide 需要 slide_index")
-    raise PatchError(f"invalid scope: {scope}")
+    if scope:
+        raise PatchError(f"invalid scope: {scope}")
+    return list(prs.slides)
+
+
+def _unify_paragraph_defaults(text_frame, font_name: str) -> bool:
+    """Rewrite fonts declared at paragraph/lstStyle level (defRPr / endParaRPr).
+
+    Without this, text typed after a unified run still comes out in the old
+    face — the defaults keep steering new runs."""
+    changed = False
+    tx_body = text_frame._txBody
+    lst_style = tx_body.find(qn("a:lstStyle"))
+    if lst_style is not None:
+        for def_rpr in lst_style.iter(qn("a:defRPr")):
+            changed |= _set_typefaces_on(def_rpr, font_name, create=False)
+    for paragraph in text_frame.paragraphs:
+        p = paragraph._p
+        pPr = p.find(qn("a:pPr"))
+        if pPr is not None:
+            def_rpr = pPr.find(qn("a:defRPr"))
+            if def_rpr is not None:
+                changed |= _set_typefaces_on(def_rpr, font_name, create=False)
+        end_para = p.find(qn("a:endParaRPr"))
+        if end_para is not None:
+            changed |= _set_typefaces_on(end_para, font_name, create=False)
+    return changed
+
+
+def _unify_master_tx_styles(prs, font_name: str) -> None:
+    """Deck scope also covers master/layout text: shapes plus the master's
+    titleStyle/bodyStyle/otherStyle declarations (footers, master titles)."""
+    containers = list(prs.slide_masters)
+    for master in prs.slide_masters:
+        containers.extend(master.slide_layouts)
+    for container in containers:
+        for target in _iter_text_targets(container):
+            for paragraph in target.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    if not _run_uses_symbol_font(run):
+                        _set_run_font_name(run, font_name)
+            _unify_paragraph_defaults(target.text_frame, font_name)
+    for master in prs.slide_masters:
+        tx_styles = master._element.find(qn("p:txStyles"))
+        if tx_styles is None:
+            continue
+        for style_tag in ("p:titleStyle", "p:bodyStyle", "p:otherStyle"):
+            style = tx_styles.find(qn(style_tag))
+            if style is None:
+                continue
+            for def_rpr in style.iter(qn("a:defRPr")):
+                _set_typefaces_on(def_rpr, font_name, create=True)
 
 
 def _op_font_unify(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
@@ -1273,6 +1366,7 @@ def _op_font_unify(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     if len(font_name) > 100:
         raise PatchError("font_name too long (max 100 chars)")
     slides = _resolve_bulk_slides(prs, merged, n_orig)
+    deck_wide = len(slides) >= n_orig
     touched: Set[int] = set()
     all_slides = list(prs.slides)
     for slide in slides:
@@ -1280,10 +1374,15 @@ def _op_font_unify(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
         for target in _iter_text_targets(slide):
             for paragraph in target.text_frame.paragraphs:
                 for run in paragraph.runs:
+                    if _run_uses_symbol_font(run):
+                        continue
                     _set_run_font_name(run, font_name)
                     changed = True
+            changed |= _unify_paragraph_defaults(target.text_frame, font_name)
         if changed:
             touched.add(all_slides.index(slide))
+    if deck_wide:
+        _unify_master_tx_styles(prs, font_name)
     return touched
 
 

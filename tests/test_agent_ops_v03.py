@@ -203,3 +203,16 @@ def test_agent_new_ops_flow_through_apply(demo_pptx, tmp_path):
     assert touched == {0, 1, 2}
     texts = [o["text"] for o in parse.parse_pptx(str(tmp_path / "out.pptx"))[0]]
     assert not any("项目" in t for t in texts)
+
+
+def test_agent_edit_on_slide_zero_accepted(demo_pptx):
+    """回归：slide_index=0 是 falsy，`or -1` 会把第一页对象全部判为范围外（v0.2.2 bug）。"""
+    store = _store_from(demo_pptx)
+    slide0_text = next(o for o in store.view.objects if o["slide_index"] == 0)
+    result = store.add_batch([
+        {"action": "edit", "shape_id": slide0_text["shape_id"], "after": "第一页新标题"},
+        {"action": "style", "shape_id": slide0_text["shape_id"], "style": {"bold": True}},
+    ])
+    assert result["accepted"] >= 1 and not any(
+        "范围" in (r.get("reason") or "") for r in result["reasons"]
+    )

@@ -101,6 +101,13 @@ ACTION_ALIASES = {
     "change_image": "replace_image",
     "background": "slide_background",
     "set_background": "slide_background",
+    # v0.3 C 组：多步规划 / 撤销（工具，不是编辑操作）
+    "plan": "plan",
+    "make_plan": "plan",
+    "plan_steps": "plan",
+    "undo_last": "undo_last",
+    "undo": "undo_last",
+    "revert_last": "undo_last",
 }
 
 # slide-level operations submitted through propose_operations like any other op
@@ -127,6 +134,8 @@ TOOL_NAMES = {
     "read_table",
     "inspect_shapes",
     "propose_operations",
+    "plan",
+    "undo_last",
     "finish",
 }
 
@@ -186,15 +195,6 @@ def _as_bool(value: Any) -> Optional[bool]:
         return False
     return None
 
-
-
-def _entry_slide_index(entry: Dict[str, Any]) -> int:
-    """slide_index 0 is falsy — `or -1` broke every slide-0 object (v0.2 latent bug)."""
-    raw = entry.get("slide_index")
-    try:
-        return int(raw) if raw is not None else -1
-    except (TypeError, ValueError):
-        return -1
 
 def _clip(value: Any, limit: int) -> str:
     text = str(value if value is not None else "")
@@ -1383,7 +1383,12 @@ class _OperationStore:
                 return None, None, "slide_index 与 scope=deck 冲突，二选一"
             return index, "slide", None
         if explicit in ("slide", "current", "page"):
+            if self.view.default_slide is not None:
+                return self.view.default_slide, "slide", None
             return None, None, "scope=slide 需要 slide_index"
+        if not deck_only and explicit == "" and self.view.default_slide is not None:
+            # 当前页范围且指令没写范围：默认只改这一页，全局需明说
+            return self.view.default_slide, "slide", None
         if deck_only or explicit in ("deck", "all", "document", "whole"):
             if len(self.view.scope_slides) >= self.view.total_slides:
                 return None, "deck", None  # full-deck scope: fine
@@ -1746,6 +1751,8 @@ class _OperationStore:
         }
         if op.get("shape_id"):
             item["shape_id"] = op.get("shape_id")
+        if op.get("scope"):
+            item["scope"] = op.get("scope")
         if op.get("action") == "add_textbox":
             item["text"] = _clip(op.get("after"), 80)
         if op.get("action") in SLIDE_ACTIONS:
@@ -2052,11 +2059,12 @@ def run_stream(
     history: Optional[List[Dict[str, Any]]] = None,
     base_version: Optional[int] = None,
     auto_apply: bool = False,
+    undo_handler: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run the streaming AI-led tool loop and return the done payload.
 
     Events emitted synchronously through ``emit``:
-    start, step, token, thought, tool_call, tool_result, operations,
+    start, step, token, thought, tool_call, tool_result, operations, plan,
     summary, error, done.
     """
     instruction = str(instruction or "").strip()
@@ -2122,6 +2130,8 @@ def run_stream(
     finished = False
     steps_run = 0
     trace: List[Dict[str, Any]] = []
+    plan: List[str] = []
+    undo_result: Optional[Dict[str, Any]] = None
 
     _safe_emit(
         emit,
@@ -2142,28 +2152,50 @@ def run_stream(
     for step in range(1, MAX_STEPS + 1):
         steps_run = step
         _safe_emit(emit, "step", {"step": step, "max_steps": MAX_STEPS})
-        try:
-            parsed, raw_content = streaming.stream_chat_json(
-                _trim_messages(conversation),
-                on_token=lambda piece, current_step=step: _safe_emit(
-                    emit, "token", {"step": current_step, "delta": piece, "text": piece}
-                ),
-                temperature=0.2,
-                max_tokens=4000,
-            )
-        except ai.AIServiceError as exc:
-            error = str(exc)
-            _safe_emit(emit, "error", {"step": step, "message": error})
-            trace.append(
-                {"step": step, "thought": "", "action": "error", "detail": _clip(error, 200)}
-            )
-            break
-        except Exception as exc:
-            error = f"AI 服务异常：{exc}"
-            _safe_emit(emit, "error", {"step": step, "message": error})
-            trace.append(
-                {"step": step, "thought": "", "action": "error", "detail": _clip(error, 200)}
-            )
+        parsed = None
+        raw_content = ""
+        # 自愈：瞬时 AI 服务错误（网络波动/限流）自动重试一次，而不是把
+        # 错误直接甩给用户；重试仍失败才中断本轮对话
+        for attempt in (1, 2):
+            try:
+                parsed, raw_content = streaming.stream_chat_json(
+                    _trim_messages(conversation),
+                    on_token=lambda piece, current_step=step: _safe_emit(
+                        emit, "token", {"step": current_step, "delta": piece, "text": piece}
+                    ),
+                    temperature=0.2,
+                    max_tokens=4000,
+                )
+                break
+            except ai.AIServiceError as exc:
+                if attempt == 1:
+                    _safe_emit(
+                        emit,
+                        "thought",
+                        {
+                            "step": step,
+                            "thought": f"AI 服务波动，自动重试一次：{exc}",
+                            "text": f"AI 服务波动，自动重试一次：{exc}",
+                        },
+                    )
+                    trace.append(
+                        {"step": step, "thought": "AI 服务波动，自动重试", "action": "retry", "detail": _clip(str(exc), 200)}
+                    )
+                    continue
+                error = str(exc)
+                _safe_emit(emit, "error", {"step": step, "message": error})
+                trace.append(
+                    {"step": step, "thought": "", "action": "error", "detail": _clip(error, 200)}
+                )
+                break
+            except Exception as exc:
+                error = f"AI 服务异常：{exc}"
+                _safe_emit(emit, "error", {"step": step, "message": error})
+                trace.append(
+                    {"step": step, "thought": "", "action": "error", "detail": _clip(error, 200)}
+                )
+                break
+        if parsed is None and error:
             break
 
         assistant_content = str(raw_content or "").strip()
@@ -2205,7 +2237,86 @@ def run_stream(
             },
         )
 
+        if action == "plan":
+            # 多步任务规划：先亮出清单再逐步执行，UI 以 plan 事件渲染进度
+            raw_steps = args.get("steps") if isinstance(args.get("steps"), list) else None
+            if raw_steps is None and isinstance(parsed.get("steps"), list):
+                raw_steps = parsed.get("steps")
+            cleaned: List[str] = []
+            for item in raw_steps or []:
+                text = ai.clean_text(item, 200)
+                if text and text not in cleaned:
+                    cleaned.append(text)
+                if len(cleaned) >= 12:
+                    break
+            if not cleaned:
+                detail = {"error": "plan 需要 steps（非空字符串数组）"}
+            else:
+                plan = cleaned
+                detail = {
+                    "plan": plan,
+                    "note": "计划已记录，请逐步执行并逐项汇报；完成后 finish 里总结每项结果",
+                }
+                _safe_emit(emit, "plan", {"step": step, "steps": plan})
+            _safe_emit(
+                emit,
+                "tool_result",
+                {
+                    "step": step,
+                    "action": "plan",
+                    "tool": "plan",
+                    "detail": f"制定 {len(plan)} 步计划" if plan else "计划为空",
+                    "result": detail,
+                },
+            )
+            trace.append(
+                {"step": step, "thought": thought, "action": "plan", "detail": f"制定 {len(plan)} 步计划"}
+            )
+            observation = "Observation:\n" + json.dumps(detail, ensure_ascii=False)
+            if detail.get("error"):
+                observation += "\n请修正参数后重试（steps 需为非空字符串数组）。"
+            conversation.append({"role": "user", "content": observation})
+            continue
+
+        if action == "undo_last":
+            # 撤销上一轮已应用的操作：由调用方注入基于版本快照的回退器
+            if undo_handler is None:
+                detail = {"error": "当前环境不支持撤销（未接入版本回退）"}
+            else:
+                try:
+                    detail = undo_handler() or {}
+                    undo_result = detail if not detail.get("error") else None
+                except Exception as exc:  # noqa: BLE001 — handler errors become tool errors
+                    detail = {"error": str(exc) or "撤销失败"}
+            _safe_emit(
+                emit,
+                "tool_result",
+                {
+                    "step": step,
+                    "action": "undo_last",
+                    "tool": "undo_last",
+                    "detail": _trace_detail("undo_last", args, detail),
+                    "result": detail,
+                },
+            )
+            trace.append(
+                {
+                    "step": step,
+                    "thought": thought,
+                    "action": "undo_last",
+                    "detail": _trace_detail("undo_last", args, detail),
+                }
+            )
+            observation = "Observation:\n" + json.dumps(detail, ensure_ascii=False)
+            if detail.get("error"):
+                observation += "\n撤销未执行；请向用户说明原因，不要重复尝试。"
+            conversation.append({"role": "user", "content": observation})
+            continue
+
         if action == "finish":
+            raw_plan = args.get("plan") if isinstance(args.get("plan"), list) else parsed.get("plan")
+            if isinstance(raw_plan, list) and not plan:
+                plan = [ai.clean_text(item, 200) for item in raw_plan if ai.clean_text(item, 200)][:12]
             summary = ai.clean_text(args.get("summary") or parsed.get("summary") or "", 500)
             reply = ai.clean_text(
                 args.get("reply") or args.get("message") or parsed.get("reply") or "", 800
