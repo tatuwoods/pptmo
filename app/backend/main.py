@@ -1154,7 +1154,17 @@ def _perform_undo(doc_id: str, base_version: Optional[int] = None) -> Dict[str, 
             raise ValueError("已在最初版本（v0），没有可撤销的操作")
         if base_version is not None and int(base_version) != current:
             raise edits.PatchConflict("文档已经更新，请刷新后再试")
-        prev_id = _previous_version_id(doc_id, meta, current)
+        # 连续撤销走 undo 血统：当前版本本身是撤销产物时，锚点用它恢复到的
+        # 那个版本，继续向前回退（undo-undo ≠ redo）
+        anchor = current
+        current_item = next(
+            (it for it in meta.get("versions", []) if str(it.get("id")) == f"v{current}"),
+            None,
+        )
+        lineage = str((current_item or {}).get("restored_from") or "")
+        if re.fullmatch(r"v\d+", lineage):
+            anchor = int(lineage[1:])
+        prev_id = _previous_version_id(doc_id, meta, anchor)
         if prev_id is None:
             raise ValueError("找不到可回退的历史版本，无法撤销")
         source = storage.version_file(doc_id, prev_id)
@@ -1181,12 +1191,18 @@ def _perform_undo(doc_id: str, base_version: Optional[int] = None) -> Dict[str, 
                 work_path, render_dir, objects_payload, page_count,
                 expected_version=current,
             )
+            # 血统标记：undo 产出的版本记录 restored_from，供下一次连续撤销定位锚点
+            for item in committed.get("versions", []):
+                if str(item.get("id")) == f"v{new_version}":
+                    item["restored_from"] = prev_id
+                    storage.save_meta(doc_id, committed)
+                    break
             result = _commit_result(committed, objects_payload)
             result["restored_from"] = prev_id
             message = {
                 "id": uuid.uuid4().hex[:12],
                 "role": "system",
-                "content": f"已撤销 v{current} 的修改，回到 {prev_id}，保存为 v{new_version}",
+                "content": f"已撤销最近一次修改，回到 {prev_id}，保存为 v{new_version}",
                 "at": storage.now_iso(),
                 "kind": "undo",
                 "version": result["version_id"],

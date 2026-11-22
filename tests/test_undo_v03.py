@@ -45,6 +45,32 @@ def test_undo_twice_walks_back_two_versions(client, uploaded_doc):
     assert r2.json()["slide_count"] == 3
 
 
+def test_consecutive_undo_walks_back_not_redo(client, uploaded_doc):
+    """live 冒烟回归：连按撤销应沿原始链继续回退，undo-undo ≠ redo。"""
+    doc_id = uploaded_doc["doc_id"]
+    _apply(client, doc_id, [{"action": "duplicate_slide", "source_slide": 0}])  # v1: 4
+    _apply(client, doc_id, [{"action": "duplicate_slide", "source_slide": 0}])  # v2: 5
+    r1 = client.post(f"/api/docs/{doc_id}/undo").json()  # v3 == v1
+    assert r1["slide_count"] == 4 and r1["restored_from"] == "v1"
+    r2 = client.post(f"/api/docs/{doc_id}/undo").json()  # v4 == v0（3 页），绝不是 redo 回 v2(5)
+    assert r2["slide_count"] == 3
+    assert r2["restored_from"] == "v0"
+    # 撤销之后继续撤销边界：v4 之后再撤 → v0 的前一版不存在 → 400
+    r3 = client.post(f"/api/docs/{doc_id}/undo")
+    assert r3.status_code == 400
+
+
+def test_undo_after_new_apply_targets_latest(client, uploaded_doc):
+    """撤销后又做了新修改：下一次撤销回退的是新修改，不延续旧血统。"""
+    doc_id = uploaded_doc["doc_id"]
+    _apply(client, doc_id, [{"action": "duplicate_slide", "source_slide": 0}])  # v1: 4
+    client.post(f"/api/docs/{doc_id}/undo")  # v2 == v0 (3)
+    _apply(client, doc_id, [{"action": "duplicate_slide", "source_slide": 0}])  # v3: 4（普通 apply）
+    r = client.post(f"/api/docs/{doc_id}/undo").json()  # v4 == v2 (3)：回退 v3 这次修改
+    assert r["slide_count"] == 3
+    assert r["restored_from"] == "v2"
+
+
 def test_undo_at_v0_returns_friendly_400(client, uploaded_doc):
     doc_id = uploaded_doc["doc_id"]
     r = client.post(f"/api/docs/{doc_id}/undo")
