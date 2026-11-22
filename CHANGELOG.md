@@ -33,7 +33,7 @@
 
 ### B. Import/export (main.py)
 11. `GET /api/docs/{id}/export/pdf` — render chain now keeps the produced PDF
-    (`deck.pdf` in the version's render dir); missing PDFs are regenerated once
+    (`export.pdf` in the version's render dir); missing PDFs are regenerated once
 12. `GET /api/docs/{id}/export/images.zip` — all rendered slide PNGs zipped
 13. `POST /api/docs/{id}/duplicate` — copy the current document into a fresh
     session (same content/objects, v0, “副本” title, system note; rollback on
@@ -58,9 +58,9 @@
     surfaces; `color-scheme: light dark`)
 
 ### E. Stability
-21. Render timeout (180s, `RENDER_TIMEOUT_SECONDS`) degrades instead of
+21. Render timeout (180s, `RENDER_TIMEOUT_S`) degrades instead of
     failing the whole commit: pages already rendered / stale previews from the
-    previous version are kept, response carries `partial_render`
+    previous version are kept, response carries `render_partial`
 22. Upload validation: .ppt/.pptm/.pps → “另存为 .pptx” hint; empty files,
     tiny/corrupt files and oversize files get friendly, specific messages
 
