@@ -113,3 +113,16 @@ def test_partial_render_hint_is_shown_in_ui():
     # 刚进入降级状态时再弹一次 toast，保证用户当场注意到
     apply_doc = _function_body("applyDocument")
     assert "render_partial" in apply_doc and "toast(" in apply_doc
+
+
+def test_manual_apply_keeps_partial_status_note():
+    """常驻提示不能在手动保存路径上被盖掉。
+
+    runApply 是手动改字/原位编辑/拖动/应用 AI 建议的共同入口：它先 applyDocument
+    （updateStatus 已按 render_partial 选好状态栏文案），若随后再无条件写回
+    「所有修改直接写入原 PPTX」，降级态就只剩一个几秒后消失的 toast。"""
+    run_apply = _function_body("runApply")
+    assert "applyDocument(doc" in run_apply
+    # 状态栏文案只由 updateStatus 按 render_partial 决定；runApply 不再自带一份
+    assert "所有修改直接写入原 PPTX" not in run_apply
+    assert "setStatus(`已保存" not in run_apply

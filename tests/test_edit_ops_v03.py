@@ -591,6 +591,64 @@ def test_table_mod_validation(table_pptx, tmp_path):
         )
 
 
+def test_table_mod_keeps_frame_size_in_sync_with_grid(table_pptx, tmp_path):
+    """增删行列后 graphicFrame 的尺寸必须跟上 tblGrid / 行高。
+
+    python-pptx 只改 tblGrid 和 tr@h，边框会停在旧尺寸：LibreOffice 照常按列宽排版，
+    但 parse._table_cells 会把列宽缩放到边框宽度，单元格命中框和给 AI 的 bbox
+    就整体错位（加列后被压到 75%）。"""
+    def geometry(path):
+        prs = Presentation(str(path))
+        frame = next(
+            s for s in prs.slides[0].shapes if getattr(s, "has_table", False) and s.has_table
+        )
+        table = frame.table
+        return (
+            int(frame.width),
+            int(frame.height),
+            sum(int(col.width) for col in table.columns),
+            sum(int(row.height) for row in table.rows),
+        )
+
+    assert geometry(table_pptx) == (9000000, 3600000, 9000000, 3600000)
+    cases = [
+        ("add_col", {"op": "add_col"}),
+        ("delete_col", {"op": "delete_col", "index": 2}),
+        ("add_row", {"op": "add_row"}),
+        ("delete_row", {"op": "delete_row", "index": 2}),
+    ]
+    for name, params in cases:
+        dst = tmp_path / f"{name}.pptx"
+        edits.apply_patches_to_file(
+            table_pptx, dst, [{"action": "table_mod", "shape_id": "s0_id2", **params}]
+        )
+        width, height, grid_w, grid_h = geometry(dst)
+        assert (width, height) == (grid_w, grid_h), name
+
+
+def test_table_mod_add_col_keeps_cell_boxes_aligned(table_pptx, tmp_path):
+    """加列后单元格框落在它真实渲染的位置，而不是被压进旧边框。"""
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        table_pptx, dst, [{"action": "table_mod", "shape_id": "s0_id2", "op": "add_col"}]
+    )
+    # 新列是空单元格，parse 不输出空格 —— 先写上文字
+    edits.apply_patches_to_file(
+        dst,
+        tmp_path / "out2.pptx",
+        [{"action": "edit", "shape_id": f"s0_id2_c{r}_3", "after": f"新列{r}"} for r in range(3)],
+    )
+    objects, payload = parse.parse_pptx(str(tmp_path / "out2.pptx"))
+    assert payload["tables"][0]["bbox_emu"]["w"] == 12000000
+    cells = {
+        (cell["row"], cell["col"]): cell["bbox_emu"]
+        for cell in objects
+        if cell["kind"] == "table_cell"
+    }
+    assert cells[(0, 0)] == {"x": 500000, "y": 500000, "w": 3000000, "h": 1200000}
+    assert cells[(0, 3)] == {"x": 9500000, "y": 500000, "w": 3000000, "h": 1200000}
+
+
 # ---------- 2b. replace_text 边界 ----------
 
 

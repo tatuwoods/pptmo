@@ -1012,6 +1012,28 @@ def _require_index(value: Any, high: int, label: str) -> int:
     return index
 
 
+def _sync_frame_ext(table) -> None:
+    """Keep the graphicFrame size equal to the grid after add/delete row/col.
+
+    python-pptx only touches tblGrid and tr@h, so the frame keeps its old ext.
+    LibreOffice still lays the table out by the grid, but parse._table_cells
+    scales column widths to the frame width — every cell hit-box and the
+    bbox_cm handed to the agent end up misplaced."""
+    tbl = table._tbl
+    grid = tbl.find(qn("a:tblGrid"))
+    widths = [int(gc.get("w") or 0) for gc in grid.findall(qn("a:gridCol"))] if grid is not None else []
+    if not widths:
+        return
+    heights = [int(tr.get("h") or 0) for tr in tbl.tr_lst]
+    frame = tbl.getparent().getparent().getparent()  # a:tbl → a:graphicData → a:graphic → p:graphicFrame
+    xfrm = frame.find(qn("p:xfrm")) if frame is not None else None
+    ext = xfrm.find(qn("a:ext")) if xfrm is not None else None
+    if ext is None:
+        return
+    ext.set("cx", str(sum(widths)))
+    ext.set("cy", str(sum(heights)))
+
+
 def _apply_table_mod(table, merged: Dict[str, Any]) -> None:
     op = str(merged.get("op") or merged.get("table_op") or "").strip().lower()
     if op not in TABLE_MOD_OPS:
@@ -1027,6 +1049,7 @@ def _apply_table_mod(table, merged: Dict[str, Any]) -> None:
         _strip_merge_flags(tr_new)
         _clear_tr_text(tr_new)
         tbl.append(tr_new)
+        _sync_frame_ext(table)
         return
     if op == "add_col":
         if cols >= TABLE_MAX_COLS:
@@ -1049,6 +1072,7 @@ def _apply_table_mod(table, merged: Dict[str, Any]) -> None:
                     del tc_new.attrib[attr]
             _clear_tc_text(tc_new)
             tr.append(tc_new)
+        _sync_frame_ext(table)
         return
     if op == "delete_row":
         index = _require_index(merged.get("index") if merged.get("index") is not None else merged.get("row"), rows, "index")
@@ -1058,6 +1082,7 @@ def _apply_table_mod(table, merged: Dict[str, Any]) -> None:
                     f"第 {index} 行与合并单元格（起点 R{r0 + 1}C{c0 + 1}）相交，请先拆分再删除"
                 )
         tbl.remove(tbl.tr_lst[index])
+        _sync_frame_ext(table)
         return
     if op == "delete_col":
         index = _require_index(merged.get("index") if merged.get("index") is not None else merged.get("col"), cols, "index")
@@ -1071,6 +1096,7 @@ def _apply_table_mod(table, merged: Dict[str, Any]) -> None:
         for tr in tbl.tr_lst:
             tcs = tr.findall(qn("a:tc"))
             tr.remove(tcs[index])
+        _sync_frame_ext(table)
         return
     if op == "merge_cells":
         row = _require_index(merged.get("row"), rows, "row")

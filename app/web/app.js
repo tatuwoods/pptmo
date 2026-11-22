@@ -1128,7 +1128,8 @@ async function runApply(patches, label, options = {}) {
     );
     applyDocument(doc, { preserveSelection, clearPatches: true });
     toast(successMessage || `已保存为 ${doc.version_id}`, "success");
-    setStatus(`已保存 ${doc.version_id} · 所有修改直接写入原 PPTX`);
+    // 状态栏文案由 applyDocument → updateStatus 按 render_partial 决定（降级态要
+    // 常驻提示），这里不再另写一份，否则会把「预览暂为上一版画面」当场盖掉
     return doc;
   } catch (error) {
     let recovered = false;
