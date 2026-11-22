@@ -1298,7 +1298,7 @@ function chatMessageHtml(message) {
   if (message.scope) tags.push(`<span>${escapeHtml(message.scope)}</span>`);
   if (message.model) tags.push(`<span>${escapeHtml(message.model)}</span>`);
   const trace = chatTraceHtml(message.trace);
-  const plan = planListHtml(message.plan);
+  const plan = role === "assistant" ? planListHtml(message.plan) : "";
   return `<div class="chat-msg ${role}"><div class="chat-avatar">${role === "user" ? "你" : "AI"}</div><div class="chat-bubble"><div class="chat-text">${content}</div>${plan}<div class="chat-meta">${tags.join("")}<span>${escapeHtml(formatDate(message.at))}</span></div>${trace}</div></div>`;
 }
 

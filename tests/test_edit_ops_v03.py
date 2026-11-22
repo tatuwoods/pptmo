@@ -530,7 +530,7 @@ def test_table_mod_merge_and_split(table_pptx, tmp_path):
     assert table.cell(0, 0).is_merge_origin
     assert table.cell(0, 0).span_width == 2
     assert table.cell(0, 1).is_spanned
-    assert table.cell(0, 0).text == "R0C0"
+    assert table.cell(0, 0).text == "R0C0\nR0C1"  # 两格文字都留在合并后的单元格里
 
     dst2 = tmp_path / "out2.pptx"
     edits.apply_patches_to_file(
@@ -541,6 +541,36 @@ def test_table_mod_merge_and_split(table_pptx, tmp_path):
     table2 = _table_of(prs2)
     assert not table2.cell(0, 0).is_merge_origin
     assert not table2.cell(0, 1).is_spanned
+    assert table2.cell(0, 0).text == "R0C0\nR0C1"
+
+
+def test_table_mod_merge_keeps_every_cell_text(table_pptx, tmp_path):
+    """合并同 PowerPoint：各格文字按阅读顺序并进左上角，不能静默丢弃。"""
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        table_pptx,
+        dst,
+        [{"action": "table_mod", "shape_id": "s0_id2", "op": "merge_cells",
+          "row": 0, "col": 0, "row2": 1, "col2": 1}],
+    )
+    table = _table_of(Presentation(str(dst)))
+    assert table.cell(0, 0).text == "R0C0\nR0C1\nR1C0\nR1C1"
+    assert table.cell(0, 0).span_width == 2 and table.cell(0, 0).span_height == 2
+
+
+def test_table_mod_merge_accepts_corners_in_any_order(table_pptx, tmp_path):
+    """两个角点谁先谁后都表示同一块区域，原点始终是左上角。"""
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        table_pptx,
+        dst,
+        [{"action": "table_mod", "shape_id": "s0_id2", "op": "merge_cells",
+          "row": 1, "col": 1, "row2": 0, "col2": 0}],
+    )
+    table = _table_of(Presentation(str(dst)))
+    assert table.cell(0, 0).is_merge_origin
+    assert table.cell(1, 1).is_spanned
+    assert table.cell(0, 0).text == "R0C0\nR0C1\nR1C0\nR1C1"
 
 
 def test_table_mod_merge_guards(table_pptx, tmp_path):
@@ -993,6 +1023,86 @@ def test_add_page_numbers_twice_rejected(demo_pptx, tmp_path):
     edits.apply_patches_to_file(demo_pptx, dst, [{"action": "add_page_numbers"}])
     with pytest.raises(edits.PatchError, match="页码"):
         edits.apply_patches_to_file(dst, tmp_path / "o.pptx", [{"action": "add_page_numbers"}])
+
+
+def _slide_number_fields(prs):
+    """(slide index, field id) for every slidenum field in the deck."""
+    from pptx.oxml.ns import qn
+
+    return [
+        (index, fld.get("id"))
+        for index, slide in enumerate(prs.slides)
+        for shape in slide.shapes
+        for fld in shape._element.iter(qn("a:fld"))
+        if fld.get("type") == "slidenum"
+    ]
+
+
+def _three_text_slides(tmp_path):
+    prs = Presentation()
+    for _ in range(3):
+        s = prs.slides.add_slide(prs.slide_layouts[6])
+        s.shapes.add_textbox(Emu(500000), Emu(500000), Emu(6000000), Emu(800000)).text_frame.text = "正文"
+    src = tmp_path / "pages.pptx"
+    prs.save(str(src))
+    return src
+
+
+def test_add_page_numbers_are_live_slide_number_fields(tmp_path):
+    """页码是 slidenum 域：复制/删除/移动页面后由渲染器自动重排，不是写死的数字。"""
+    numbered = tmp_path / "numbered.pptx"
+    edits.apply_patches_to_file(
+        _three_text_slides(tmp_path), numbered, [{"action": "add_page_numbers", "skip_first": True}]
+    )
+    out = Presentation(str(numbered))
+    assert [index for index, _ in _slide_number_fields(out)] == [1, 2]
+    texts = [s.text for s in out.slides[2].shapes if getattr(s, "has_text_frame", False)]
+    assert "3" in texts  # 域里缓存的文字仍是当前页码（搜索 / 对象列表可见）
+
+    # 复制一页：每页仍各有一个页码域，且域 id 不重复
+    after = tmp_path / "after.pptx"
+    edits.apply_patches_to_file(
+        numbered, after, [{"action": "duplicate_slide", "source_slide": 1, "position": 2}]
+    )
+    fields = _slide_number_fields(Presentation(str(after)))
+    assert [index for index, _ in fields] == [1, 2, 3]
+    assert len({field_id for _, field_id in fields}) == 3
+
+
+def test_add_page_numbers_start_other_than_one_uses_plain_digits(tmp_path):
+    """起始值 ≠ 1：slidenum 域在 LibreOffice（预览 / PDF 渲染器）里仍从 1 起算，
+    只能写静态数字才能让预览、导出和 PowerPoint 显示一致（LibreOffice 渲染实测）。"""
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(
+        _three_text_slides(tmp_path), dst, [{"action": "add_page_numbers", "start": 5}]
+    )
+    out = Presentation(str(dst))
+    assert _slide_number_fields(out) == []
+    digits = [
+        [s.text for s in slide.shapes if getattr(s, "has_text_frame", False) and s.text.isdigit()]
+        for slide in out.slides
+    ]
+    assert digits == [["5"], ["6"], ["7"]]
+    assert out.part._element.get("firstSlideNum") is None  # 不改演示文稿的全局设置
+
+
+def test_duplicate_object_gives_a_copied_field_a_new_id(tmp_path):
+    from pptx.oxml import parse_xml
+    from pptx.oxml.ns import nsdecls, qn
+
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = s.shapes.add_textbox(Emu(500000), Emu(500000), Emu(2000000), Emu(600000))
+    p = tb.text_frame.paragraphs[0]
+    p._p.append(parse_xml(
+        f'<a:fld {nsdecls("a")} id="{{5C1C2A0B-5D1E-4BCC-9B1F-9B4D7DD1E1A1}}" type="slidenum"><a:t>1</a:t></a:fld>'
+    ))
+    src = tmp_path / "fld.pptx"
+    prs.save(str(src))
+    dst = tmp_path / "out.pptx"
+    edits.apply_patches_to_file(src, dst, [{"action": "duplicate_object", "shape_id": f"s0_id{tb.shape_id}"}])
+    ids = [field_id for _, field_id in _slide_number_fields(Presentation(str(dst)))]
+    assert len(ids) == 2 and ids[0] != ids[1]
 
 
 # ---------- 10. font_scale ----------

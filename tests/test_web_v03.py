@@ -96,6 +96,8 @@ def test_plan_event_is_rendered_and_kept_in_chat_log():
     # 刷新页面后仍可见：会话记录里的 assistant 消息要渲染 message.plan
     message_html = js.split("function chatMessageHtml(", 1)[1].split("\nfunction ", 1)[0]
     assert "message.plan" in message_html
+    # 计划是 AI 的：只对 assistant 消息渲染，用户消息即使带了 plan 字段也不显示
+    assert 'const plan = role === "assistant" ? planListHtml(message.plan) : "";' in message_html
     assert "我将" in js and "plan-list" in js and ".plan-list" in css
 
 
