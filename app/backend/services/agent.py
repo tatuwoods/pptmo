@@ -125,6 +125,15 @@ V03_ACTIONS = {
     "slide_background",
     "add_page_numbers",
     "font_scale",
+    # v0.4 A
+    "batch_slide_ops",
+    "apply_layout",
+    "insert_summary",
+    "edit_chart",
+    "edit_notes",
+    "highlight_text",
+    "set_hyperlink",
+    "remove_hyperlink",
 }
 
 TOOL_NAMES = {
@@ -133,6 +142,7 @@ TOOL_NAMES = {
     "search_text",
     "read_table",
     "inspect_shapes",
+    "read_notes",
     "propose_operations",
     "plan",
     "undo_last",
@@ -380,8 +390,10 @@ class _DeckView:
         total_slides: int,
         scope_slides: List[int],
         slide_size: Optional[Dict[str, Any]],
+        notes: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.objects = [obj for obj in objects if obj.get("shape_id") is not None]
+        self.notes = [item for item in (notes or []) if isinstance(item, dict)]
         self.elements = [elem for elem in elements if elem.get("shape_id") is not None]
         self.tables = [table for table in tables if table.get("shape_id") is not None]
         self.total_slides = max(0, int(total_slides))
@@ -492,7 +504,7 @@ class _DeckView:
             return None, "对象不存在，请先读取页面或使用 search_text 查找"
         if not self.is_scoped(_slide_index_of(obj)):
             return None, "对象不在当前处理范围"
-        if obj.get("kind") not in ("text", "table_cell"):
+        if obj.get("kind") not in ("text", "table_cell", "smartart_node"):
             return None, "该对象没有可编辑文本"
         return obj, None
 
@@ -599,6 +611,44 @@ def _tool_outline(view: _DeckView) -> Dict[str, Any]:
             }
         )
     return {"total_slides": view.total_slides, "scope_slides": view.scope_slides, "slides": slides}
+
+
+def _tool_read_notes(view: _DeckView, args: Dict[str, Any]) -> Dict[str, Any]:
+    """读取演讲者备注（默认当前范围前 8 页，可按 slide_indices 过滤）。"""
+    raw = args.get("slide_indices")
+    if raw is None:
+        raw = args.get("slide_index")
+    if raw is None:
+        raw = view.scope_slides[:8]
+    if not isinstance(raw, list):
+        raw = [raw]
+    requested: List[int] = []
+    for value in raw:
+        index = _as_int(value)
+        if index is not None and view.is_scoped(index):
+            requested.append(index)
+    if not requested:
+        requested = view.scope_slides[:8]
+    wanted = set(requested)
+    notes = []
+    for item in view.notes:
+        try:
+            index = int(item.get("slide_index"))
+        except (TypeError, ValueError):
+            continue
+        if index in wanted:
+            notes.append(
+                {
+                    "slide_index": index,
+                    "page": index + 1,
+                    "text": str(item.get("text") or ""),
+                }
+            )
+    notes.sort(key=lambda item: item["slide_index"])
+    return {
+        "notes": notes,
+        "hint": "edit_notes 可写备注（空文本清空）；批量生成备注时逐页给简短讲稿要点",
+    }
 
 
 def _tool_read_slides(view: _DeckView, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -807,6 +857,8 @@ def _dispatch_tool(action: str, args: Dict[str, Any], view: _DeckView) -> Dict[s
         return _tool_read_table(view, args)
     if action == "inspect_shapes":
         return _tool_inspect_shapes(view, args)
+    if action == "read_notes":
+        return _tool_read_notes(view, args)
     return {"error": f"未知工具：{action}"}
 
 
@@ -1456,6 +1508,14 @@ class _OperationStore:
             "slide_background": "设置页面背景",
             "add_page_numbers": "批量添加页码",
             "font_scale": "统一调整字号",
+            "batch_slide_ops": "批量页操作",
+            "apply_layout": "套用版式",
+            "insert_summary": "插入目录/摘要页",
+            "edit_chart": "编辑图表数据",
+            "edit_notes": "编辑演讲者备注",
+            "highlight_text": "高亮文字",
+            "set_hyperlink": "添加超链接",
+            "remove_hyperlink": "移除超链接",
         }
         op: Dict[str, Any] = {
             "id": f"op{len(self.ops) + 1}",
@@ -1689,6 +1749,161 @@ class _OperationStore:
             op["meta"] = {"slide_index": slide_index, "kind": "table_mod", "op": op_name}
             return self._finish_v03_op(op, raw, merged)
 
+        if action == "batch_slide_ops":
+            op_name = str(merged.get("op") or merged.get("op_name") or "").strip().lower()
+            if op_name not in edits.BATCH_SLIDE_OP_NAMES:
+                return None, "batch_slide_ops op 仅支持 duplicate_slide/delete_slide"
+            pages = merged.get("pages", merged.get("slides"))
+            if pages is None:
+                return None, "batch_slide_ops 需要 pages（如 '2-5'、'1,3,5'）"
+            try:
+                indices = edits.parse_slide_spec(pages, self.view.total_slides)
+            except edits.PatchError as exc:
+                return None, str(exc)
+            out_of_scope = [str(i + 1) for i in indices if not self.view.is_scoped(i)]
+            if out_of_scope:
+                return None, f"页 {', '.join(out_of_scope)} 不在当前处理范围"
+            op["op"] = op_name
+            op["pages"] = pages if isinstance(pages, str) else list(pages)
+            op["slide_index"] = indices[0]
+            op["meta"] = {"kind": "batch", "op": op_name, "count": len(indices)}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "apply_layout":
+            layout = str(merged.get("layout") or merged.get("preset") or "").strip()
+            if not layout:
+                return None, "apply_layout 需要 layout（title/two_column/image_text/data）"
+            preset = edits.LAYOUT_ALIASES.get(layout.lower())
+            if preset is None:
+                return None, f"未知版式：{layout!r}（支持 title/two_column/image_text/data）"
+            slide_raw = _as_int(merged.get("slide_index"))
+            if slide_raw is None or not self.view.is_scoped(slide_raw):
+                return None, "apply_layout 需要 slide_index（且在当前处理范围内）"
+            op["layout"] = preset
+            op["slide_index"] = slide_raw
+            if merged.get("shape_id"):
+                op["shape_id"] = str(merged["shape_id"]).strip()
+            op["meta"] = {"slide_index": slide_raw, "kind": "layout", "layout": preset}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "insert_summary":
+            title = str(merged.get("title") or "").strip()
+            if not title:
+                return None, "insert_summary 需要 title"
+            items_raw = merged.get("items")
+            if not isinstance(items_raw, list):
+                return None, "insert_summary 需要 items 列表"
+            items = [str(item).strip() for item in items_raw if str(item).strip()]
+            if len(items) < 2:
+                return None, "insert_summary 至少需要 2 条 items"
+            position = _as_int(merged.get("position", 1))
+            if position is None or not (0 <= position <= self.view.total_slides):
+                return None, f"position 必须在 0..{self.view.total_slides}"
+            op["title"] = ai.clean_text(title, 60)
+            op["items"] = [ai.clean_text(item, 80) for item in items][:30]
+            op["position"] = position
+            op["meta"] = {"kind": "summary", "count": len(op["items"])}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "edit_chart":
+            shape_id = str(raw.get("shape_id") or raw.get("target_id") or "").strip()
+            if not shape_id:
+                return None, "缺少 shape_id"
+            entry = self.view.object_by_id.get(shape_id) or self.view.element_by_id.get(shape_id)
+            if entry is None:
+                return None, "对象不存在，请先 read_slides / inspect_shapes 确认"
+            slide_index = _slide_index_of(entry)
+            if not self.view.is_scoped(slide_index):
+                return None, "对象不在当前处理范围"
+            if entry.get("kind") != "chart":
+                return None, "edit_chart 只能作用于图表对象（kind=chart）"
+            series_raw = merged.get("series")
+            if not isinstance(series_raw, list) or not series_raw:
+                return None, 'edit_chart 需要 series 列表（如 [{"name":"营收","values":[1,2]}]）'
+            for item in series_raw:
+                if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+                    return None, "series 每项需要 name"
+                values = item.get("values")
+                if values is not None and not isinstance(values, list):
+                    return None, "series.values 必须是列表"
+            categories = merged.get("categories")
+            if categories is not None:
+                if not isinstance(categories, list) or not categories:
+                    return None, "categories 必须是非空列表"
+                for item in series_raw:
+                    if item.get("values") is None:
+                        return None, f"series '{item.get('name')}' 缺少 values"
+                    if len(item["values"]) != len(categories):
+                        return None, f"series '{item.get('name')}' 的值数量与类目数量不一致"
+            op["shape_id"] = shape_id
+            op["slide_index"] = slide_index
+            if categories is not None:
+                op["categories"] = [str(c) for c in categories]
+            op["series"] = [
+                {
+                    "name": str(item.get("name")).strip(),
+                    **({"values": item.get("values")} if item.get("values") is not None else {}),
+                }
+                for item in series_raw
+            ]
+            op["meta"] = {"slide_index": slide_index, "kind": "chart"}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "edit_notes":
+            text = merged.get("text")
+            if text is None:
+                return None, "edit_notes 需要 text（空字符串表示清空备注）"
+            slide_raw = _as_int(merged.get("slide_index"))
+            if slide_raw is None or not self.view.is_scoped(slide_raw):
+                return None, "edit_notes 需要 slide_index（且在当前处理范围内）"
+            op["text"] = str(text)[:2000]
+            op["slide_index"] = slide_raw
+            op["meta"] = {"slide_index": slide_raw, "kind": "notes"}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action == "highlight_text":
+            find = str(merged.get("find") or "").strip()
+            if not find:
+                return None, "highlight_text 需要 find"
+            if len(find) > 200:
+                return None, "find 过长（最多 200 字符）"
+            color = None
+            if merged.get("color"):
+                try:
+                    color = edits._bg_color(merged.get("color"), "color")
+                except edits.PatchError as exc:
+                    return None, str(exc)
+            slide_raw = _as_int(merged.get("slide_index"))
+            if slide_raw is not None and not self.view.is_scoped(slide_raw):
+                return None, "slide_index 不在当前处理范围"
+            op["find"] = find
+            if color:
+                op["color"] = color
+            if slide_raw is not None:
+                op["slide_index"] = slide_raw
+            op["meta"] = {"kind": "highlight", "find": find}
+            return self._finish_v03_op(op, raw, merged)
+
+        if action in ("set_hyperlink", "remove_hyperlink"):
+            shape_id = str(raw.get("shape_id") or raw.get("target_id") or "").strip()
+            if not shape_id:
+                return None, "缺少 shape_id"
+            entry, slide_index, error = self._v03_resolve(shape_id)
+            if error:
+                return None, error
+            op["shape_id"] = shape_id
+            op["slide_index"] = slide_index
+            if action == "set_hyperlink":
+                try:
+                    op["url"] = edits._normalize_url(merged.get("url"))
+                except edits.PatchError as exc:
+                    return None, str(exc)
+                needle = merged.get("text")
+                if needle is not None and str(needle).strip():
+                    op["text"] = str(needle)[:200]
+            op["meta"] = {"slide_index": slide_index, "kind": "hyperlink"}
+            return self._finish_v03_op(op, raw, merged)
+
         return None, f"不支持的操作：{action}"
 
     def _v03_scope_deck_required(self, merged: Dict[str, Any]):
@@ -1719,6 +1934,13 @@ class _OperationStore:
             op.get("align"),
             op.get("mode"),
             op.get("op"),
+            op.get("pages"),
+            op.get("layout"),
+            op.get("title"),
+            op.get("url"),
+            json.dumps(op.get("items"), ensure_ascii=False) if op.get("items") else None,
+            json.dumps(op.get("series"), ensure_ascii=False) if op.get("series") else None,
+            json.dumps(op.get("categories"), ensure_ascii=False) if op.get("categories") else None,
             op.get("position"),
             op.get("color"),
             json.dumps(op.get("gradient"), ensure_ascii=False, sort_keys=True) if op.get("gradient") else None,
@@ -1783,7 +2005,8 @@ class _OperationStore:
             for key in (
                 "font_name", "find", "replace", "delta_pt", "align", "mode", "op",
                 "shape_ids", "skip_first", "position", "start", "color", "gradient",
-                "offset_emu",
+                "offset_emu", "pages", "layout", "title", "items", "url", "text",
+                "categories", "series",
             ):
                 if op.get(key) is not None:
                     item[key] = op.get(key)
@@ -1924,7 +2147,9 @@ SYSTEM_PROMPT = (
     "系统会把「我将：1… 2… 3…」展示给用户；之后逐步执行、逐项汇报，完成后在 finish 里总结各项结果。\n"
     '8. undo_last {}：撤销上一轮已应用的修改（回退到上一版本快照）。用户要求“撤销/回退上一步”时调用，'
     "撤销结果以 Observation 返回，不要重复撤销。\n"
-    '9. finish {"summary":"...","reply":"给用户的回复","question":"可选反问"}：结束。\n\n'
+    '9. read_notes {"slide_indices":[0,2]}：读取演讲者备注（不传则读当前范围前 8 页）；'
+    "用户要“给每页生成备注”时，先通读全稿再逐页 edit_notes 写简短讲稿要点。\n"
+    '10. finish {"summary":"...","reply":"给用户的回复","question":"可选反问"}：结束。\n\n'
     "操作 schema：\n"
     '- edit：{"action":"edit","shape_id":"...","after":"新文本","before":"可选原文",'
     '"description":"...","style":{"font_size_pt":18,"font_name":"微软雅黑","bold":true,'
@@ -1972,7 +2197,23 @@ SYSTEM_PROMPT = (
     "都会作用于整份文稿，需要整份范围（当前页范围下，指令含「全局/整份/所有页」且没有点名具体页面时，"
     "系统会自动扩大范围；否则需用户把范围切到「整份文稿」）；"
     "replace_image 需要图片来源（image_base64 或服务器可读的 image_path，png/jpg）；"
-    "对话里拿不到图片来源时，用 finish 引导用户通过 /api/docs/{id}/apply 提供图片。\n\n"
+    "对话里拿不到图片来源时，用 finish 引导用户通过 /api/docs/{id}/apply 提供图片。\n"
+    "v0.4 新增操作：\n"
+    '- batch_slide_ops：{"action":"batch_slide_ops","op":"duplicate_slide|delete_slide",'
+    '"pages":"2-5" 或 "1,3,5"} 对多页执行同一页级操作；pages 为 1-based 页码（范围/列表）。\n'
+    '- apply_layout：{"action":"apply_layout","slide_index":0,"layout":"title|two_column|image_text|data",'
+    '"shape_id":可选标题对象} 把现有页面重排成预设版式（标题页/两栏/图文/数据页），不增删对象不改文字。\n'
+    '- insert_summary：{"action":"insert_summary","title":"目录","items":["一、…","二、…"],"position":1} '
+    "先 outline 通读全稿提炼 3-8 条要点再插入目录/摘要页；position 默认插在封面后。\n"
+    '- edit_chart：{"action":"edit_chart","shape_id":"图表id","categories":["Q1","Q2"],'
+    '"series":[{"name":"营收","values":[1,2]}]} 改图表数据与系列名；只给 name 不给 values 即重命名系列。\n'
+    '- edit_notes：{"action":"edit_notes","slide_index":0,"text":"备注"} 改演讲者备注（空文本清空）。\n'
+    '- set_hyperlink：{"action":"set_hyperlink","shape_id":"...","url":"https://…","text":可选局部文字}；'
+    'remove_hyperlink：{"action":"remove_hyperlink","shape_id":"..."} 清除链接（仅 http/https/mailto）。\n'
+    '- highlight_text：{"action":"highlight_text","find":"关键词","color":"FFFF00","slide_index":可选} '
+    "给匹配文字加高亮（审阅标记；找不到会报错）\n"
+    "SmartArt：read_slides 会把 SmartArt 节点列为 smartart_node 对象（shape_id 形如 s0_id90_n0），"
+    "用 edit 修改 after 文本即可；SmartArt 结构重建不支持，只能改文字。\n\n"
     f"约束：单次 propose 最多 {MAX_OPS_PER_CALL} 条，本次对话最多 {MAX_OPS} 条。\n\n"
     "工作方式：\n"
     "- 先理解意图：用户点名字段或页面时优先处理该对象/页面；模糊需求先 outline/read_slides 判断。\n"
@@ -2079,6 +2320,7 @@ def run_stream(
     slide_size: Optional[Dict[str, Any]] = None,
     elements: Optional[List[Dict[str, Any]]] = None,
     tables: Optional[List[Dict[str, Any]]] = None,
+    notes: Optional[List[Dict[str, Any]]] = None,
     scope: str = "current",
     slide_index: int = 0,
     selected_shape_id: Optional[str] = None,
@@ -2102,6 +2344,7 @@ def run_stream(
     objects = [obj for obj in (objects or []) if isinstance(obj, dict)]
     elements = [elem for elem in (elements or []) if isinstance(elem, dict)]
     tables = [table for table in (tables or []) if isinstance(table, dict)]
+    notes = [item for item in (notes or []) if isinstance(item, dict)]
 
     max_index = -1
     for item in objects + elements:
@@ -2133,7 +2376,7 @@ def run_stream(
             scope = "deck"
     scope_slides = [target_slide] if scope == "current" else list(range(total_slides))
 
-    view = _DeckView(objects, elements, tables, total_slides, scope_slides, slide_size)
+    view = _DeckView(objects, elements, tables, total_slides, scope_slides, slide_size, notes=notes)
     store = _OperationStore(view, instruction, MAX_OPS)
     model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 

@@ -328,6 +328,7 @@ def _serialize(meta: Dict[str, Any], objects_payload: Dict[str, Any]) -> Dict[st
         "download_url": f"/api/docs/{doc_id}/download",
         "messages": messages[-60:],
         "message_count": len(messages),
+        "notes": objects_payload.get("notes", []),
         "pending_operations": _pending_from_messages(messages),
         "ai_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
@@ -807,6 +808,7 @@ def chat(doc_id: str, body: ChatIn):
                 objects=objects_payload.get("objects", []),
                 elements=objects_payload.get("elements", []),
                 tables=objects_payload.get("tables", []),
+                notes=objects_payload.get("notes"),
                 total_slides=total_slides,
                 slide_size=objects_payload.get("slide_size_emu")
                 or meta.get("slide_size_emu")

@@ -358,6 +358,729 @@ def _remove_shape(shape) -> None:
         parent.remove(element)
 
 
+# ---------- v0.4：批量页操作 / 版式库 / 摘要页 / 图表 / SmartArt / 备注 / 链接 / 高亮 ----------
+
+BATCH_SLIDE_OP_NAMES = {"duplicate_slide", "delete_slide", "move_slide"}
+
+_PAGE_RANGE_RE = re.compile(r"^(\d+)\s*[-\u2013\u2014]\s*(\d+)$")
+
+
+def parse_slide_spec(pages: Any, total_slides: int) -> List[int]:
+    """页码选择器（1-based 页码）→ 去重升序的 0-based 索引。
+
+    支持 "2-5"、"1,3,5"、"1-2,4" 与整数列表 [2, 3]；区间闭包含端点。
+    与用户口中的「第 2-5 页」一致；内部再换算成 slide_index。
+    """
+    numbers: List[int] = []
+    if isinstance(pages, str):
+        for token in pages.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            match = _PAGE_RANGE_RE.fullmatch(token)
+            if match:
+                low, high = int(match.group(1)), int(match.group(2))
+                if low > high:
+                    raise PatchError(f"页码区间起止颠倒：{token}")
+                numbers.extend(range(low, high + 1))
+            elif token.isdigit():
+                numbers.append(int(token))
+            else:
+                raise PatchError(f"页码格式无效：{token!r}（支持 2-5 / 1,3,5）")
+    elif isinstance(pages, (list, tuple)):
+        for value in pages:
+            if isinstance(value, bool):
+                raise PatchError(f"页码无效：{value!r}")
+            if isinstance(value, int):
+                number = value
+            elif isinstance(value, str) and value.strip().isdigit():
+                number = int(value.strip())
+            else:
+                raise PatchError(f"页码无效：{value!r}")
+            numbers.append(number)
+    else:
+        raise PatchError(f"pages 格式无效：{pages!r}（支持 '2-5' / '1,3,5' / [2,3]）")
+    if not numbers:
+        raise PatchError("pages 为空")
+    unique = sorted(set(numbers))
+    for number in unique:
+        if number < 1 or number > total_slides:
+            raise PatchError(f"页码超出范围：第 {number} 页（文稿共 {total_slides} 页）")
+    return [number - 1 for number in unique]
+
+
+LAYOUT_PRESETS = {"title", "two_col", "image_text", "data"}
+
+LAYOUT_ALIASES = {
+    "title": "title",
+    "title_page": "title",
+    "title_slide": "title",
+    "cover": "title",
+    "标题页": "title",
+    "封面": "title",
+    "two_col": "two_col",
+    "two_column": "two_col",
+    "twocolumn": "two_col",
+    "two-column": "two_col",
+    "comparison": "two_col",
+    "两栏": "two_col",
+    "双栏": "two_col",
+    "对比页": "two_col",
+    "image_text": "image_text",
+    "image-text": "image_text",
+    "imagetext": "image_text",
+    "picture_text": "image_text",
+    "图文": "image_text",
+    "图片文字": "image_text",
+    "图文页": "image_text",
+    "data": "data",
+    "metrics": "data",
+    "数据页": "data",
+    "数据": "data",
+    "指标页": "data",
+}
+
+
+def canonical_layout(value: Any) -> Optional[str]:
+    key = str(value or "").strip().lower()
+    if not key:
+        return None
+    return LAYOUT_ALIASES.get(key)
+
+
+_LAYOUT_CONTENT_KEYS = ("subtitle", "left", "right", "data", "image_base64")
+
+
+def _add_layout_textbox(slide, slide_w: int, slide_h: int, x: float, y: float,
+                        w: float, h: float, text: str, size_pt: float,
+                        bold: bool = False, align: Optional[str] = None) -> Any:
+    """按比例坐标（0..1）加一个版式文本框。"""
+    box = slide.shapes.add_textbox(
+        Emu(int(slide_w * x)), Emu(int(slide_h * y)),
+        Emu(int(slide_w * w)), Emu(int(slide_h * h)),
+    )
+    tf = box.text_frame
+    tf.word_wrap = True
+    try:
+        tf.auto_size = None
+    except Exception:
+        pass
+    last = tf.paragraphs[0]
+    for index, line in enumerate(str(text or "").split("\n")):
+        if index > 0:
+            last = tf.add_paragraph()
+        if align in PP_ALIGN.__members__:
+            last.alignment = PP_ALIGN[align]
+        run = last.add_run()
+        run.text = line
+        run.font.size = Pt(size_pt)
+        run.font.bold = bold
+    return box
+
+
+def _pick_title_shape(slide, merged: Dict[str, Any]):
+    """版式重排时的标题对象：显式 shape_id 优先，否则最大字号/最靠上的文本。"""
+    shape_id = str(merged.get("shape_id") or "").strip()
+    if shape_id:
+        shape = find_shape(slide, shape_id)
+        if shape is None:
+            raise PatchConflict(f"shape not found: {shape_id}")
+        return shape
+    best = None
+    best_score = None
+    for shape in _iter_shapes(slide.shapes):
+        if not getattr(shape, "has_text_frame", False):
+            continue
+        try:
+            text = shape.text or ""
+        except Exception:
+            continue
+        if not text.strip():
+            continue
+        style = _font_style(shape)
+        size = float(style["size"].pt) if style.get("size") else 0.0
+        top = float(shape.top or 0)
+        score = (-size, top)
+        if best_score is None or score < best_score:
+            best, best_score = shape, score
+    return best
+
+
+def _layout_content_shapes(slide, title_shape) -> List[Any]:
+    """非标题的顶层文本形状（重排用）。"""
+    out = []
+    # python-pptx rebuilds shape proxies on every iteration — identity must be
+    # checked on the underlying XML elements, never on the wrapper objects
+    title_element = title_shape._element if title_shape is not None else None
+    for shape in slide.shapes:
+        if title_element is not None and shape._element is title_element:
+            continue
+        if getattr(shape, "has_text_frame", False):
+            try:
+                text = shape.text or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                out.append(shape)
+    return out
+
+
+def _apply_layout_preset(slide, merged: Dict[str, Any], slide_w: int, slide_h: int) -> None:
+    preset = canonical_layout(merged.get("layout") or merged.get("preset"))
+    if preset is None:
+        raise PatchError(
+            f"未知版式：{merged.get('layout')!r}（支持 {'/'.join(sorted(LAYOUT_PRESETS))} 及其中文名）"
+        )
+    has_content = str(merged.get("title") or "").strip() != "" or any(
+        merged.get(key) is not None for key in _LAYOUT_CONTENT_KEYS
+    )
+    if has_content:
+        _layout_add_content(slide, preset, merged, slide_w, slide_h)
+    else:
+        _layout_rearrange(slide, preset, merged, slide_w, slide_h)
+
+
+def _layout_add_content(slide, preset: str, merged: Dict[str, Any],
+                        slide_w: int, slide_h: int) -> None:
+    """内容模式：按版式新增标题/内容框（不动现有对象）。"""
+    title = str(merged.get("title") or "").strip()
+    if preset == "title":
+        subtitle = merged.get("subtitle")
+        if title:
+            _add_layout_textbox(slide, slide_w, slide_h, 0.08, 0.30, 0.84, 0.16,
+                                title, 32, bold=True, align="CENTER")
+        if subtitle is not None:
+            _add_layout_textbox(slide, slide_w, slide_h, 0.12, 0.48, 0.76, 0.10,
+                                str(subtitle), 18, align="CENTER")
+        return
+    if preset == "two_col":
+        if title:
+            _add_layout_textbox(slide, slide_w, slide_h, 0.06, 0.06, 0.88, 0.12, title, 28, bold=True)
+        left = merged.get("left")
+        right = merged.get("right")
+        if left is not None:
+            _add_layout_textbox(slide, slide_w, slide_h, 0.06, 0.24, 0.40, 0.64, str(left), 16)
+        if right is not None:
+            _add_layout_textbox(slide, slide_w, slide_h, 0.54, 0.24, 0.40, 0.64, str(right), 16)
+        return
+    if preset == "image_text":
+        if title:
+            _add_layout_textbox(slide, slide_w, slide_h, 0.06, 0.06, 0.88, 0.12, title, 28, bold=True)
+        text = merged.get("text")
+        if text is not None:
+            _add_layout_textbox(slide, slide_w, slide_h, 0.06, 0.24, 0.40, 0.64, str(text), 16)
+        if merged.get("image_base64"):
+            import io
+
+            data = _decode_image_payload(merged)
+            slide.shapes.add_picture(
+                io.BytesIO(data),
+                Emu(int(slide_w * 0.54)), Emu(int(slide_h * 0.22)),
+                Emu(int(slide_w * 0.40)),
+            )
+        return
+    # data 指标瓦片
+    if title:
+        _add_layout_textbox(slide, slide_w, slide_h, 0.06, 0.06, 0.88, 0.12, title, 28, bold=True)
+    rows = merged.get("data")
+    if isinstance(rows, list) and rows:
+        tiles = [row for row in rows if isinstance(row, (list, tuple)) and len(row) >= 2][:6]
+        if tiles:
+            columns = max(1, min(3, 2 if len(tiles) > 2 else len(tiles)))
+            per_col = (len(tiles) + columns - 1) // columns
+            col_w = 0.88 / columns
+            for index, row in enumerate(tiles):
+                col = index // per_col
+                row_i = index % per_col
+                x = 0.06 + col * col_w
+                y = 0.24 + row_i * (0.68 / max(1, per_col))
+                _add_layout_textbox(slide, slide_w, slide_h, x + 0.01, y + 0.02,
+                                    col_w - 0.06, 0.10, str(row[0]), 14)
+                _add_layout_textbox(slide, slide_w, slide_h, x + 0.01, y + 0.14,
+                                    col_w - 0.06, 0.16, str(row[1]), 26, bold=True)
+
+
+def _layout_rearrange(slide, preset: str, merged: Dict[str, Any],
+                      slide_w: int, slide_h: int) -> None:
+    """重排模式：把现有对象按版式归位（不增删对象、不改文字）。"""
+    title_shape = _pick_title_shape(slide, merged)
+    if preset == "title":
+        # 标题页：全部文本水平居中（标题最显眼，正文作为副题同样居中）
+        moved = False
+        for shape in _iter_shapes(slide.shapes):
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            try:
+                text = shape.text or ""
+            except Exception:
+                continue
+            if not text.strip():
+                continue
+            _pin_inherited_box(shape)
+            shape.left = Emu(max(0, (slide_w - int(shape.width or 0)) // 2))
+            moved = True
+        if not moved:
+            raise PatchError("页面上没有可作为标题的文本对象")
+        if title_shape is not None:
+            _pin_inherited_box(title_shape)
+            title_shape.top = Emu(int(slide_h * 0.08))
+        return
+    if preset == "two_col":
+        if title_shape is not None:
+            _pin_inherited_box(title_shape)
+            title_shape.left = Emu(int(slide_w * 0.06))
+            title_shape.top = Emu(int(slide_h * 0.06))
+            title_shape.width = Emu(int(slide_w * 0.88))
+        bodies = _layout_content_shapes(slide, title_shape)
+        for index, shape in enumerate(bodies[:2]):
+            _pin_inherited_box(shape)
+            col = 0 if index == 0 else 1
+            shape.left = Emu(int(slide_w * (0.06 if col == 0 else 0.54)))
+            shape.top = Emu(int(slide_h * 0.24))
+            shape.width = Emu(int(slide_w * 0.40))
+        return
+    if preset == "image_text":
+        pictures = [s for s in slide.shapes if str(getattr(s, "shape_type", "")) == "PICTURE (13)"]
+        for shape in pictures:
+            _pin_inherited_box(shape)
+            new_w = int(slide_w * 0.40)
+            old_w = int(shape.width or 0)
+            old_h = int(shape.height or 0)
+            shape.width = Emu(new_w)
+            if old_w > 0 and old_h > 0:
+                shape.height = Emu(int(old_h * new_w / old_w))
+            shape.left = Emu(int(slide_w * 0.54))
+            shape.top = Emu(int(slide_h * 0.22))
+        if title_shape is not None:
+            _pin_inherited_box(title_shape)
+            title_shape.left = Emu(int(slide_w * 0.06))
+            title_shape.top = Emu(int(slide_h * 0.06))
+            title_shape.width = Emu(int(slide_w * 0.42))
+        for shape in _layout_content_shapes(slide, title_shape)[:1]:
+            _pin_inherited_box(shape)
+            shape.left = Emu(int(slide_w * 0.06))
+            shape.top = Emu(int(slide_h * 0.24))
+            shape.width = Emu(int(slide_w * 0.42))
+        return
+    # data：居中主要数据对象（表格/图表，否则最大文本框）
+    target = None
+    for shape in slide.shapes:
+        if getattr(shape, "has_table", False) or getattr(shape, "has_chart", False):
+            target = shape
+            break
+    if target is None:
+        bodies = _layout_content_shapes(slide, None)
+        target = bodies[0] if bodies else None
+    if target is None and title_shape is not None:
+        target = title_shape
+    if target is None:
+        raise PatchError("页面上没有可居中的内容对象")
+    _pin_inherited_box(target)
+    target.left = Emu(max(0, (slide_w - int(target.width or 0)) // 2))
+
+
+def _deck_slide_titles(prs, n_orig: int) -> List[str]:
+    """每页的标题候选（最大字号/最靠上的非空文本），用于自动目录。"""
+    titles: List[str] = []
+    for index in range(n_orig):
+        title_shape = _pick_title_shape(prs.slides[index], {})
+        text = ""
+        if title_shape is not None:
+            text = str(title_shape.text or "").strip().split("\n", 1)[0][:60]
+        titles.append(text or f"第 {index + 1} 页")
+    return titles
+
+
+def _build_summary_slide(prs, title: str, items: List[str]) -> Any:
+    """创建目录/摘要页（追加到末尾，由调用方移动到位）。"""
+    slide_w = int(prs.slide_width)
+    slide_h = int(prs.slide_height)
+    slide = prs.slides.add_slide(
+        prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+    )
+    _dedupe_slide_partname(slide)
+    _add_layout_textbox(slide, slide_w, slide_h, 0.08, 0.08, 0.84, 0.14,
+                        title, 30, bold=True, align="CENTER")
+    lines = []
+    for index, item in enumerate(items, start=1):
+        text = str(item).strip()
+        if not text:
+            continue
+        numbered = text if re.match(r"^[0-9一二三四五六七八九十]+[、.．]", text) else f"{index}. {text}"
+        lines.append(numbered)
+    _add_layout_textbox(slide, slide_w, slide_h, 0.12, 0.28, 0.76, 0.62, "\n".join(lines), 18)
+    return slide
+
+
+def _set_slide_notes(slide, text: str) -> None:
+    slide.notes_slide.notes_text_frame.text = str(text or "")
+
+
+# ---------- 图表数据编辑 ----------
+
+def _apply_edit_chart(chart, merged: Dict[str, Any]) -> None:
+    from pptx.chart.data import CategoryChartData
+
+    categories = merged.get("categories")
+    series_spec = merged.get("series")
+    if not isinstance(series_spec, list) or not series_spec:
+        raise PatchError("edit_chart 需要 series 列表（如 [{'name':'营收','values':[1,2]}]）")
+    try:
+        current_categories = [str(value) for value in chart.plots[0].categories]
+    except Exception:
+        current_categories = []
+    current: List[Dict[str, Any]] = []
+    for series in chart.series:
+        try:
+            values = [float(value) for value in series.values]
+        except (TypeError, ValueError):
+            values = []
+        current.append({"name": str(series.name or ""), "values": values})
+    # categories 一并给出 = 重写整张数据表（系列全量替换）；只给 series = 按名合并
+    full_replace = isinstance(categories, list) and bool(categories)
+    new_categories = [str(value) for value in categories] if full_replace else current_categories
+    result: List[Dict[str, Any]] = [] if full_replace else [dict(entry) for entry in current]
+    for position, entry in enumerate(series_spec):
+        if not isinstance(entry, dict):
+            raise PatchError("series 每项需要是对象")
+        # name 可省略：按提交位置更新对应系列的数值
+        name = str(entry.get("name") or "").strip()
+        raw_values = entry.get("values")
+        if raw_values is None:
+            values = None
+        else:
+            if not isinstance(raw_values, list):
+                raise PatchError(f"series '{name}' 的 values 必须是列表")
+            try:
+                values = [float(value) for value in raw_values]
+            except (TypeError, ValueError):
+                raise PatchError(f"series '{name}' 的 values 含非数值")
+        target = next((i for i, item in enumerate(result) if name and item["name"] == name), None)
+        if target is None and position < len(result):
+            target = position  # 同名找不到时按提交顺序对位（改名/换数据）
+        if target is None:
+            if not name:
+                raise PatchError(f"series[{position}] 需要 name（或对位到已有系列）")
+            result.append({"name": name, "values": values or []})
+        else:
+            if name:
+                result[target]["name"] = name
+            if values is not None:
+                result[target]["values"] = values
+    for item in result:
+        if len(item["values"]) != len(new_categories):
+            raise PatchError(
+                f"系列「{item['name']}」的值数量（{len(item['values'])}）"
+                f"与类目数量（{len(new_categories)}）不一致"
+            )
+    data = CategoryChartData()
+    data.categories = new_categories
+    for item in result:
+        data.add_series(item["name"], tuple(item["values"]))
+    try:
+        chart.replace_data(data)
+    except Exception as exc:  # 外部数据源 / XY 等不支持重写的图表
+        raise PatchError(f"图表数据写入失败（不支持的数据源或图表类型）：{exc}") from exc
+
+
+# ---------- SmartArt 编辑 ----------
+
+SMARTART_NODE_ID_RE = re.compile(r"^(s(\d+)_id\d+)_n(\d+)$")
+
+
+def _apply_smartart_edit(prs, patch: Dict[str, Any], match, shape_id: str) -> int:
+    from services import smartart as smartart_mod
+
+    frame_id, slide_index, node_index = match.group(1), int(match.group(2)), int(match.group(3))
+    if slide_index < 0 or slide_index >= len(prs.slides):
+        raise PatchError(f"slide_index out of range: {slide_index}")
+    slide = prs.slides[slide_index]
+    shape = find_shape(slide, frame_id)
+    if shape is None:
+        raise PatchConflict(f"shape not found: {frame_id}")
+    info = smartart_mod.find_frame_data(shape, slide)
+    if info is None or info.get("data_part") is None:
+        raise PatchError(f"对象不是 SmartArt：{frame_id}")
+    payload = patch.get("payload") or {}
+    after = patch.get("after")
+    if after is None:
+        after = payload.get("text")
+    if after is None:
+        raise PatchError("编辑 SmartArt 节点需要 after 新文本")
+    text = str(after)
+    if len(text) > MAX_PATCH_TEXT_CHARS:
+        raise PatchError(f"after too long (max {MAX_PATCH_TEXT_CHARS} chars)")
+    data_part = info["data_part"]
+    old_texts = smartart_mod.node_texts(data_part.blob)
+    if node_index < 0 or node_index >= len(old_texts):
+        raise PatchError(f"SmartArt 节点不存在：{shape_id}（共 {len(old_texts)} 个文本节点）")
+    old_text = old_texts[node_index]
+    _validate_before(patch, old_text, shape_id)
+    new_blob = smartart_mod.set_node_text(data_part.blob, node_index, text)
+    if new_blob is None:
+        raise PatchError("SmartArt 节点写入失败")
+    smartart_mod.write_part(data_part, new_blob)
+    drawing_part = info.get("drawing_part")
+    if drawing_part is not None and old_text and old_text != text:
+        drawn, _count = smartart_mod.replace_text(drawing_part.blob, old_text, text)
+        if drawn is not None:
+            smartart_mod.write_part(drawing_part, drawn)
+    return slide_index
+
+
+def _apply_smartart_find_replace(slide, shape, merged: Dict[str, Any]) -> int:
+    from services import smartart as smartart_mod
+
+    info = smartart_mod.find_frame_data(shape, slide)
+    if info is None or info.get("data_part") is None:
+        raise PatchError(f"对象不是 SmartArt：{merged.get('shape_id')}")
+    find = str(merged.get("find") or "")
+    replace = str(merged.get("replace") if merged.get("replace") is not None else "")
+    if not find:
+        raise PatchError("edit_smartart 需要 find")
+    if len(find) > 500 or len(replace) > 2000:
+        raise PatchError("find/replace 过长")
+    data_part = info["data_part"]
+    new_blob, count = smartart_mod.replace_text(data_part.blob, find, replace)
+    if count == 0:
+        raise PatchError(f"SmartArt 中未找到要替换的文字：「{find}」")
+    smartart_mod.write_part(data_part, new_blob)
+    drawing_part = info.get("drawing_part")
+    if drawing_part is not None:
+        drawn, _drawn_count = smartart_mod.replace_text(drawing_part.blob, find, replace)
+        if drawn is not None:
+            smartart_mod.write_part(drawing_part, drawn)
+    return count
+
+
+# ---------- 超链接 ----------
+
+HYPERLINK_SCHEMES = ("http://", "https://", "mailto:")
+
+
+def _normalize_url(url: Any) -> str:
+    text = str(url or "").strip()
+    if not text:
+        raise PatchError("url 不能为空")
+    if not text.lower().startswith(HYPERLINK_SCHEMES):
+        raise PatchError("仅支持 http/https/mailto 超链接")
+    if len(text) > 2000:
+        raise PatchError("url 过长（最多 2000 字符）")
+    return text
+
+
+def _iter_runs(shape):
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            yield run
+
+
+def _apply_set_hyperlink(shape, merged: Dict[str, Any]) -> None:
+    if not getattr(shape, "has_text_frame", False):
+        raise PatchError(f"shape 没有文本：{merged.get('shape_id')}")
+    url = _normalize_url(merged.get("url"))
+    needle = merged.get("text")
+    if needle is None:
+        needle = merged.get("find")
+    needle_text = str(needle) if needle is not None else None
+    linked = 0
+    for run in _iter_runs(shape):
+        if needle_text is not None and needle_text not in (run.text or ""):
+            continue
+        try:
+            run.hyperlink.address = url
+            linked += 1
+        except Exception:
+            continue
+    if linked == 0:
+        if needle_text is not None:
+            raise PatchError(f"未找到要加链接的文字：「{needle_text}」")
+        raise PatchError("对象上没有可加链接的文字")
+
+
+def _apply_remove_hyperlink(shape) -> None:
+    if not getattr(shape, "has_text_frame", False):
+        raise PatchError("shape 没有文本，无法清除链接")
+    cleared = 0
+    for run in _iter_runs(shape):
+        try:
+            if run.hyperlink.address:
+                run.hyperlink.address = None
+                cleared += 1
+        except Exception:
+            continue
+    if cleared == 0:
+        raise PatchError("对象上没有超链接")
+
+
+# ---------- 查找高亮 ----------
+
+_HIGHLIGHT_TAIL_TAGS = tuple(
+    qn(tag) for tag in (
+        "a:latin", "a:ea", "a:cs", "a:sym", "a:hlinkClick",
+        "a:hlinkMouseOver", "a:rtl", "a:extLst",
+    )
+)
+
+
+def _set_run_highlight(rPr, color: str) -> None:
+    """a:rPr/a:highlight/a:srgbClr；按 schema 放在字体/链接声明之前。"""
+    highlight = rPr.find(qn("a:highlight"))
+    if highlight is None:
+        highlight = rPr.makeelement(qn("a:highlight"), {})
+        srgb = rPr.makeelement(qn("a:srgbClr"), {"val": color})
+        highlight.append(srgb)
+        anchor_index = len(rPr)
+        for index, child in enumerate(rPr):
+            if child.tag in _HIGHLIGHT_TAIL_TAGS:
+                anchor_index = index
+                break
+        rPr.insert(anchor_index, highlight)
+    else:
+        srgb = highlight.find(qn("a:srgbClr"))
+        if srgb is None:
+            srgb = highlight.makeelement(qn("a:srgbClr"), {})
+            highlight.append(srgb)
+        srgb.set("val", color)
+
+
+def _split_run_with_highlight(paragraph, run, find: str, color: str) -> int:
+    """把 run 按 find 切分，命中段加高亮；返回命中次数。前后片段保留原样式。"""
+    text = run.text or ""
+    if find not in text:
+        return 0
+    r = run._r
+    parent = r.getparent()
+    if parent is None:
+        return 0
+    segments = []
+    rest = text
+    while find in rest:
+        head, rest = rest.split(find, 1)
+        if head:
+            segments.append((head, False))
+        segments.append((find, True))
+    if rest:
+        segments.append((rest, False))
+    anchor = r
+    hits = 0
+    for seg_text, highlighted in segments:
+        new_r = copy.deepcopy(r)
+        rPr = new_r.find(qn("a:rPr"))
+        if rPr is None:
+            rPr = new_r.makeelement(qn("a:rPr"), {})
+            new_r.insert(0, rPr)
+        if highlighted:
+            _set_run_highlight(rPr, color)
+            hits += 1
+        t = new_r.find(qn("a:t"))
+        if t is None:
+            t = new_r.makeelement(qn("a:t"), {})
+            new_r.append(t)
+        t.text = seg_text
+        anchor.addnext(new_r)
+        anchor = new_r
+    parent.remove(r)
+    return hits
+
+
+def _op_highlight_text(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    find = str(merged.get("find") or "")
+    color = _bg_color(merged.get("color") or "FFFF00", "color")
+    shape_id = str(merged.get("shape_id") or "").strip()
+    if not find and not shape_id:
+        raise PatchError("highlight_text 需要 find（或 shape_id 高亮整个对象）")
+    all_slides = list(prs.slides)
+    containers = []  # (slide_index, text 目标)
+    if shape_id:
+        parsed = parse_shape_id(shape_id)
+        if not parsed:
+            raise PatchError(f"invalid shape_id: {shape_id!r}")
+        slide_index = parsed[0]
+        if slide_index < 0 or slide_index >= n_orig:
+            raise PatchError(f"slide_index out of range: {slide_index}")
+        shape = find_shape(prs.slides[slide_index], shape_id)
+        if shape is None:
+            raise PatchConflict(f"shape not found: {shape_id}")
+        if not getattr(shape, "has_text_frame", False):
+            raise PatchError(f"shape 没有文本：{shape_id}")
+        containers.append((slide_index, shape))
+    else:
+        slides = _resolve_bulk_slides(prs, merged, n_orig)
+        for slide in slides:
+            index = all_slides.index(slide)
+            for target in _iter_text_targets(slide):
+                containers.append((index, target))
+    total = 0
+    touched: Set[int] = set()
+    for index, target in containers:
+        changed = 0
+        for paragraph in target.text_frame.paragraphs:
+            if find:
+                for run in list(paragraph.runs):
+                    changed += _split_run_with_highlight(paragraph, run, find, color)
+            else:
+                for run in paragraph.runs:
+                    if run.text:
+                        _set_run_highlight(run._r.get_or_add_rPr(), color)
+                        changed += 1
+        if changed:
+            touched.add(index)
+        total += changed
+    if total == 0:
+        raise PatchError(f"未找到要高亮的文字：「{find}」" if find else "对象上没有文字可高亮")
+    return touched
+
+
+def _expand_batch_slide_ops(patch: Dict[str, Any], n_orig: int) -> List[Dict[str, Any]]:
+    """batch_slide_ops → 逐页的基础页级操作（0-based、副本紧随原页）。
+
+    op 可为字符串（duplicate_slide/delete_slide）或带 $page 占位符的模板。
+    """
+    payload = patch.get("payload") or {}
+    merged = {**patch, **payload}
+    op_spec = merged.get("op")
+    if isinstance(op_spec, str):
+        inner = _canonical_action({"action": op_spec})
+        template: Dict[str, Any] = {}
+    elif isinstance(op_spec, dict):
+        template = dict(op_spec)
+        inner = _canonical_action(template)
+    else:
+        raise PatchError("batch_slide_ops 需要 op（duplicate_slide / delete_slide）")
+    if inner not in BATCH_SLIDE_OP_NAMES:
+        raise PatchError(f"batch_slide_ops 暂不支持 {inner}（仅 duplicate_slide/delete_slide/move_slide）")
+    pages = merged.get("pages", merged.get("slides"))
+    indices = parse_slide_spec(pages, n_orig)
+    expanded: List[Dict[str, Any]] = []
+    for index in indices:
+        sub = dict(template)
+        for key, value in list(sub.items()):
+            if isinstance(value, str) and value.strip() == "$page":
+                sub[key] = index
+        if inner == "duplicate_slide":
+            sub.setdefault("source_slide", index)
+            sub.setdefault("position", index + 1)
+        elif inner == "delete_slide":
+            sub.setdefault("slide", index)
+        else:  # move_slide：按相对位移平移（0 基页码，夹在有效范围内）
+            shift = merged.get("shift", sub.get("shift"))
+            if shift is None:
+                raise PatchError("batch move_slide 需要 shift（相对位移，如 1 或 -1）")
+            try:
+                shift = int(shift)
+            except (TypeError, ValueError):
+                raise PatchError("shift 必须是整数")
+            target = max(0, min(n_orig - 1, index + shift))
+            if target == index:
+                continue  # 位移为零：无操作
+            sub.setdefault("slide", index)
+            sub["to"] = target
+        sub["action"] = inner
+        expanded.append(sub)
+    return expanded
+
+
 MAX_PATCH_TEXT_CHARS = 20000
 MAX_PATCH_IMAGE_B64_CHARS = 41 * 1024 * 1024  # ≈30 MB binary after base64
 FUZZY_BEFORE_MAX_CHARS = 10000
@@ -376,7 +1099,7 @@ def _validate_patch_sizes(patch: Dict[str, Any]) -> None:
         if len(value) > MAX_PATCH_TEXT_CHARS:
             raise PatchError(f"{label} too long (max {MAX_PATCH_TEXT_CHARS} chars)")
 
-    for key in ("before", "after", "text", "find", "replace"):
+    for key in ("before", "after", "text", "find", "replace", "url"):
         _check(patch.get(key), key)
     payload = patch.get("payload")
     if isinstance(payload, dict):
@@ -454,6 +1177,8 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
 
     slide_w = int(prs.slide_width)
     slide_h = int(prs.slide_height)
+    payload = patch.get("payload") or {}
+    merged = {**patch, **payload}
 
     if action == "add_textbox":
         try:
@@ -477,7 +1202,55 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
         _apply_slide_background(prs.slides[slide_index], merged)
         return slide_index
 
+    if action == "apply_layout":
+        try:
+            slide_index = int(merged.get("slide_index"))
+        except (TypeError, ValueError):
+            raise PatchError("apply_layout requires slide_index")
+        if slide_index < 0 or slide_index >= len(prs.slides):
+            raise PatchError(f"slide_index out of range: {slide_index}")
+        _apply_layout_preset(prs.slides[slide_index], merged, slide_w, slide_h)
+        return slide_index
+
+    if action == "edit_notes":
+        items = merged.get("items")
+        if not isinstance(items, list):
+            notes_list = merged.get("notes")
+            if isinstance(notes_list, list):
+                items = notes_list
+        if isinstance(items, list) and items:
+            last_index = 0
+            for entry in items:
+                if not isinstance(entry, dict):
+                    raise PatchError("edit_notes.items 每项需要 {slide_index, text}")
+                try:
+                    item_index = int(entry.get("slide_index"))
+                except (TypeError, ValueError):
+                    raise PatchError("edit_notes.items[].slide_index 无效")
+                if item_index < 0 or item_index >= len(prs.slides):
+                    raise PatchError(f"edit_notes slide_index out of range: {item_index}")
+                text = entry.get("text")
+                if text is None:
+                    text = entry.get("after")
+                _set_slide_notes(prs.slides[item_index], "" if text is None else str(text))
+                last_index = item_index
+            return last_index
+        try:
+            slide_index = int(merged.get("slide_index"))
+        except (TypeError, ValueError):
+            raise PatchError("edit_notes requires slide_index")
+        if slide_index < 0 or slide_index >= len(prs.slides):
+            raise PatchError(f"slide_index out of range: {slide_index}")
+        text = merged.get("text")
+        if text is None:
+            text = patch.get("after")
+        _set_slide_notes(prs.slides[slide_index], "" if text is None else str(text))
+        return slide_index
+
     shape_id = str(patch.get("shape_id") or "")
+    sa_match = SMARTART_NODE_ID_RE.fullmatch(shape_id)
+    if sa_match:
+        return _apply_smartart_edit(prs, patch, sa_match, shape_id)
     cell_ref = parse_cell_id(shape_id)
     parsed = parse_shape_id(shape_id)
     if cell_ref:
@@ -505,8 +1278,6 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
         seen.add(shape_id)
 
     slide = prs.slides[slide_index]
-    payload = patch.get("payload") or {}
-    merged = {**patch, **payload}
     style_payload = merged.get("style") if isinstance(merged.get("style"), dict) else merged
 
     if cell_ref:
@@ -533,6 +1304,20 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
     if shape is None:
         raise PatchConflict(f"shape not found: {shape_id}")
     grouped = bool(getattr(shape, "shape_type", None) == 6)
+    if action == "edit_chart":
+        if not getattr(shape, "has_chart", False):
+            raise PatchError(f"shape 不是图表对象：{shape_id}")
+        _apply_edit_chart(shape.chart, merged)
+        return slide_index
+    if action == "edit_smartart":
+        _apply_smartart_find_replace(slide, shape, merged)
+        return slide_index
+    if action == "set_hyperlink":
+        _apply_set_hyperlink(shape, merged)
+        return slide_index
+    if action == "remove_hyperlink":
+        _apply_remove_hyperlink(shape)
+        return slide_index
     if action == "replace_image":
         _apply_replace_image(slide, shape, merged)
         return slide_index
@@ -601,11 +1386,13 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
 # python-pptx has no duplicate/delete/move API, so these work directly on the
 # sldIdLst element and the OPC relationship graph.
 
-SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide"}
+SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide",
+                 "batch_slide_ops", "insert_summary", "generate_summary"}
 
 # deck-wide bulk ops (v0.3): run after shape patches but BEFORE slide-level ops
 # so slide_index parameters still refer to the base deck the caller read
-DECK_ACTIONS = {"font_unify", "replace_text", "font_scale", "add_page_numbers"}
+DECK_ACTIONS = {"font_unify", "replace_text", "font_scale", "add_page_numbers",
+                 "highlight_text"}
 
 _ACTION_ALIASES = {
     "update": "edit",
@@ -660,6 +1447,31 @@ _ACTION_ALIASES = {
     "slide_background": "slide_background",
     "background": "slide_background",
     "set_background": "slide_background",
+    # v0.4 批量/版式/摘要/图表/SmartArt/备注/链接/高亮
+    "batch_slide_ops": "batch_slide_ops",
+    "batch_slides": "batch_slide_ops",
+    "slide_batch": "batch_slide_ops",
+    "apply_layout": "apply_layout",
+    "layout_preset": "apply_layout",
+    "rearrange": "apply_layout",
+    "insert_summary": "insert_summary",
+    "add_toc_slide": "insert_summary",
+    "generate_summary": "generate_summary",
+    "summary_page": "generate_summary",
+    "edit_chart": "edit_chart",
+    "chart_data": "edit_chart",
+    "edit_smartart": "edit_smartart",
+    "smartart_edit": "edit_smartart",
+    "edit_notes": "edit_notes",
+    "set_notes": "edit_notes",
+    "notes": "edit_notes",
+    "set_hyperlink": "set_hyperlink",
+    "add_hyperlink": "set_hyperlink",
+    "hyperlink": "set_hyperlink",
+    "remove_hyperlink": "remove_hyperlink",
+    "clear_hyperlink": "remove_hyperlink",
+    "highlight_text": "highlight_text",
+    "highlight": "highlight_text",
 }
 
 
@@ -835,6 +1647,14 @@ def _apply_slide_patches(
     def insertion_index(position: int) -> int:
         return sum(1 for anchor in anchors if anchor < float(position))
 
+    expanded: List[Dict[str, Any]] = []
+    for patch in patches:
+        if _canonical_action(patch) == "batch_slide_ops":
+            expanded.extend(_expand_batch_slide_ops(patch, n_orig))
+        else:
+            expanded.append(patch)
+    patches = expanded
+
     for patch in patches:
         action = _canonical_action(patch)
         if action == "duplicate_slide":
@@ -892,6 +1712,36 @@ def _apply_slide_patches(
             anchors.pop(from_index)
             anchors.insert(to, float(to) - 0.5)
             touched.update({from_index, to})
+        elif action in ("insert_summary", "generate_summary"):
+            payload = patch.get("payload") or {}
+            merged = {**patch, **payload}
+            strict = action == "insert_summary"
+            title_raw = merged.get("title")
+            if str(title_raw or "").strip() == "" and strict:
+                raise PatchError("insert_summary 需要 title 与 items")
+            items_raw = merged.get("items")
+            mode = str(merged.get("mode") or "").strip().lower()
+            if items_raw is not None:
+                items = [str(item).strip() for item in items_raw if str(item).strip()]
+                if len(items) < 2:
+                    raise PatchError("insert_summary/generate_summary 需要 items（至少 2 条要点）")
+                title = str(title_raw).strip() or "摘要"
+            elif strict:
+                raise PatchError("insert_summary 需要 title 与 items")
+            else:
+                items = _deck_slide_titles(prs, n_orig)
+                title = str(title_raw).strip() or ("摘要" if mode == "summary" else "目录")
+            try:
+                position = int(merged.get("position", 1))
+            except (TypeError, ValueError):
+                raise PatchError("position 必须是整数")
+            if position < 0 or position > n_orig:
+                raise PatchError(f"position 必须在 0..{n_orig}")
+            _build_summary_slide(prs, title, items)
+            new_index = insertion_index(position)
+            _move_sld_id(prs, len(anchors), new_index)  # 新页追加在末尾，先建后移
+            anchors.insert(new_index, position - 0.5)
+            touched.add(new_index)
         else:
             raise PatchError(f"unsupported slide action: {action}")
     return touched
@@ -1900,6 +2750,8 @@ def _apply_deck_patches(
             touched.update(_op_font_scale(prs, merged, n_orig))
         elif action == "add_page_numbers":
             touched.update(_op_add_page_numbers(prs, merged))
+        elif action == "highlight_text":
+            touched.update(_op_highlight_text(prs, merged, n_orig))
         else:
             raise PatchError(f"unsupported bulk action: {action}")
     return touched

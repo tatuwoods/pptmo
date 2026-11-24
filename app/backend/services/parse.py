@@ -124,12 +124,50 @@ def _shape_id(slide_index: int, shape, fallback: int) -> str:
     return f"s{slide_index}_sh{fallback}"
 
 
+_DGM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+
+
+def _dqn(tag: str) -> str:
+    return f"{{{_DGM_NS}}}{tag}"
+
+
+def _smartart_node_texts(shape) -> list:
+    """SmartArt 每个节点的文本（非空），按模型顺序；读 diagram data 部件。"""
+    try:
+        element = shape._element
+        rel_ids = element.find(f".//{_dqn('relIds')}")
+        if rel_ids is None:
+            return []
+        dm_rid = rel_ids.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}dm")
+        if not dm_rid:
+            return []
+        part = shape.part.rels[dm_rid].target_part
+        from lxml import etree
+
+        root = etree.fromstring(part.blob)
+    except Exception:
+        return []
+    texts = []
+    for point in root.iter(_dqn("pt")):
+        if point.find(_dqn("t")) is None:
+            continue
+        from pptx.oxml.ns import qn
+
+        text = "".join(node.text or "" for node in point.iter(qn("a:t")))
+        if text.strip():
+            texts.append(text)
+    return texts
+
+
 def _shape_kind(shape) -> str:
     try:
         if getattr(shape, "has_table", False):
             return "table"
         if getattr(shape, "has_chart", False):
             return "chart"
+        element = getattr(shape, "_element", None)
+        if element is not None and element.find(f".//{_dqn('relIds')}") is not None:
+            return "smartart"
         if getattr(shape, "shape_type", None) == 6 or shape.__class__.__name__.lower().endswith("group"):
             return "group"
         if getattr(shape, "shape_type", None) is not None and str(shape.shape_type) == "PICTURE (13)":
@@ -312,6 +350,7 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
     objects: List[Dict[str, Any]] = []
     elements: List[Dict[str, Any]] = []
     tables: List[Dict[str, Any]] = []
+    notes: List[Dict[str, Any]] = []
     seq = 0
     # structural caps: a hostile 60MB pptx can expand into hundreds of MB of
     # JSON that would then be re-read on every GET; these keep worst cases sane
@@ -372,6 +411,47 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
             table_meta["grouped"] = grouped
             tables.append(table_meta)
             return
+        if kind == "smartart":
+            # SmartArt：一个聚合对象（整体文本）+ 每节点一个可编辑对象（s0_id42_sa0）
+            node_texts = _smartart_node_texts(shape)
+            objects.append(
+                {
+                    "slide_index": slide_index,
+                    "shape_index": current_seq,
+                    "shape_id": shape_id,
+                    "shape_name": name or "SmartArt",
+                    "kind": "smartart",
+                    "text": "\n".join(node_texts),
+                    "bbox_emu": bbox,
+                    "slide_size_emu": slide_size,
+                    "grouped": grouped,
+                    "parent_shape_id": parent_shape_id,
+                    "group_path": list(group_path),
+                    "deletable": False,
+                    "movable": False,
+                    "resizable": False,
+                }
+            )
+            for node_index, node_text in enumerate(node_texts):
+                objects.append(
+                    {
+                        "slide_index": slide_index,
+                        "shape_index": current_seq,
+                        "shape_id": f"{shape_id}_n{node_index}",
+                        "shape_name": f"{name or 'SmartArt'} 节点 {node_index + 1}",
+                        "kind": "smartart_node",
+                        "text": node_text,
+                        "bbox_emu": bbox,
+                        "slide_size_emu": slide_size,
+                        "grouped": grouped,
+                        "parent_shape_id": parent_shape_id,
+                        "group_path": list(group_path),
+                        "deletable": False,
+                        "movable": False,
+                        "resizable": False,
+                    }
+                )
+            return
         if not getattr(shape, "has_text_frame", False):
             return
         try:
@@ -410,6 +490,14 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
             walk(shape, _identity, slide_index, False, None, [])
         if len(elements) >= max_shapes:
             limits["truncated_shapes"] = True
+        note_text = ""
+        if getattr(slide, "has_notes_slide", False):
+            try:
+                note_text = str(slide.notes_slide.notes_text_frame.text or "").replace("\v", "\n")
+            except Exception:
+                note_text = ""
+        notes.append({"slide_index": slide_index, "text": note_text})
+        slides[slide_index]["notes"] = note_text
 
     payload = {
         "slide_count": len(slides),
@@ -418,6 +506,7 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
         "objects": objects,
         "elements": elements,
         "tables": tables,
+        "notes": notes,
     }
     payload.update({key: value for key, value in limits.items() if value})
     return objects, payload
