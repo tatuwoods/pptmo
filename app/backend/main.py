@@ -241,6 +241,16 @@ def _startup_reconcile() -> None:
     except Exception:
         log.exception("startup reconciliation failed")
 
+    def _daily_maintenance() -> None:
+        try:
+            removed = storage.run_daily_cleanup()  # 每日首次启动跑一次（D20）
+            if removed:
+                log.info("startup cleanup: removed %d stale file(s)", removed)
+        except Exception:
+            log.exception("startup cleanup failed")
+
+    threading.Thread(target=_daily_maintenance, daemon=True, name="daily-cleanup").start()
+
 
 @app.exception_handler(edits.PatchConflict)
 async def _conflict_handler(_request, exc: edits.PatchConflict):
@@ -368,6 +378,77 @@ def _sse(event: str, data: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _content_hash(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _find_cached_render(doc_id: str, digest: str) -> Optional[Path]:
+    """内容指纹相同的完整渲染目录（无降级标记、有 PDF 与页面图）。"""
+    base = storage.doc_dir(doc_id) / "render"
+    if not base.exists():
+        return None
+    for item in sorted(base.iterdir()):
+        if not item.is_dir() or not re.fullmatch(r"v\d+", item.name):
+            continue
+        marker = item / ".contenthash"
+        if not marker.exists() or marker.read_text(encoding="utf-8").strip() != digest:
+            continue
+        if render.partial_marker(item).exists():
+            continue  # 降级目录：页图属于上一版，不能复用
+        if not (item / render.EXPORT_PDF_NAME).exists():
+            continue
+        if not list(item.glob("slide-*.png")):
+            continue
+        return item
+    return None
+
+
+def _render_with_cache(
+    doc_id: str, work_path: Path, render_dir: Path, stale_dir: Optional[Path] = None
+) -> int:
+    """v0.4 D17：相同内容（restore/重复操作）直接复用已渲染 PNG，不再排队渲染。"""
+    digest = _content_hash(work_path)
+    cached = _find_cached_render(doc_id, digest)
+    if cached is not None and cached != render_dir:
+        render_dir.mkdir(parents=True, exist_ok=True)
+        for item in cached.iterdir():
+            if item.is_file() and item.name != ".contenthash":
+                shutil.copy2(item, render_dir / item.name)
+        (render_dir / ".contenthash").write_text(digest, encoding="utf-8")
+        log.info("render cache hit: %s reuses %s (%.12s)", render_dir.name, cached.name, digest)
+        return len(list(render_dir.glob("slide-*.png")))
+    page_count = render.render_pptx(work_path, render_dir, scale=RENDER_SCALE, stale_dir=stale_dir)
+    (render_dir / ".contenthash").write_text(digest, encoding="utf-8")
+    return page_count
+
+
+def _prewarm_doc(doc_id: str, version: Optional[int] = None) -> int:
+    """v0.4 D18：后台补齐当前版本缺失的缩略图（上传后/启动时自愈）。"""
+    try:
+        meta = storage.load_meta(doc_id)
+        if version is None:
+            version = int(meta.get("version", 0))
+        filled = render.ensure_thumbs(storage.render_dir(doc_id, version))
+        if filled:
+            log.info("prewarm: filled %d missing thumb(s) for %s v%d", filled, doc_id, version)
+        return filled
+    except Exception:
+        log.exception("prewarm failed for %s", doc_id)
+        return 0
+
+
+def _prewarm_doc_async(doc_id: str) -> None:
+    threading.Thread(
+        target=_prewarm_doc, args=(doc_id,), daemon=True, name=f"prewarm-{doc_id[:8]}"
+    ).start()
+
+
 def _prepare_commit(doc_id: str, work_path: Path, new_version: int):
     """Render + parse the work file WITHOUT holding the doc lock.
 
@@ -388,7 +469,7 @@ def _prepare_commit(doc_id: str, work_path: Path, new_version: int):
             if current_version >= 0 and current_version != new_version
             else None
         )
-        page_count = render.render_pptx(work_path, render_dir, scale=RENDER_SCALE, stale_dir=stale_dir)
+        page_count = _render_with_cache(doc_id, work_path, render_dir, stale_dir=stale_dir)
         _objs, objects_payload = parse.parse_pptx(work_path)
         del _objs
         if page_count != objects_payload.get("slide_count"):
@@ -714,11 +795,13 @@ def upload_document(file: UploadFile = File(...)):
                 log.info("wingdings sanitized: %d bullets, %d chars", b_fixed, t_fixed)
         except Exception as exc:  # 修复失败不阻塞上传
             log.warning("wingdings sanitize skipped: %s", exc)
-        render.render_pptx(
-            storage.current_path(doc_id),
-            storage.render_dir(doc_id, 0),
-            scale=RENDER_SCALE,
+        _render_with_cache(doc_id, storage.current_path(doc_id), storage.render_dir(doc_id, 0))
+        # v0 的缓存指纹以版本快照为准：sanitize_wingdings 会无条件重存 current.pptx，
+        # 而 restore 的来源是 versions/v0.pptx，两者字节可能不同
+        (storage.render_dir(doc_id, 0) / ".contenthash").write_text(
+            _content_hash(storage.versions_dir(doc_id) / "v0.pptx"), encoding="utf-8"
         )
+        _prewarm_doc_async(doc_id)  # D18：响应即刻返回，缩略图缺口后台补齐
         return _serialize(meta, parsed)
     except Exception:
         if doc_id:
@@ -1654,11 +1737,8 @@ def import_images(files: Optional[List[UploadFile]] = File(None)):
         )
         doc_id = meta["doc_id"]
         storage.save_objects(doc_id, parsed)
-        render.render_pptx(
-            storage.current_path(doc_id),
-            storage.render_dir(doc_id, 0),
-            scale=RENDER_SCALE,
-        )
+        _render_with_cache(doc_id, storage.current_path(doc_id), storage.render_dir(doc_id, 0))
+        _prewarm_doc_async(doc_id)
         return _serialize(meta, parsed)
     except Exception:
         if doc_id:
@@ -2037,10 +2117,10 @@ def duplicate_document(doc_id: str):
         storage.save_objects(new_meta["doc_id"], objects_payload)
         title = str(meta.get("title") or Path(str(meta.get("file_name"))).stem)
         storage.touch_doc(new_meta["doc_id"], title=f"{title} 副本")
-        render.render_pptx(
+        _render_with_cache(
+            new_meta["doc_id"],
             storage.current_path(new_meta["doc_id"]),
             storage.render_dir(new_meta["doc_id"], 0),
-            scale=RENDER_SCALE,
         )
         # 起一条系统备注说明副本来源，聊天上下文可追溯
         storage.append_messages(

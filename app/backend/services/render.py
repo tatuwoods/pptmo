@@ -83,6 +83,58 @@ def _degrade_to_stale(out_dir: Path, stale_dir: Optional[Path]) -> Optional[int]
     return len(pages)
 
 
+THUMB_SCALE = 0.32
+
+
+def ensure_thumbs(out_dir: Path) -> int:
+    """补齐缺失的缩略图（预热/自愈）：优先从 export.pdf 重出小图，
+    PDF 不可用时回退复制整页 PNG（体积换可用性）。返回补齐数量。"""
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        return 0
+    slides = sorted(out_dir.glob("slide-*.png"))
+    if not slides:
+        return 0
+    missing = [
+        (index, slide)
+        for index, slide in enumerate(slides, start=1)
+        if not (out_dir / f"thumb-{index:03d}.png").exists()
+    ]
+    if not missing:
+        return 0
+    pdf_path = out_dir / EXPORT_PDF_NAME
+    doc = None
+    if pdf_path.exists():
+        try:
+            doc = pymupdf.open(pdf_path)
+        except Exception:
+            doc = None
+    filled = 0
+    for index, slide in missing:
+        thumb_file = out_dir / f"thumb-{index:03d}.png"
+        wrote = False
+        if doc is not None and index <= doc.page_count:
+            try:
+                pix = doc[index - 1].get_pixmap(
+                    matrix=pymupdf.Matrix(THUMB_SCALE, THUMB_SCALE), alpha=False
+                )
+                pix.save(thumb_file)
+                wrote = True
+            except Exception:
+                wrote = False
+        if not wrote:
+            try:
+                shutil.copy2(slide, thumb_file)
+                wrote = True
+            except OSError:
+                wrote = False
+        if wrote:
+            filled += 1
+    if doc is not None:
+        doc.close()
+    return filled
+
+
 def render_pptx(
     pptx_path: Path, out_dir: Path, scale: float = 2.0, stale_dir: Optional[Path] = None
 ) -> int:
