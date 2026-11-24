@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from services import agent, ai
+from services import agent
 
 
 # ---------- 21. 风格模仿：系统提示词 ----------

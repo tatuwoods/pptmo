@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.4.0 — second-round optimization, 22 items (2026-11-24)
+
+### A. Editing & AI (edits.py + agent.py, 8 items)
+1. `batch_slide_ops` — one instruction applies the same op to many slides
+   (duplicate/delete; page-range syntax `2-5`, lists `1,3,5`)
+2. `apply_layout` — preset layouts (title / two_column / image_text / data)
+   with `layout_catalog` introspection
+3. `generate_summary` — AI reads the whole deck and inserts a
+   directory/summary slide at a given position
+4. `edit_chart` — rewrite chart data tables and series names
+   (python-pptx chart part)
+5. SmartArt read/edit — SmartArt node text is readable (`smartart_node`
+   objects) and editable via normal text edits; rebuilding geometry is
+   rejected
+6. `edit_notes` — speaker notes read/write per slide, incl. batch note
+   generation hint
+7. `set_hyperlink` / `remove_hyperlink` — add/clear hyperlinks on runs
+8. `highlight_text` — yellow (or specified color) highlight on matching runs
+
+### B. Import/export (main.py, 4 items)
+9. `GET /api/docs/{id}/export/pdf-notes` — handout PDF (slide + notes pages)
+10. `GET /api/docs/{id}/export/outline` — plain-text outline export
+11. `POST /api/docs/import-images` — multi-image upload → one PPTX page per image
+12. `GET /api/docs/{id}/versions/{a}/compare/{b}` — text diff summary between
+    two versions (added/removed/changed slides)
+
+### C. Collaboration & security (main.py + storage.py, 4 items)
+13. `POST /api/docs/{id}/share` — tokenized read-only share URL
+    (`/share/{token}`: renders + download only, revocable)
+14. Optional document password (hashed in meta; session open requires
+    `X-Doc-Password`)
+15. Audit log — every apply records time/instruction digest/op count/result
+    to `audit.jsonl`; API returns the recent 50 entries
+16. Macro detection — pptx containing `vbaProject.bin` becomes read-only
+    preview with a warning
+
+### D. Performance & stability (render.py + main.py + web, 4 items)
+17. Render cache — same doc+version reuses rendered PNGs (no re-render on
+    restore of the same version)
+18. Background prewarm — upload finishes with thumbnail warm-up and missing
+    page fill
+19. Lazy thumbnails — >50-page decks load thumbs via IntersectionObserver
+20. Auto cleanup — uploaded tmp files and >30-day-old version files purged on
+    daily first startup (logged)
+
+### E. AI prompt upgrades (agent.py, 2 items)
+21. Style imitation — system prompt directs the agent to read reference
+    slides, extract font/color/layout patterns and reuse them
+22. Bilingual reporting — `detect_language` switches reply language to English
+    when the user asks in English (default stays Chinese)
+
+- `/api/health` reports version 0.4.0
+- Test suite grew from 311 to 403 cases, all green
+- `garble_fix.py` font mapping logic untouched
+
 ## v0.3.0 — full capability upgrade, 22 items (2026-11-22)
 
 ### A. Editing (edits.py + agent.py)

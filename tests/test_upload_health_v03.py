@@ -50,9 +50,9 @@ def test_upload_oversize_friendly(client, monkeypatch):
     assert "MB" in resp.json()["detail"]
 
 
-def test_health_reports_v030(client):
+def test_health_reports_v040(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["version"] == "0.3.0"
+    assert body["version"] == "0.4.0"
     assert body["ok"] is True

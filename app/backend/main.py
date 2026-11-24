@@ -184,7 +184,7 @@ def _sanitize_detail(text: Any) -> str:
     return clean
 
 
-app = FastAPI(title="PPT Light", version="0.3.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
+app = FastAPI(title="PPT Light", version="0.4.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
 app.add_middleware(GZipMiddleware, minimum_size=1500)
 app.add_middleware(
     CORSMiddleware,
@@ -693,7 +693,7 @@ def health():
     return {
         "ok": True,
         "service": "ppt-light",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "ai_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         "libreoffice": bool(shutil.which("soffice") or shutil.which("libreoffice")),
