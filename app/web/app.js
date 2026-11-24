@@ -11,6 +11,8 @@ const dom = {
   landingUploadBtn: $id("landingUploadBtn"),
   historyBtn: $id("historyBtn"),
   downloadBtn: $id("downloadBtn"),
+  shareBtn: $id("shareBtn"),
+  auditBtn: $id("auditBtn"),
   fileInput: $id("fileInput"),
   dropzone: $id("dropzone"),
   recentSection: $id("recentSection"),
@@ -151,6 +153,21 @@ async function api(url, options = {}, timeout = 180000) {
         data = null;
       }
     }
+    if (response.status === 401 && !options._retriedAuth) {
+      // v0.4 密码保护：一次交互式补密重试（X-Doc-Password），取消则按原样抛错
+      const password = window.prompt("这份文稿已设置密码保护，请输入访问密码：", "");
+      if (password !== null) {
+        return api(
+          url,
+          {
+            ...options,
+            headers: { ...(options.headers || {}), "X-Doc-Password": password },
+            _retriedAuth: true,
+          },
+          timeout
+        );
+      }
+    }
     if (!response.ok) {
       const message = (data && data.detail) || raw || response.statusText || "请求失败";
       const error = new Error(typeof message === "string" ? message : JSON.stringify(message));
@@ -167,6 +184,58 @@ async function api(url, options = {}, timeout = 180000) {
     throw error;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// ---------- v0.4 C：只读分享 / 审计面板 ----------
+
+async function createShareLink() {
+  if (!state.doc) return;
+  try {
+    const share = await api(`/api/docs/${state.doc.doc_id}/share`, { method: "POST" }, 30000);
+    const url = `${location.origin}${share.share_url}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast(`分享链接已复制（只读，可撤销）：\n${url}`);
+    } catch {
+      window.prompt("只读分享链接（可随时撤销）：", url);
+    }
+  } catch (error) {
+    toast(`创建分享失败：${error.message}`, "error");
+  }
+}
+
+function renderAuditPanel(entries) {
+  const overlay = document.createElement("div");
+  overlay.className = "audit-overlay";
+  overlay.innerHTML = `
+    <div class="audit-panel" role="dialog" aria-label="操作审计日志">
+      <header>
+        <strong>操作审计（最近 ${entries.length} 条）</strong>
+        <button class="btn tiny ghost" type="button" data-close>关闭</button>
+      </header>
+      <ul class="audit-list">
+        ${entries.map((entry) => `
+          <li class="${entry.ok ? "" : "is-failed"}">
+            <span class="audit-at">${new Date(entry.at).toLocaleString()}</span>
+            <span class="audit-action">${entry.action}</span>
+            <span class="audit-summary">${(entry.summary || "").replace(/</g, "&lt;")}</span>
+            <span class="audit-meta">${entry.op_count} 项 · ${entry.ok ? "成功" : `失败：${(entry.error || "").replace(/</g, "&lt;")}`}</span>
+          </li>`).join("")}
+      </ul>
+    </div>`;
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay || event.target.closest("[data-close]")) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+}
+
+async function openAuditPanel() {
+  try {
+    const data = await api("/api/audit?limit=50", {}, 30000);
+    renderAuditPanel(data.entries || []);
+  } catch (error) {
+    toast(`读取审计日志失败：${error.message}`, "error");
   }
 }
 
@@ -238,6 +307,8 @@ function showWorkspace() {
   dom.downloadBtn.classList.remove("is-hidden");
   dom.historyBtn.disabled = false;
   dom.downloadBtn.disabled = false;
+  dom.shareBtn.classList.remove("is-hidden");
+  dom.shareBtn.disabled = false;
 }
 
 /* landing + recent documents */
@@ -2155,6 +2226,8 @@ function bindEvents() {
     goHome();
   });
 
+  dom.shareBtn.addEventListener("click", () => createShareLink());
+  dom.auditBtn.addEventListener("click", () => openAuditPanel());
   dom.downloadBtn.addEventListener("click", downloadCurrent);
   dom.historyBtn.addEventListener("click", () => void openHistory());
   dom.sessionLogBtn.addEventListener("click", openSessionLog);
