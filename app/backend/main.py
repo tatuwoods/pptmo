@@ -16,6 +16,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
@@ -1434,6 +1435,17 @@ def _export_base_name(meta: Dict[str, Any]) -> str:
     return name[:80] or "presentation"
 
 
+def _content_disposition(filename: str) -> str:
+    """RFC 5987：头必须 ASCII 安全——filename= 给 ASCII 回退，中文原名走 filename*。"""
+    fallback = "".join(
+        ch if 32 <= ord(ch) < 127 and ch not in '\\"' else "_" for ch in filename
+    ) or "file"
+    return (
+        f'attachment; filename="{fallback}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+
+
 def _current_render_dir(doc_id: str, meta: Dict[str, Any]) -> Path:
     return storage.render_dir(doc_id, int(meta.get("version", 0)))
 
@@ -1663,7 +1675,9 @@ def export_outline(doc_id: str, x_doc_password: Optional[str] = Header(default=N
         content,
         media_type="text/plain; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="{_export_base_name(meta)}-outline.txt"',
+            "Content-Disposition": _content_disposition(
+                f"{_export_base_name(meta)}-outline.txt"
+            ),
             "Cache-Control": "no-store",
         },
     )

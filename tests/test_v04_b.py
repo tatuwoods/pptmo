@@ -179,3 +179,23 @@ def test_compare_rejects_unknown_version(client, uploaded_doc):
     doc_id = uploaded_doc["doc_id"]
     assert client.get(f"/api/docs/{doc_id}/versions/v0/compare/v99").status_code == 404
     assert client.get(f"/api/docs/{doc_id}/versions/v0/compare/junk").status_code == 400
+
+
+def test_export_outline_ascii_header_with_cjk_title(client, uploaded_doc):
+    """中文标题导出 outline：Content-Disposition 必须 ASCII 安全（latin-1 头编码 400 回归）。"""
+    from urllib.parse import unquote
+
+    doc_id = uploaded_doc["doc_id"]
+    assert (
+        client.patch(f"/api/docs/{doc_id}", json={"title": "季度汇报 副本"}).status_code == 200
+    )
+    resp = client.get(f"/api/docs/{doc_id}/export/outline")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/plain")
+    disp = resp.headers.get("content-disposition", "")
+    disp.encode("ascii")  # 头本身必须可 latin-1/ascii 编码
+    # RFC 5987：非 ASCII 文件名走 filename*，且能还原出中文
+    assert "filename*=UTF-8''" in disp
+    encoded = disp.split("filename*=UTF-8''", 1)[1].split(";")[0].strip('"')
+    assert "季度汇报" in unquote(encoded)
+    assert resp.text  # 正文是大纲文本，不为空
