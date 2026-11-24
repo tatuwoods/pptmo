@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import html
+import io
 import json
 import logging
 import os
@@ -14,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -219,6 +223,14 @@ class RestoreIn(BaseModel):
     base_version: Optional[int] = None
 
 
+class PasswordIn(BaseModel):
+    password: Optional[str] = Field(default=None, max_length=100)
+
+
+class UnlockIn(BaseModel):
+    password: str = Field(min_length=1, max_length=100)
+
+
 @app.on_event("startup")
 def _startup_reconcile() -> None:
     """Adopt orphaned version files left by a crash between pptx and meta writes."""
@@ -336,6 +348,13 @@ def _serialize(meta: Dict[str, Any], objects_payload: Dict[str, Any]) -> Dict[st
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         # E21：本版渲染是否降级为旧页图（部分页渲染中）
         "render_partial": bool(objects_payload.get("render_partial")),
+        # v0.4：宏文档只读标记
+        "has_macro": bool(meta.get("has_macro")),
+        "macro_warning": (
+            "含宏的文件已转为只读预览（检测到 vbaProject，防宏病毒）"
+            if meta.get("has_macro") else None
+        ),
+        "password_protected": bool(meta.get("password_hash")),
     }
 
 
@@ -540,6 +559,12 @@ def _finalize_chat(
                     applied_doc["message_count"] = len(messages)
                 except Exception:
                     log.exception("append apply message failed for %s", doc_id)
+                storage.append_audit(
+                    action="chat_apply", doc_id=doc_id,
+                    summary=f"AI 对话改稿 · {len(operations)} 项",
+                    op_count=len(operations), ok=True,
+                    version=applied_doc.get("version_id"),
+                )
                 applied_event = {
                     "version_id": applied_doc.get("version_id"),
                     "version": applied_doc.get("version"),
@@ -658,12 +683,26 @@ def upload_document(file: UploadFile = File(...)):
                 status_code=413,
                 detail=f"对象数超过解析上限（{os.getenv('PARSE_MAX_SHAPES', '5000')} 个），已拒绝",
             )
+        has_macro = False
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                has_macro = any(
+                    name == "ppt/vbaProject.bin" or name.endswith("/vbaProject.bin")
+                    for name in zf.namelist()
+                )
+        except zipfile.BadZipFile:
+            pass
         meta = storage.create_doc(
             file_name=safe_name,
             content=data,
             slide_count=int(parsed["slide_count"]),
             slide_size=parsed["slide_size_emu"],
         )
+        if has_macro:
+            # 宏文档：保留预览/下载，编辑入口由 _assert_editable 拒绝
+            meta["has_macro"] = True
+            storage.save_meta(meta["doc_id"], meta)
+            log.warning("macro detected in %s (%s) — read-only preview", safe_name, meta["doc_id"])
         doc_id = meta["doc_id"]
         storage.save_objects(doc_id, parsed)
         # Wingdings 乱码防护：macOS 无 Wingdings 字体，私用区符号在 LibreOffice
@@ -694,8 +733,9 @@ def upload_document(file: UploadFile = File(...)):
 
 
 @app.get("/api/docs/{doc_id}")
-def get_document(doc_id: str):
+def get_document(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     meta, objects_payload = _load_doc(doc_id)
+    _assert_doc_open(meta, x_doc_password)
     return _serialize(meta, objects_payload)
 
 
@@ -721,11 +761,13 @@ def delete_document(doc_id: str):
 
 
 @app.post("/api/docs/{doc_id}/chat")
-def chat(doc_id: str, body: ChatIn):
+def chat(doc_id: str, body: ChatIn, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     message = body.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="请输入修改要求")
     meta, objects_payload = _load_doc(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    _assert_editable(meta)
     total_slides = int(meta.get("slide_count") or objects_payload.get("slide_count") or 0)
     if total_slides <= 0:
         raise HTTPException(status_code=400, detail="文档没有可编辑页面")
@@ -939,8 +981,27 @@ def chat(doc_id: str, body: ChatIn):
 
 
 @app.post("/api/docs/{doc_id}/apply")
-def apply(doc_id: str, body: ApplyIn):
+def apply(doc_id: str, body: ApplyIn, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     label = (body.label or "编辑").strip()[:80] or "编辑"
+    _assert_doc_open(storage.load_meta(doc_id), x_doc_password)
+    _assert_editable(storage.load_meta(doc_id))
+    try:
+        result = _apply_locked(doc_id, body, label)
+    except Exception as exc:
+        storage.append_audit(
+            action="apply", doc_id=doc_id, summary=label,
+            op_count=len(body.patches), ok=False,
+            error=str(exc)[:200],
+        )
+        raise
+    storage.append_audit(
+        action="apply", doc_id=doc_id, summary=label,
+        op_count=len(body.patches), ok=True, version=result.get("version_id"),
+    )
+    return result
+
+
+def _apply_locked(doc_id: str, body: ApplyIn, label: str):
     # ---- phase 1 (short lock): snapshot the optimistic base ----
     with storage.lock_for(doc_id):
         meta = storage.load_meta(doc_id)
@@ -1089,7 +1150,9 @@ def list_versions(doc_id: str):
 
 
 @app.post("/api/docs/{doc_id}/versions/{version_id}/restore")
-def restore_version(doc_id: str, version_id: str, body: Optional[RestoreIn] = None):
+def restore_version(doc_id: str, version_id: str, body: Optional[RestoreIn] = None, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    _assert_doc_open(storage.load_meta(doc_id), x_doc_password)
+    _assert_editable(storage.load_meta(doc_id))
     if not re.fullmatch(r"v\d+", version_id or ""):
         raise HTTPException(status_code=400, detail="invalid version id")
     # ---- phase 1 (short lock): allocate the version id ----
@@ -1134,6 +1197,10 @@ def restore_version(doc_id: str, version_id: str, body: Optional[RestoreIn] = No
     except edits.PatchConflict:
         _discard_prepared(work_path, render_dir)
         raise
+    storage.append_audit(
+        action="restore", doc_id=doc_id, summary=f"恢复 {version_id}",
+        op_count=1, ok=True, version=result.get("version_id"),
+    )
     return result
 
 
@@ -1226,10 +1293,17 @@ def _perform_undo(doc_id: str, base_version: Optional[int] = None) -> Dict[str, 
 
 
 @app.post("/api/docs/{doc_id}/undo")
-def undo_last(doc_id: str, body: Optional[RestoreIn] = None):
+def undo_last(doc_id: str, body: Optional[RestoreIn] = None, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     """撤销上一轮已应用的修改（v0 无可撤销 → 400；并发版本冲突 → 409）。"""
+    _assert_doc_open(storage.load_meta(doc_id), x_doc_password)
+    _assert_editable(storage.load_meta(doc_id))
     try:
-        return _perform_undo(doc_id, body.base_version if body else None)
+        result = _perform_undo(doc_id, body.base_version if body else None)
+        storage.append_audit(
+            action="undo", doc_id=doc_id, summary=f"撤销 → {result.get('restored_from')}",
+            op_count=1, ok=True, version=result.get("version_id"),
+        )
+        return result
     except edits.PatchConflict as exc:  # PatchConflict 继承 ValueError，必须先接
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1250,8 +1324,9 @@ def _agent_undo(doc_id: str, base_version: Optional[int]) -> Dict[str, Any]:
 
 
 @app.get("/api/docs/{doc_id}/download")
-def download(doc_id: str):
+def download(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
     path = storage.current_path(doc_id)
     if not path.exists():
         raise FileNotFoundError("document file not found")
@@ -1316,8 +1391,9 @@ def _is_degraded(render_dir: Path) -> bool:
 
 
 @app.get("/api/docs/{doc_id}/export/pdf")
-def export_pdf(doc_id: str):
+def export_pdf(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
     render_dir = _current_render_dir(doc_id, meta)
     pdf_path = render_dir / "export.pdf"
     if not pdf_path.exists() or _is_degraded(render_dir):
@@ -1334,8 +1410,9 @@ def export_pdf(doc_id: str):
 
 
 @app.get("/api/docs/{doc_id}/export/images.zip")
-def export_images_zip(doc_id: str):
+def export_images_zip(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
     render_dir = _current_render_dir(doc_id, meta)
     pages = sorted(render_dir.glob("slide-*.png"))
     if not pages or _is_degraded(render_dir):
@@ -1408,8 +1485,9 @@ def _compose_notes_pdf(pptx_path: Path, slides_pdf_path: Path, out_path: Path) -
 
 
 @app.get("/api/docs/{doc_id}/export/pdf-notes")
-def export_pdf_notes(doc_id: str):
+def export_pdf_notes(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
     render_dir = _current_render_dir(doc_id, meta)
     pdf_path = render_dir / "export.pdf"
     if not pdf_path.exists() or _is_degraded(render_dir):
@@ -1494,8 +1572,9 @@ def _outline_lines(meta: Dict[str, Any], pptx_path: Path) -> List[str]:
 
 
 @app.get("/api/docs/{doc_id}/export/outline")
-def export_outline(doc_id: str):
+def export_outline(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
     content = "\n".join(_outline_lines(meta, storage.current_path(doc_id)))
     return Response(
         content,
@@ -1697,6 +1776,242 @@ def compare_versions(doc_id: str, version_a: str, version_b: str):
     }
 
 
+# ---------- v0.4 C：密码保护 / 只读分享 / 宏只读 ----------
+
+def _password_digest(salt: str, password: str) -> str:
+    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+
+
+def _assert_doc_open(meta: Dict[str, Any], x_doc_password: Optional[str]) -> None:
+    """密码保护：未提供正确密码时拒绝访问（X-Doc-Password 头）。"""
+    if not meta.get("password_hash"):
+        return
+    supplied = str(x_doc_password or "")
+    salt = str(meta.get("password_salt") or "")
+    expected = _password_digest(salt, supplied)
+    if not hmac.compare_digest(expected, str(meta.get("password_hash"))):
+        raise HTTPException(
+            status_code=401,
+            detail="文档已设置密码保护：请先用正确的密码解锁（X-Doc-Password 请求头）",
+        )
+
+
+def _assert_editable(meta: Dict[str, Any]) -> None:
+    """宏文档只读：.pptx 内嵌 vbaProject 的文件拒绝一切编辑入口。"""
+    if meta.get("has_macro"):
+        raise HTTPException(
+            status_code=400,
+            detail="含宏的文件已转为只读预览（检测到 vbaProject，防宏病毒），不能编辑",
+        )
+
+
+def _serialize_share(meta: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "token": entry.get("token"),
+        "created_at": entry.get("created_at"),
+        "revoked": bool(entry.get("revoked")),
+        "share_url": f"/share/{entry.get('token')}",
+    }
+
+
+def _find_share(token: str):
+    """token → (doc_id, meta, entry)；已撤销/不存在返回 None。"""
+    token = str(token or "").strip()
+    if not token or not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", token):
+        return None
+    storage.ensure_dirs()
+    for path in storage.DOCS_DIR.iterdir():
+        if not path.is_dir() or not re.fullmatch(r"[a-f0-9]{32}", path.name):
+            continue
+        try:
+            meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for entry in meta.get("shares") or []:
+            if isinstance(entry, dict) and entry.get("token") == token and not entry.get("revoked"):
+                return path.name, meta, entry
+    return None
+
+
+@app.post("/api/docs/{doc_id}/password")
+def set_document_password(doc_id: str, body: PasswordIn, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    with storage.lock_for(doc_id):
+        meta = storage.load_meta(doc_id)
+        _assert_doc_open(meta, x_doc_password)
+        if body.password:
+            salt = uuid.uuid4().hex
+            meta["password_salt"] = salt
+            meta["password_hash"] = _password_digest(salt, body.password)
+            meta["password_set_at"] = storage.now_iso()
+        else:
+            meta.pop("password_hash", None)
+            meta.pop("password_salt", None)
+            meta.pop("password_set_at", None)
+        meta["updated_at"] = storage.now_iso()
+        storage.save_meta(doc_id, meta)
+    return {"ok": True, "locked": bool(body.password)}
+
+
+@app.post("/api/docs/{doc_id}/unlock")
+def unlock_document(doc_id: str, body: UnlockIn):
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, body.password)
+    return {"ok": True}
+
+
+@app.post("/api/docs/{doc_id}/share")
+def create_share(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    with storage.lock_for(doc_id):
+        meta = storage.load_meta(doc_id)
+        _assert_doc_open(meta, x_doc_password)
+        token = uuid.uuid4().hex
+        entry = {"token": token, "created_at": storage.now_iso(), "revoked": False}
+        meta.setdefault("shares", []).append(entry)
+        meta["updated_at"] = storage.now_iso()
+        storage.save_meta(doc_id, meta)
+    return _serialize_share(meta, entry)
+
+
+@app.get("/api/docs/{doc_id}/shares")
+def list_shares(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    return {"shares": [_serialize_share(meta, e) for e in meta.get("shares") or []]}
+
+
+@app.delete("/api/docs/{doc_id}/share/{token}")
+def revoke_share(doc_id: str, token: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    with storage.lock_for(doc_id):
+        meta = storage.load_meta(doc_id)
+        _assert_doc_open(meta, x_doc_password)
+        found = False
+        for entry in meta.get("shares") or []:
+            if entry.get("token") == token:
+                entry["revoked"] = True
+                found = True
+        if not found:
+            raise FileNotFoundError("share token not found")
+        storage.save_meta(doc_id, meta)
+    return {"ok": True, "revoked": token}
+
+
+_SHARE_PAGE = """<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} · 只读分享</title>
+<style>
+body{{margin:0;background:#f1f5f9;font-family:-apple-system,"PingFang SC",sans-serif}}
+header{{padding:14px 20px;background:#0f172a;color:#fff;display:flex;justify-content:space-between;align-items:center}}
+header small{{opacity:.7}}
+main{{max-width:980px;margin:0 auto;padding:20px}}
+img{{width:100%;display:block;margin:0 0 14px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.12);background:#fff}}
+a.dl{{color:#38bdf8}}
+</style></head><body>
+<header><strong>{title}</strong><small>只读分享 · <a class="dl" href="/share/{token}/download">下载 PPTX</a></small></header>
+<main id="pages"><p style="color:#64748b">加载中…</p></main>
+<script>
+fetch('/share/{token}/data').then(function(r){{return r.json()}}).then(function(d){{
+  document.title = d.title + ' · 只读分享';
+  var main = document.getElementById('pages');
+  main.innerHTML = '';
+  d.pages.forEach(function(p){{
+    var img = new Image();
+    img.src = p.thumb;
+    img.alt = '第 ' + p.page + ' 页';
+    img.loading = 'lazy';
+    main.appendChild(img);
+  }});
+}}).catch(function(){{ document.getElementById('pages').innerHTML = '<p>分享内容不可用或已撤销</p>'; }});
+</script></body></html>"""
+
+
+@app.get("/share/{token}")
+def share_page(token: str):
+    found = _find_share(token)
+    if found is None:
+        raise FileNotFoundError("share not found")
+    _doc_id, meta, _entry = found
+    title = html.escape(str(meta.get("title") or "演示文稿"))
+    safe_token = html.escape(token)
+    return Response(
+        _SHARE_PAGE.format(title=title, token=safe_token),
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/share/{token}/data")
+def share_data(token: str):
+    found = _find_share(token)
+    if found is None:
+        raise FileNotFoundError("share not found")
+    doc_id, meta, _entry = found
+    slide_count = int(meta.get("slide_count") or 0)
+    version = int(meta.get("version") or 0)
+    pages = [
+        {
+            "page": index + 1,
+            "image": f"/share/{token}/slides/{index}/image",
+            "thumb": f"/share/{token}/slides/{index}/image?thumb=1",
+        }
+        for index in range(slide_count)
+    ]
+    return {
+        "title": meta.get("title") or "演示文稿",
+        "slide_count": slide_count,
+        "version_id": f"v{version}",
+        "pages": pages,
+        "download_url": f"/share/{token}/download",
+    }
+
+
+@app.get("/share/{token}/slides/{slide_index}/image")
+def share_slide_image(token: str, slide_index: int, thumb: bool = False):
+    found = _find_share(token)
+    if found is None:
+        raise FileNotFoundError("share not found")
+    doc_id, meta, _entry = found
+    if slide_index < 0 or slide_index >= int(meta.get("slide_count", 0)):
+        raise FileNotFoundError("slide not found")
+    version = int(meta.get("version", 0))
+    path = (
+        storage.thumb_path(doc_id, version, slide_index)
+        if thumb
+        else storage.image_path(doc_id, version, slide_index)
+    )
+    if not path.exists():
+        raise FileNotFoundError("image not rendered")
+    return FileResponse(
+        path,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/share/{token}/download")
+def share_download(token: str):
+    found = _find_share(token)
+    if found is None:
+        raise FileNotFoundError("share not found")
+    doc_id, meta, _entry = found
+    path = storage.current_path(doc_id)
+    if not path.exists():
+        raise FileNotFoundError("document file not found")
+    name = meta.get("file_name") or "presentation.pptx"
+    if not name.lower().endswith(".pptx"):
+        name = f"{name}.pptx"
+    return FileResponse(
+        path, media_type=PPTX_MEDIA_TYPE, filename=name,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/audit")
+def get_audit(limit: int = 50, doc_id: Optional[str] = None):
+    entries = storage.recent_audit(limit=limit, doc_id=doc_id)
+    return {"entries": entries, "count": len(entries)}
+
+
 @app.post("/api/docs/{doc_id}/duplicate")
 def duplicate_document(doc_id: str):
     """另存副本：把当前版本复制成一份全新的会话（不带聊天记录/版本历史）。"""
@@ -1751,8 +2066,9 @@ def duplicate_document(doc_id: str):
 
 
 @app.get("/api/docs/{doc_id}/slides/{slide_index}/image")
-def slide_image(doc_id: str, slide_index: int, v: Optional[str] = None, thumb: bool = False):
+def slide_image(doc_id: str, slide_index: int, v: Optional[str] = None, thumb: bool = False, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
     if slide_index < 0 or slide_index >= int(meta.get("slide_count", 0)):
         raise FileNotFoundError("slide not found")
     version = int(meta.get("version", 0))

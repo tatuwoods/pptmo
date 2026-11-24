@@ -8,7 +8,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Optional
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -335,6 +335,100 @@ def reconcile_all() -> int:
         except (OSError, ValueError):
             continue
     return repaired
+
+
+_AUDIT_LOCK = threading.Lock()
+
+
+def audit_path() -> Path:
+    """audit.jsonl lives beside the docs dir so test isolation (remapped
+    DOCS_DIR) keeps test entries out of the production log."""
+    return DOCS_DIR.parent / "audit.jsonl"
+
+
+def append_audit(**entry: Any) -> None:
+    record = {"at": now_iso(), **entry}
+    with _AUDIT_LOCK:
+        ensure_dirs()
+        path = audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            if path.stat().st_size > 20 * 1024 * 1024:  # 简单轮转：保最近 2 万条
+                lines = path.read_text(encoding="utf-8").splitlines()[-20000:]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def recent_audit(limit: int = 50, doc_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    path = audit_path()
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if doc_id and record.get("doc_id") != doc_id:
+            continue
+        out.append(record)
+        if len(out) >= max(1, min(int(limit or 50), 500)):
+            break
+    return out
+
+
+_AUDIT_LOCK = threading.Lock()
+
+
+def audit_path() -> Path:
+    """audit.jsonl lives beside the docs dir so test isolation (remapped
+    DOCS_DIR) keeps test entries out of the production log."""
+    return DOCS_DIR.parent / "audit.jsonl"
+
+
+def append_audit(**entry: Any) -> None:
+    record = {"at": now_iso(), **entry}
+    with _AUDIT_LOCK:
+        ensure_dirs()
+        path = audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            if path.stat().st_size > 20 * 1024 * 1024:  # 简单轮转：保最近 2 万条
+                lines = path.read_text(encoding="utf-8").splitlines()[-20000:]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def recent_audit(limit: int = 50, doc_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    path = audit_path()
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if doc_id and record.get("doc_id") != doc_id:
+            continue
+        out.append(record)
+        if len(out) >= max(1, min(int(limit or 50), 500)):
+            break
+    return out
 
 
 def release_lock(doc_id: str) -> None:
