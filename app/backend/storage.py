@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import threading
+import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Optional
+from typing import Any, Dict, List, Optional
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DOCS_DIR = DATA_DIR / "docs"
 
 _DOC_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_log = logging.getLogger("ppt-light")
+
+VERSION_TTL_DAYS = 30
+TMP_TTL_HOURS = 24
 _locks: Dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
@@ -337,51 +343,74 @@ def reconcile_all() -> int:
     return repaired
 
 
-_AUDIT_LOCK = threading.Lock()
-
-
-def audit_path() -> Path:
-    """audit.jsonl lives beside the docs dir so test isolation (remapped
-    DOCS_DIR) keeps test entries out of the production log."""
-    return DOCS_DIR.parent / "audit.jsonl"
-
-
-def append_audit(**entry: Any) -> None:
-    record = {"at": now_iso(), **entry}
-    with _AUDIT_LOCK:
-        ensure_dirs()
-        path = audit_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        try:
-            if path.stat().st_size > 20 * 1024 * 1024:  # 简单轮转：保最近 2 万条
-                lines = path.read_text(encoding="utf-8").splitlines()[-20000:]
-                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        except OSError:
-            pass
-
-
-def recent_audit(limit: int = 50, doc_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    path = audit_path()
-    if not path.exists():
-        return []
+def _parse_iso(value: Any):
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    out: List[Dict[str, Any]] = []
-    for line in reversed(lines):
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def run_daily_cleanup(force: bool = False) -> int:
+    """每日一次：清理超期 tmp 文件与 30 天前的旧版本（当前版本永不清理）。
+
+    以 DOCS_DIR 同级的 .last-cleanup 日期标记保证每天最多跑一次；
+    force=True 供测试与手动触发。返回清理的文件数。
+    """
+    marker = DOCS_DIR.parent / ".last-cleanup"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not force and marker.exists() and marker.read_text(encoding="utf-8").strip() == today:
+        return 0
+    removed = 0
+    now = time.time()
+    tmp_targets = {DATA_DIR / "tmp", DOCS_DIR.parent / "tmp"}
+    for tmp_dir in tmp_targets:
+        if not tmp_dir.exists():
+            continue
+        for item in tmp_dir.iterdir():
+            try:
+                if item.is_file() and now - item.stat().st_mtime > TMP_TTL_HOURS * 3600:
+                    item.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    cutoff = datetime.now(timezone.utc) - timedelta(days=VERSION_TTL_DAYS)
+    ensure_dirs()
+    for path in DOCS_DIR.iterdir():
+        if not path.is_dir() or not _DOC_ID_RE.fullmatch(path.name):
+            continue
         try:
-            record = json.loads(line)
-        except ValueError:
+            meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        if doc_id and record.get("doc_id") != doc_id:
-            continue
-        out.append(record)
-        if len(out) >= max(1, min(int(limit or 50), 500)):
-            break
-    return out
+        current = int(meta.get("version", 0))
+        kept = []
+        changed = False
+        for entry in meta.get("versions") or []:
+            version_id = str(entry.get("id") or "")
+            match = re.fullmatch(r"v(\d+)", version_id)
+            created = _parse_iso(entry.get("created_at"))
+            if (
+                match
+                and int(match.group(1)) != current
+                and created is not None
+                and created < cutoff
+            ):
+                try:
+                    (versions_dir(path.name) / f"{version_id}.pptx").unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    pass
+                shutil.rmtree(render_dir(path.name, int(match.group(1))), ignore_errors=True)
+                changed = True
+            else:
+                kept.append(entry)
+        if changed:
+            meta["versions"] = kept
+            save_meta(path.name, meta)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(today, encoding="utf-8")
+    _log.info("cleanup: removed %d stale file(s) (tmp >%dh, versions >%dd)", removed, TMP_TTL_HOURS, VERSION_TTL_DAYS)
+    return removed
 
 
 _AUDIT_LOCK = threading.Lock()
