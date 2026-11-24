@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -1363,6 +1363,338 @@ def export_images_zip(doc_id: str):
         headers={"Cache-Control": "no-store"},
         background=BackgroundTask(lambda: tmp_path.unlink(missing_ok=True)),
     )
+
+
+# ---------- v0.4 B：备注版 PDF / TXT 大纲 / 图片导入 / 版本对比 ----------
+
+NOTES_PDF_CJK_FONT = "china-s"  # PyMuPDF 内置简体字体，备注文字可渲染
+
+
+def _compose_notes_pdf(pptx_path: Path, slides_pdf_path: Path, out_path: Path) -> Path:
+    """幻灯片 + 演讲者备注合成讲义 PDF：A4 竖版，上页图下备注。"""
+    import pymupdf
+    from pptx import Presentation as _Presentation
+
+    prs = _Presentation(str(pptx_path))
+    notes = []
+    for slide in prs.slides:
+        text = ""
+        if getattr(slide, "has_notes_slide", False):
+            try:
+                text = str(slide.notes_slide.notes_text_frame.text or "").strip()
+            except Exception:
+                text = ""
+        notes.append(text)
+    src = pymupdf.open(str(slides_pdf_path))
+    out = pymupdf.open()
+    page_w, page_h, margin = 595, 842, 40
+    for index in range(max(src.page_count, len(notes))):
+        page = out.new_page(width=page_w, height=page_h)
+        top = margin
+        if index < src.page_count:
+            rect = src[index].rect
+            scale = min((page_w - margin * 2) / rect.width, (page_h * 0.62) / rect.height)
+            w, h = rect.width * scale, rect.height * scale
+            x0 = (page_w - w) / 2
+            page.show_pdf_page(pymupdf.Rect(x0, top, x0 + w, top + h), src, index)
+            top += h + 16
+        note = notes[index].strip() if index < len(notes) else ""
+        label = f"— 第 {index + 1} 页 · 演讲者备注 —"
+        body = f"{label}\n{note or '（无备注）'}"
+        box = pymupdf.Rect(margin, top + 4, page_w - margin, page_h - margin)
+        page.insert_textbox(box, body, fontname=NOTES_PDF_CJK_FONT, fontsize=10)
+    out.save(str(out_path), garbage=3, deflate=True)
+    return out_path
+
+
+@app.get("/api/docs/{doc_id}/export/pdf-notes")
+def export_pdf_notes(doc_id: str):
+    meta = storage.load_meta(doc_id)
+    render_dir = _current_render_dir(doc_id, meta)
+    pdf_path = render_dir / "export.pdf"
+    if not pdf_path.exists() or _is_degraded(render_dir):
+        render_dir = _regenerate_render(doc_id, meta)
+        pdf_path = render_dir / "export.pdf"
+    if not pdf_path.exists():
+        raise FileNotFoundError("PDF 尚未生成（渲染未产出 PDF），请稍后重试或先重新渲染")
+    tmp_dir = storage.DATA_DIR / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"pdf-notes-{uuid.uuid4().hex}.pdf"
+    try:
+        _compose_notes_pdf(storage.current_path(doc_id), pdf_path, tmp_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        tmp_path,
+        media_type="application/pdf",
+        filename=f"{_export_base_name(meta)}-notes.pdf",
+        headers={"Cache-Control": "no-store"},
+        background=BackgroundTask(lambda: tmp_path.unlink(missing_ok=True)),
+    )
+
+
+def _outline_lines(meta: Dict[str, Any], pptx_path: Path) -> List[str]:
+    """全稿文字大纲：页标题/正文/表格行/备注，贴飞书或文档用。"""
+    from pptx import Presentation as _Presentation
+
+    prs = _Presentation(str(pptx_path))
+    title = str(
+        meta.get("title")
+        or Path(str(meta.get("file_name") or "presentation.pptx")).stem
+    )
+    lines = [f"# {title}", ""]
+
+    def walk(shapes):
+        for shape in shapes:
+            if getattr(shape, "shape_type", None) == 6:
+                try:
+                    walk(shape.shapes)
+                except Exception:
+                    pass
+                continue
+            if getattr(shape, "has_table", False):
+                try:
+                    row_texts = []
+                    for row in shape.table.rows:
+                        cells = [str(cell.text or "").strip() for cell in row.cells]
+                        if any(cells):
+                            row_texts.append(" | ".join(cells))
+                    if row_texts:
+                        lines.append("")
+                        lines.extend(f"  {row}" for row in row_texts)
+                        lines.append("")
+                except Exception:
+                    pass
+                continue
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            try:
+                text = str(shape.text or "").strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            for line in text.split("\n"):
+                if line.strip():
+                    lines.append(f"- {line.strip()}")
+
+    for index, slide in enumerate(prs.slides, start=1):
+        lines.append(f"## 第 {index} 页")
+        walk(slide.shapes)
+        if getattr(slide, "has_notes_slide", False):
+            try:
+                note = str(slide.notes_slide.notes_text_frame.text or "").strip()
+            except Exception:
+                note = ""
+            if note:
+                lines.append(f"  > 备注：{note}")
+        lines.append("")
+    return lines
+
+
+@app.get("/api/docs/{doc_id}/export/outline")
+def export_outline(doc_id: str):
+    meta = storage.load_meta(doc_id)
+    content = "\n".join(_outline_lines(meta, storage.current_path(doc_id)))
+    return Response(
+        content,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{_export_base_name(meta)}-outline.txt"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+_IMPORT_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
+IMPORT_IMAGES_MAX = 60
+IMPORT_IMAGE_MAX_BYTES = 30 * 1024 * 1024
+
+
+@app.post("/api/docs/import-images")
+def import_images(files: Optional[List[UploadFile]] = File(None)):
+    """多张图片（扫描件/截图）每张一页生成 PPTX，图片满宽居中。"""
+    if not files:
+        raise HTTPException(status_code=400, detail="请至少上传 1 张图片（png/jpg）")
+    if len(files) > IMPORT_IMAGES_MAX:
+        raise HTTPException(
+            status_code=400, detail=f"单次最多 {IMPORT_IMAGES_MAX} 张图片，请分批导入"
+        )
+    images: List[bytes] = []
+    first_stem = ""
+    total = 0
+    for upload in files:
+        original = Path(upload.filename or "image.png").name
+        stem = re.sub(r"[\x00-\x1f]", "", original).strip()
+        if not first_stem:
+            first_stem = Path(stem or "image").stem
+        data = upload.file.read(IMPORT_IMAGE_MAX_BYTES + 1)
+        if len(data) > IMPORT_IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail=f"{original} 超过 30 MB 限制")
+        if not data or not any(data.startswith(magic) for magic in _IMPORT_IMAGE_MAGIC):
+            raise HTTPException(
+                status_code=400, detail=f"{original} 不是有效的 png/jpg 图片"
+            )
+        total += len(data)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"图片总量超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 限制",
+            )
+        images.append(data)
+    import io
+
+    from pptx import Presentation as _Presentation
+    from pptx.util import Emu as _Emu
+
+    prs = _Presentation()
+    blank = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+    slide_w, slide_h = int(prs.slide_width), int(prs.slide_height)
+    for data in images:
+        slide = prs.slides.add_slide(blank)
+        picture = slide.shapes.add_picture(io.BytesIO(data), _Emu(0), _Emu(0), width=_Emu(slide_w))
+        picture.top = _Emu(max(0, (slide_h - int(picture.height)) // 2))
+    file_name = f"{(first_stem or '图片集')[:60]}-imported.pptx"
+    storage.ensure_dirs()
+    tmp_dir = storage.DATA_DIR / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"{uuid.uuid4().hex}.pptx"
+    prs.save(str(tmp_path))
+    doc_id: Optional[str] = None
+    try:
+        try:
+            _, parsed = parse.parse_pptx(tmp_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"生成的 PPTX 无法解析：{exc}") from exc
+        meta = storage.create_doc(
+            file_name=file_name,
+            content=tmp_path.read_bytes(),
+            slide_count=int(parsed["slide_count"]),
+            slide_size=parsed["slide_size_emu"],
+        )
+        doc_id = meta["doc_id"]
+        storage.save_objects(doc_id, parsed)
+        render.render_pptx(
+            storage.current_path(doc_id),
+            storage.render_dir(doc_id, 0),
+            scale=RENDER_SCALE,
+        )
+        return _serialize(meta, parsed)
+    except Exception:
+        if doc_id:
+            shutil.rmtree(storage.doc_dir(doc_id), ignore_errors=True)
+            storage.release_lock(doc_id)
+        raise
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _version_number(raw: str) -> Optional[int]:
+    text = str(raw or "").strip().lower()
+    if re.fullmatch(r"v\d+", text):
+        return int(text[1:])
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    return None
+
+
+def _page_text_lists(payload: Dict[str, Any]) -> List[List[str]]:
+    count = int(payload.get("slide_count") or 0)
+    pages: List[List[str]] = [[] for _ in range(count)]
+    for obj in payload.get("objects", []):
+        try:
+            index = int(obj.get("slide_index"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < count:
+            text = str(obj.get("text") or "").strip()
+            if text:
+                pages[index].append(text)
+    return pages
+
+
+@app.get("/api/docs/{doc_id}/versions/{version_a}/compare/{version_b}")
+def compare_versions(doc_id: str, version_a: str, version_b: str):
+    """两版本文字差异摘要：新增/删除/改动的页码与内容要点（按页位对齐）。"""
+    meta = storage.load_meta(doc_id)
+    a_num, b_num = _version_number(version_a), _version_number(version_b)
+    if a_num is None or b_num is None:
+        raise HTTPException(status_code=400, detail="版本号格式无效（应为 v0 / 0）")
+    a_id, b_id = f"v{a_num}", f"v{b_num}"
+    path_a = storage.version_file(doc_id, a_id)  # 缺失 → 404
+    path_b = storage.version_file(doc_id, b_id)
+    _objs_a, payload_a = parse.parse_pptx(path_a)
+    _objs_b, payload_b = parse.parse_pptx(path_b)
+    pages_a = _page_text_lists(payload_a)
+    pages_b = _page_text_lists(payload_b)
+
+    def _titles(payload):
+        by_slide: Dict[int, list] = {}
+        for obj in payload.get("objects", []):
+            try:
+                by_slide.setdefault(int(obj.get("slide_index")), []).append(obj)
+            except (TypeError, ValueError):
+                continue
+        return [
+            agent._slide_title(by_slide.get(index, []))
+            for index in range(int(payload.get("slide_count") or 0))
+        ]
+
+    titles_a, titles_b = _titles(payload_a), _titles(payload_b)
+    shared = min(len(pages_a), len(pages_b))
+    changed, added, removed = [], [], []
+    unchanged = 0
+    for index in range(shared):
+        set_a = {edits.normalize_text(t) for t in pages_a[index]}
+        set_b = {edits.normalize_text(t) for t in pages_b[index]}
+        if set_a == set_b:
+            unchanged += 1
+            continue
+        additions = [t[:80] for t in pages_b[index] if edits.normalize_text(t) not in set_a][:6]
+        deletions = [t[:80] for t in pages_a[index] if edits.normalize_text(t) not in set_b][:6]
+        changed.append(
+            {
+                "page": index + 1,
+                "title": titles_b[index] if index < len(titles_b) else "",
+                "additions": additions,
+                "deletions": deletions,
+            }
+        )
+    for index in range(shared, len(pages_b)):
+        added.append(
+            {
+                "page": index + 1,
+                "title": titles_b[index] if index < len(titles_b) else "",
+                "points": [t[:80] for t in pages_b[index][:6]],
+            }
+        )
+    for index in range(shared, len(pages_a)):
+        removed.append(
+            {
+                "page": index + 1,
+                "title": titles_a[index] if index < len(titles_a) else "",
+                "points": [t[:80] for t in pages_a[index][:6]],
+            }
+        )
+    diff_pages = len(changed) + len(added) + len(removed)
+    return {
+        "a": a_id,
+        "b": b_id,
+        "pages_a": len(pages_a),
+        "pages_b": len(pages_b),
+        "changed": changed,
+        "added": added,
+        "removed": removed,
+        "unchanged_pages": unchanged,
+        "summary": (
+            f"共 {diff_pages} 页存在差异：改动 {len(changed)} 页、"
+            f"新增 {len(added)} 页、删除 {len(removed)} 页"
+        ),
+    }
 
 
 @app.post("/api/docs/{doc_id}/duplicate")
