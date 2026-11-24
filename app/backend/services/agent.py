@@ -2129,6 +2129,31 @@ def _trim_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return head + trimmed
 
 
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_EN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def detect_language(text: str) -> str:
+    """E22：判断用户指令语言。出现中文即 zh；英文单词 ≥2 个才切 en；默认 zh。"""
+    text = str(text or "")
+    if _CJK_RE.search(text):
+        return "zh"
+    words = [w for w in _EN_WORD_RE.findall(text) if w.lower() != "ppt"]
+    if len(words) >= 2:
+        return "en"
+    return "zh"
+
+
+LANGUAGE_DIRECTIVES = {
+    "zh": "回复语言：默认使用简体中文——thought/summary/reply、plan 步骤与操作 description 一律中文；幻灯片内容语言遵循文稿本身或用户要求。",
+    "en": (
+        "Reply language: the user asked in English — write thought/summary/reply, "
+        "plan steps and operation descriptions in English this turn; "
+        "slide content language follows the deck itself or the user's request."
+    ),
+}
+
+
 SYSTEM_PROMPT = (
     "你是一个 AI 主导的 PPT 精准编辑 Agent。你不能直接修改文件，只能调用工具读取内容并提交操作；"
     "操作由系统在用户确认后应用（调用方也可以按配置自动应用）。\n\n"
@@ -2225,6 +2250,9 @@ SYSTEM_PROMPT = (
     "- 保持原意与事实，不编造数据、案例、人名、机构或结论；保留数字、单位、专有名词、英文缩写。\n"
     "- 保持版式：默认只改文字；只有用户明确要求时才改字体、字号、颜色、位置或尺寸。"
     "新增文本框必须给精确 EMU 坐标。\n"
+    "- 风格模仿：当用户给出参考页（如「照第 3 页的风格」「和封面保持一致」）时，"
+    "先 read_slides/inspect_shapes 读取参考页，分析其字体、字号、配色、对齐与版式规律，"
+    "再在新页或目标页中复用这些规律（新增文本框沿用参考页的字体与颜色），不要凭空发明风格。\n"
     "- 未经明确点名，不要修改 logo、页码、页脚、页眉、版权、日期。\n"
     "- before 可省略，系统会用真实原文校验；若填写必须与原文一致。after 为空表示清空，"
     "系统会按 clear 处理。\n"
@@ -2389,11 +2417,12 @@ def run_stream(
         undo_callback = undo_handler
 
     today = datetime.now().astimezone().strftime("%Y年%m月%d日")
+    language = detect_language(instruction)  # E22：默认中文，英文提问切英文
     conversation: List[Dict[str, str]] = [
         {
             "role": "system",
             "content": (
-                f"{SYSTEM_PROMPT}\n\n当前日期：{today}。"
+                f"{SYSTEM_PROMPT}\n\n{LANGUAGE_DIRECTIVES[language]}\n\n当前日期：{today}。"
                 "用户说“今天/明天/本月”等相对日期时，以该日期为准换算成具体日期。"
             ),
         },

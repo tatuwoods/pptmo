@@ -461,11 +461,43 @@ function updateStatus() {
   );
 }
 
+// v0.4 D19：大文档（>50 页）缩略图懒加载——进入视口才装入真实图片地址
+const LAZY_THUMB_THRESHOLD = 50;
+let thumbObserver = null;
+
+function ensureThumbObserver() {
+  if (thumbObserver || !("IntersectionObserver" in window)) return thumbObserver;
+  thumbObserver = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        const img = entry.target;
+        thumbObserver.unobserve(img);
+        const url = img.dataset.url;
+        if (url && !img.dataset.loaded) {
+          img.dataset.loaded = "1";
+          img.src = url;
+        }
+      });
+    },
+    { root: dom.thumbs, rootMargin: "400px" }
+  );
+  return thumbObserver;
+}
+
+function loadThumbNow(img) {
+  if (!img.dataset.loaded) {
+    img.dataset.loaded = "1";
+    if (img.dataset.url) img.src = img.dataset.url;
+  }
+}
+
 function renderThumbs() {
   if (!state.doc) {
     dom.thumbs.innerHTML = "";
     return;
   }
+  const lazy = state.doc.slide_count > LAZY_THUMB_THRESHOLD;
   const existing = dom.thumbs.querySelectorAll(".thumb");
   if (existing.length === state.doc.slide_count) {
     // same deck shape: patch image sources only — rebuilding the DOM would
@@ -476,8 +508,8 @@ function renderThumbs() {
       if (!img) return;
       const url = imageUrl(index, { thumb: true });
       if (img.dataset.url !== url) {
-        img.src = url;
         img.dataset.url = url;
+        if (img.dataset.loaded) img.src = url; // 懒加载未触达的页等进入视口再取
       }
     });
     return;
@@ -485,13 +517,23 @@ function renderThumbs() {
   const parts = [];
   for (let index = 0; index < state.doc.slide_count; index += 1) {
     const url = imageUrl(index, { thumb: true });
+    const imgAttrs = lazy
+      ? `loading="lazy" data-url="${url}"`
+      : `loading="lazy" src="${url}" data-url="${url}" data-loaded="1"`;
     parts.push(`
       <button class="thumb" type="button" data-slide="${index}" aria-label="第 ${index + 1} 页">
-        <span class="thumb-frame"><img loading="lazy" src="${url}" data-url="${url}" alt=""></span>
+        <span class="thumb-frame"><img ${imgAttrs} alt=""></span>
         <span class="thumb-num">${index + 1}</span>
       </button>`);
   }
   dom.thumbs.innerHTML = parts.join("");
+  if (lazy) {
+    const observer = ensureThumbObserver();
+    dom.thumbs.querySelectorAll(".thumb-frame img").forEach((img) => {
+      if (observer) observer.observe(img);
+      else loadThumbNow(img); // 环境不支持 IntersectionObserver：直接加载
+    });
+  }
   dom.thumbs.querySelectorAll(".thumb").forEach((button) => {
     button.addEventListener("click", () => {
       // 画布切页 + 对话范围联动：点缩略图后「当前页」即该页
