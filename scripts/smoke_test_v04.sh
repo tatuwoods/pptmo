@@ -9,6 +9,9 @@ DEMO="$HERE/app/samples/demo.pptx"
 PY="$HERE/app/backend/.venv/bin/python"
 [[ -x "$PY" ]] || PY=python3
 
+# 每次运行独占临时目录：固定 /tmp 路径会让两个并发冒烟互相删文件（outline/compare 误报）
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/pptmo-v04.XXXXXX")"
+
 pass=0; fail=0
 ok()   { pass=$((pass+1)); echo "  ✓ $1"; }
 bad()  { fail=$((fail+1)); echo "  ✗ $1"; }
@@ -24,7 +27,7 @@ check "health version" "$ver" "0.4.0"
 doc=$(curl -sf --max-time 300 -X POST "$BASE/api/docs/upload" -F "file=@$DEMO")
 doc_id=$(echo "$doc" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["doc_id"])' 2>/dev/null)
 [[ -n "${doc_id:-}" ]] && ok "upload $doc_id" || { bad "upload failed"; exit 1; }
-cleanup(){ curl -s -o /dev/null -X DELETE "$BASE/api/docs/$doc_id"; }
+cleanup(){ curl -s -o /dev/null -X DELETE "$BASE/api/docs/$doc_id" 2>/dev/null; rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
 target=$(echo "$doc" | "$PY" -c '
@@ -64,12 +67,11 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/share/$token")
 [[ "$code" == "404" || "$code" == "410" ]] && ok "revoked share gone ($code)" || bad "revoked share still $code"
 
 # 4. outline 导出：text/plain、含改后标题、Content-Disposition
-hdr=$(curl -sD - -o /tmp/pptmo-v04-outline.txt --max-time 30 "$BASE/api/docs/$doc_id/export/outline")
+hdr=$(curl -sD - -o "$SCRATCH/outline.txt" --max-time 30 "$BASE/api/docs/$doc_id/export/outline")
 grep -qi "content-type: text/plain" <<<"$hdr" && ok "outline content-type text/plain" || bad "outline content-type wrong"
 grep -q "outline.txt" <<<"$hdr" && ok "outline filename header" || bad "outline filename header missing"
-grep -q "冒烟测试标题" /tmp/pptmo-v04-outline.txt && ok "outline contains edited title" || bad "outline missing edited title"
-head -1 /tmp/pptmo-v04-outline.txt | grep -q "^# " && ok "outline starts with # title" || bad "outline heading malformed"
-rm -f /tmp/pptmo-v04-outline.txt
+grep -q "冒烟测试标题" "$SCRATCH/outline.txt" && ok "outline contains edited title" || bad "outline missing edited title"
+head -1 "$SCRATCH/outline.txt" | grep -q "^# " && ok "outline starts with # title" || bad "outline heading malformed"
 
 # 5. compare：v0 vs v1 返回 diff JSON
 diff=$(curl -sf --max-time 30 "$BASE/api/docs/$doc_id/versions/v0/compare/v1")
@@ -82,9 +84,8 @@ assert p["page"]==1, "first change on page %s" % p["page"]
 flat=" ".join(p["additions"])
 assert "冒烟测试标题" in flat, "edited title not in additions: %s" % flat
 assert any("演示文稿标题" in x for x in p["deletions"]), "original title not in deletions"
-print(d["summary"])' >/tmp/pptmo-v04-diff.out 2>/tmp/pptmo-v04-diff.err \
-  && ok "compare diff: $(cat /tmp/pptmo-v04-diff.out)" || bad "compare diff wrong: $(cat /tmp/pptmo-v04-diff.err)"
-rm -f /tmp/pptmo-v04-diff.out /tmp/pptmo-v04-diff.err
+print(d["summary"])' >"$SCRATCH/diff.out" 2>"$SCRATCH/diff.err" \
+  && ok "compare diff: $(cat "$SCRATCH/diff.out")" || bad "compare diff wrong: $(cat "$SCRATCH/diff.err")"
 
 # 6. undo 仍工作：回到 v0 内容，版本前进到 v2
 undo=$(curl -sf --max-time 300 -X POST "$BASE/api/docs/$doc_id/undo" -H 'Content-Type: application/json' -d '{"base_version":1}')
@@ -92,11 +93,10 @@ echo "$undo" | "$PY" -c '
 import json,sys
 d=json.load(sys.stdin)
 assert d.get("restored_from")=="v0", d
-print(d.get("version_id"))' >/tmp/pptmo-v04-undo.out 2>/tmp/pptmo-v04-undo.err \
-  && ok "undo restored v0 -> $(cat /tmp/pptmo-v04-undo.out)" || bad "undo failed: $(cat /tmp/pptmo-v04-undo.err)"
+print(d.get("version_id"))' >"$SCRATCH/undo.out" 2>"$SCRATCH/undo.err" \
+  && ok "undo restored v0 -> $(cat "$SCRATCH/undo.out")" || bad "undo failed: $(cat "$SCRATCH/undo.err")"
 curl -sf --max-time 30 "$BASE/api/docs/$doc_id/export/outline" | grep -q "演示文稿标题" \
   && ok "outline after undo has original title" || bad "undo did not restore original title"
-rm -f /tmp/pptmo-v04-undo.out /tmp/pptmo-v04-undo.err
 
 # 7. audit 记录了 apply / undo
 curl -sf --max-time 10 "$BASE/api/audit" | "$PY" -c '
