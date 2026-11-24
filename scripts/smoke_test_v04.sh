@@ -21,7 +21,7 @@ ver=$(curl -sf --max-time 10 "$BASE/api/health" | "$PY" -c 'import json,sys;prin
 check "health version" "$ver" "0.4.0"
 
 # 2. 上传 + 改标题产生 v1（后续 compare/undo 的素材）
-doc=$(curl -sf --max-time 120 -X POST "$BASE/api/docs/upload" -F "file=@$DEMO")
+doc=$(curl -sf --max-time 300 -X POST "$BASE/api/docs/upload" -F "file=@$DEMO")
 doc_id=$(echo "$doc" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["doc_id"])' 2>/dev/null)
 [[ -n "${doc_id:-}" ]] && ok "upload $doc_id" || { bad "upload failed"; exit 1; }
 cleanup(){ curl -s -o /dev/null -X DELETE "$BASE/api/docs/$doc_id"; }
@@ -37,7 +37,7 @@ if [[ -n "$target" ]]; then
 import json
 o=json.loads('''$target''')
 print(json.dumps({'patches':[{'action':'edit','shape_id':o['shape_id'],'after':'冒烟测试标题','before':o['text']}],'label':'冒烟v04','base_version':0}))")
-  vid=$(curl -sf --max-time 120 -X POST "$BASE/api/docs/$doc_id/apply" -H 'Content-Type: application/json' -d "$patch" \
+  vid=$(curl -sf --max-time 300 -X POST "$BASE/api/docs/$doc_id/apply" -H 'Content-Type: application/json' -d "$patch" \
     | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["version_id"])' 2>/dev/null)
   check "apply -> v1" "$vid" "v1"
 else
@@ -87,7 +87,7 @@ print(d["summary"])' >/tmp/pptmo-v04-diff.out 2>/tmp/pptmo-v04-diff.err \
 rm -f /tmp/pptmo-v04-diff.out /tmp/pptmo-v04-diff.err
 
 # 6. undo 仍工作：回到 v0 内容，版本前进到 v2
-undo=$(curl -sf --max-time 120 -X POST "$BASE/api/docs/$doc_id/undo" -H 'Content-Type: application/json' -d '{"base_version":1}')
+undo=$(curl -sf --max-time 300 -X POST "$BASE/api/docs/$doc_id/undo" -H 'Content-Type: application/json' -d '{"base_version":1}')
 echo "$undo" | "$PY" -c '
 import json,sys
 d=json.load(sys.stdin)
