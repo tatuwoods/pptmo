@@ -90,6 +90,10 @@ spPr = acc._element.spPr
 fill = etree.SubElement(spPr, qn("a:solidFill"))
 scheme = etree.SubElement(fill, qn("a:schemeClr"))
 scheme.set("val", "accent1")
+# 第 2、3 页：后续 merge/hide/PDF 页数断言都按 3 页主文档设计
+for i in (2, 3):
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    add_text(s, f"冒烟第{i}页")
 prs.save(f"{scratch}/main.pptx")
 
 src = new_deck()
