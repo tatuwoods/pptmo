@@ -108,6 +108,11 @@ ACTION_ALIASES = {
     "undo_last": "undo_last",
     "undo": "undo_last",
     "revert_last": "undo_last",
+    # v0.6：渲染验证闭环（多模态自检）
+    "vision_check": "vision_check",
+    "render_check": "vision_check",
+    "look": "vision_check",
+    "self_check": "vision_check",
     # v0.5：重主题 / 调色 / 切换动画 / 隐藏页 / 元数据 / 替代文本 / 自修
     "theme_rebrand": "theme_rebrand",
     "set_theme": "theme_rebrand",
@@ -176,6 +181,7 @@ TOOL_NAMES = {
     "propose_operations",
     "plan",
     "undo_last",
+    "vision_check",
     "finish",
 }
 
@@ -2269,7 +2275,10 @@ SYSTEM_PROMPT = (
     "撤销结果以 Observation 返回，不要重复撤销。\n"
     '9. read_notes {"slide_indices":[0,2]}：读取演讲者备注（不传则读当前范围前 8 页）；'
     "用户要“给每页生成备注”时，先通读全稿再逐页 edit_notes 写简短讲稿要点。\n"
-    '10. finish {"summary":"...","reply":"给用户的回复","question":"可选反问"}：结束。\n\n'
+    '10. vision_check {"slides":[0,1]}：视觉自检——把当前版本渲染图交给多模态模型检查'
+    "（文字溢出/乱码豆腐块/布局塌陷/对比度过低），返回结构化 issues；"
+    "改完版式或字号后建议自检一次，发现问题就提交修复操作再复查；不传 slides 默认查当前范围（最多 6 页）。\n"
+    '11. finish {"summary":"...","reply":"给用户的回复","question":"可选反问"}：结束。\n\n'
     "操作 schema：\n"
     '- edit：{"action":"edit","shape_id":"...","after":"新文本","before":"可选原文",'
     '"description":"...","style":{"font_size_pt":18,"font_name":"微软雅黑","bold":true,'
@@ -2460,6 +2469,7 @@ def run_stream(
     auto_apply: bool = False,
     undo_last: Optional[Callable[[Optional[int]], Dict[str, Any]]] = None,
     undo_handler: Optional[Callable[[], Dict[str, Any]]] = None,
+    vision_check: Optional[Callable[[Optional[List[int]]], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run the streaming AI-led tool loop and return the done payload.
 
@@ -2518,6 +2528,8 @@ def run_stream(
         undo_callback = lambda: undo_last(base_version)  # noqa: E731
     elif undo_handler is not None:
         undo_callback = undo_handler
+    # v0.6 #1：vision_check 工具的后端回调（读当前版本渲染 PNG 喂多模态模型）
+    vision_callback = vision_check
 
     today = datetime.now().astimezone().strftime("%Y年%m月%d日")
     language = detect_language(instruction)  # E22：默认中文，英文提问切英文
@@ -2723,6 +2735,46 @@ def run_stream(
             observation = "Observation:\n" + json.dumps(detail, ensure_ascii=False)
             if detail.get("error"):
                 observation += "\n撤销未执行；请向用户说明原因，不要重复尝试。"
+            conversation.append({"role": "user", "content": observation})
+            continue
+
+        if action == "vision_check":
+            # v0.6 #1：渲染验证闭环——把当前版本渲染 PNG 交给多模态模型「看」，
+            # 发现溢出/乱码/塌版后由模型决定是否再提交修复操作
+            if vision_callback is None:
+                detail = {"error": "视觉自检不可用（未接入渲染图或多模态模型）"}
+            else:
+                try:
+                    detail = vision_callback(args.get("slides")) or {}
+                except Exception as exc:  # noqa: BLE001 — handler errors become tool errors
+                    detail = {"error": str(exc) or "视觉自检失败"}
+            _safe_emit(
+                emit,
+                "tool_result",
+                {
+                    "step": step,
+                    "action": "vision_check",
+                    "tool": "vision_check",
+                    "detail": _trace_detail("vision_check", args, detail),
+                    "result": detail,
+                },
+            )
+            trace.append(
+                {
+                    "step": step,
+                    "thought": thought,
+                    "action": "vision_check",
+                    "detail": _trace_detail("vision_check", args, detail),
+                }
+            )
+            observation = "Observation:\n" + json.dumps(detail, ensure_ascii=False)
+            if detail.get("error"):
+                observation += "\n视觉自检未执行；请向用户说明原因，不要重复尝试。"
+            else:
+                observation += (
+                    "\n发现问题请提交修复操作（fix_issues/edit/style 等），"
+                    "修复后可再次 vision_check 复查；没有问题就继续任务或 finish。"
+                )
             conversation.append({"role": "user", "content": observation})
             continue
 
