@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -2157,6 +2157,89 @@ def duplicate_document(doc_id: str):
         if isinstance(exc, (render.RenderError, render.RenderBusy)):
             raise
         raise HTTPException(status_code=500, detail=_sanitize_detail(exc) or "复制失败") from exc
+
+
+# ---------- v0.5 #3：merge 从另一 deck 拉页 ----------
+
+@app.post("/api/docs/{doc_id}/merge")
+def merge_document(
+    doc_id: str,
+    file: UploadFile = File(...),
+    pages: str = Form(""),
+    position: Optional[int] = Form(None),
+    base_version: Optional[int] = Form(None),
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
+    """上传另一 PPTX，把指定页拉进当前文档（rels 全量重新家园化），生成新版本。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    _assert_editable(meta)
+    original = Path(file.filename or "merge-source.pptx").name
+    if not original.lower().endswith(".pptx"):
+        raise HTTPException(status_code=400, detail="合并源只支持 .pptx 文件")
+    data = file.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"合并源超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 限制")
+    if len(data) < 100:
+        raise HTTPException(status_code=400, detail="合并源文件过小或已损坏")
+    tmp_dir = storage.DATA_DIR / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    src_tmp = tmp_dir / f"merge-src-{uuid.uuid4().hex}.pptx"
+    work_path = storage.doc_dir(doc_id) / f"work-{uuid.uuid4().hex}.pptx"
+    render_dir: Optional[Path] = None
+    try:
+        src_tmp.write_bytes(data)
+        # ---- phase 1 (short lock): 校验 + 分配版本号 ----
+        with storage.lock_for(doc_id):
+            meta = storage.load_meta(doc_id)
+            if base_version is not None and int(base_version) != int(meta.get("version", 0)):
+                raise edits.PatchConflict("文档已经更新，请刷新后再合并")
+            entry_version = int(meta.get("version", 0))
+            new_version, _ = storage.next_version_id(meta)
+        # ---- phase 2 (no lock): 跨包克隆 + 渲染 + 解析 ----
+        merged, touched = edits.merge_slides_from_file(
+            storage.current_path(doc_id), src_tmp, work_path, pages, position
+        )
+        render_dir, objects_payload, page_count = _prepare_commit(doc_id, work_path, new_version)
+        # ---- phase 3 (short lock): 提交 ----
+        try:
+            with storage.lock_for(doc_id):
+                committed, objects_payload = _commit_prepared_locked(
+                    doc_id, new_version, f"合并 {merged} 页", work_path, render_dir,
+                    objects_payload, page_count, expected_version=entry_version,
+                )
+                result = _commit_result(committed, objects_payload, sorted(touched))
+                result["merged_slides"] = merged
+                message = {
+                    "id": uuid.uuid4().hex[:12],
+                    "role": "system",
+                    "content": f"从「{original}」合并 {merged} 页 · 保存为 {result['version_id']}",
+                    "at": storage.now_iso(),
+                    "kind": "merge",
+                    "version": result["version_id"],
+                }
+                result["messages"] = storage.append_messages(doc_id, [message])
+                result["message_count"] = len(result["messages"])
+        except edits.PatchConflict:
+            _discard_prepared(work_path, render_dir)
+            raise
+    except edits.PatchError as exc:
+        _discard_prepared(work_path, render_dir)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _discard_prepared(work_path, render_dir)
+        raise
+    finally:
+        try:
+            src_tmp.unlink()
+        except OSError:
+            pass
+    storage.append_audit(
+        action="merge", doc_id=doc_id, summary=f"合并 {merged} 页（{original}）",
+        op_count=merged, ok=True, version=result.get("version_id"),
+    )
+    log.info("merged %d slides into %s -> v%d", merged, doc_id, new_version)
+    return result
 
 
 @app.get("/api/docs/{doc_id}/slides/{slide_index}/image")

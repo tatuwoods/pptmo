@@ -2895,6 +2895,152 @@ def _op_recolor(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     return touched
 
 
+# ---------- v0.5 #3: merge 从另一 deck 拉页（跨包克隆） ----------
+# 源与目标属于不同 OPC 包：slide XML 深拷贝之外，版式/母版/主题/图片/图表等
+# 关系目标按源 part 树递归复制进目标包（partname 挪到空闲槽位），rId 重映射。
+
+_PARTNAME_PREFIX_RE = re.compile(r"^[^\d]+")
+
+
+def _next_partname(taken: Set[str], directory: str, prefix: str, ext: str) -> PackURI:
+    index = 1
+    while f"{directory}/{prefix}{index}{ext}" in taken:
+        index += 1
+    name = f"{directory}/{prefix}{index}{ext}"
+    taken.add(name)
+    return PackURI(name)
+
+
+def _copy_part_tree(src_part, dst_package, cache: Dict[str, Any], taken: Set[str]):
+    """把另一个包里的 part（含其关系闭包）复制到目标包；同一次合并内按源
+    partname 去重（多页共享同一版式/图片时只复制一份）。"""
+    key = str(src_part.partname)
+    if key in cache:
+        return cache[key]
+    from pptx.opc.package import Part as _OpcPart
+
+    name = str(src_part.partname)
+    directory, filename = name.rsplit("/", 1)
+    stem, dot, ext = filename.rpartition(".")
+    match = _PARTNAME_PREFIX_RE.match(stem)
+    prefix = match.group(0) if match else stem
+    new_part = _OpcPart(
+        _next_partname(taken, directory, prefix, f".{ext}" if dot else ""),
+        src_part.content_type,
+        dst_package,
+        src_part.blob,
+    )
+    cache[key] = new_part
+    for rel in src_part.rels.values():
+        if rel.is_external:
+            new_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+        else:
+            child = _copy_part_tree(rel.target_part, dst_package, cache, taken)
+            new_part.relate_to(child, rel.reltype)
+    return new_part
+
+
+def _merge_foreign_slide(dst_prs, src_slide, cache: Dict[str, Any], taken: Set[str]):
+    """单页跨包克隆：内容/背景/切换全量复制，版式链与资源 rels 重新家园化。"""
+    blank = dst_prs.slide_layouts[6] if len(dst_prs.slide_layouts) > 6 else dst_prs.slide_layouts[0]
+    new_slide = dst_prs.slides.add_slide(blank)
+    _dedupe_slide_partname(new_slide)
+    taken.add(str(new_slide.part.partname))
+    for shape in list(new_slide.shapes):
+        _remove_shape(shape)
+    dst_tree = new_slide.shapes._spTree
+    for child in src_slide.shapes._spTree:
+        if child.tag in (qn("p:nvGrpSpPr"), qn("p:grpSpPr")):
+            continue
+        copied = copy.deepcopy(child)
+        _renew_field_ids(copied)
+        dst_tree.append(copied)
+    src_cSld = src_slide._element.cSld
+    dst_cSld = new_slide._element.cSld
+    src_bg = src_cSld.find(qn("p:bg"))
+    if src_bg is not None:
+        dst_bg = dst_cSld.find(qn("p:bg"))
+        if dst_bg is not None:
+            dst_cSld.remove(dst_bg)
+        dst_cSld.insert(0, copy.deepcopy(src_bg))
+    for tag in ("p:transition", "p:timing"):
+        src_el = src_slide._element.find(qn(tag))
+        if src_el is not None:
+            new_slide._element.append(copy.deepcopy(src_el))
+    # 版式随页搬迁（连带母版/主题），保证占位符继承与背景不丢
+    layout_copy = _copy_part_tree(
+        src_slide.slide_layout.part, dst_prs.part.package, cache, taken
+    )
+    for rId, rel in list(new_slide.part.rels.items()):
+        if rel.reltype == RT.SLIDE_LAYOUT:
+            new_slide.part.drop_rel(rId)
+    new_slide.part.relate_to(layout_copy, RT.SLIDE_LAYOUT)
+    remap: Dict[str, str] = {}
+    for rId, rel in list(src_slide.part.rels.items()):
+        if rel.reltype in (RT.SLIDE_LAYOUT, RT.NOTES_SLIDE):
+            continue
+        if rel.is_external:
+            new_rId = new_slide.part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+        else:
+            child = _copy_part_tree(rel.target_part, dst_prs.part.package, cache, taken)
+            new_rId = new_slide.part.relate_to(child, rel.reltype)
+        remap[rId] = new_rId
+    if remap:
+        _remap_rids(new_slide._element, remap)
+    if src_slide.has_notes_slide:
+        try:
+            new_slide.notes_slide.notes_text_frame.text = (
+                src_slide.notes_slide.notes_text_frame.text
+            )
+        except Exception:
+            pass
+    return new_slide
+
+
+def merge_slides_from_file(
+    dst_path: Path, src_path: Path, out_path: Path, pages: Any, position: Any
+) -> Tuple[int, Set[int]]:
+    """把 src 的指定页（1-based 选择器，空=all）克隆进 dst，插到 position。
+
+    返回 (合并页数, 新页占用的 0-based 索引集合)；out_path 由调用方负责清理。
+    """
+    dst_prs = Presentation(str(dst_path))
+    src_prs = Presentation(str(src_path))
+    n_src = len(src_prs.slides)
+    if pages in (None, "", "all", "ALL", "全部", "*"):
+        page_indexes = list(range(n_src))
+    else:
+        page_indexes = parse_slide_spec(pages, n_src)
+    n_dst = len(dst_prs.slides)
+    if position is None:
+        position = n_dst
+    try:
+        position = int(position)
+    except (TypeError, ValueError):
+        raise PatchError(f"position 必须是整数：{position!r}")
+    if position < 0 or position > n_dst:
+        raise PatchError(f"position 超出范围：{position}（当前文稿 0..{n_dst}）")
+    from services.parse import _cap
+
+    max_slides = _cap("PARSE_MAX_SLIDES", 500)
+    if n_dst + len(page_indexes) > max_slides:
+        raise PatchError(f"合并后页数超过上限（{max_slides} 页）")
+
+    cache: Dict[str, Any] = {}
+    taken = {str(part.partname) for part in dst_prs.part.package.iter_parts()}
+    for page_index in page_indexes:
+        _merge_foreign_slide(dst_prs, src_prs.slides[page_index], cache, taken)
+    # 合并页追加在尾部 [n_dst, n_dst+k)：position 即末尾时已就位不动；否则逐个
+    # 前移。每挪一页，剩余合并页整体左移一位但相对次序不变 → 第 i 页总在
+    # n_dst + i（remove-then-insert 语义下 from 先于 to 计算即可）
+    if position < n_dst:
+        for offset in range(len(page_indexes)):
+            _move_sld_id(dst_prs, n_dst + offset, position + offset)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    dst_prs.save(str(out_path))
+    return len(page_indexes), set(range(position, position + len(page_indexes)))
+
+
 def _apply_deck_patches(
     prs, patches: List[Dict[str, Any]], n_orig: int
 ) -> Set[int]:
