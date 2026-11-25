@@ -71,7 +71,7 @@ def _objects_of(demo_pptx):
 
 def test_apply_edit_patch(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    target = next(o for o in objects if "项目进展汇报" in o["text"])
+    target = next(o for o in objects if "项目进展汇报" in o.get("text", ""))
     dst = tmp_path / "out.pptx"
     touched = edits.apply_patches_to_file(
         demo_pptx, dst,
@@ -86,7 +86,7 @@ def test_apply_edit_patch(demo_pptx, tmp_path):
 
 def test_apply_table_cell_edit_preserves_style(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    cell = next(o for o in objects if o["text"] == "200 万")
+    cell = next(o for o in objects if o.get("text", "") == "200 万")
     dst = tmp_path / "out.pptx"
     edits.apply_patches_to_file(
         demo_pptx, dst,
@@ -100,7 +100,7 @@ def test_apply_table_cell_edit_preserves_style(demo_pptx, tmp_path):
 
 def test_apply_style_patch(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    target = next(o for o in objects if "本季度完成" in o["text"])
+    target = next(o for o in objects if "本季度完成" in o.get("text", ""))
     dst = tmp_path / "out.pptx"
     edits.apply_patches_to_file(
         demo_pptx, dst,
@@ -116,7 +116,7 @@ def test_apply_style_patch(demo_pptx, tmp_path):
 
 def test_apply_add_and_delete_textbox(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    target = next(o for o in objects if "本季度完成" in o["text"])
+    target = next(o for o in objects if "本季度完成" in o.get("text", ""))
     dst = tmp_path / "out.pptx"
     edits.apply_patches_to_file(
         demo_pptx, dst,
@@ -134,7 +134,7 @@ def test_apply_add_and_delete_textbox(demo_pptx, tmp_path):
 
 def test_apply_geometry_patch(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    target = next(o for o in objects if "本季度完成" in o["text"])
+    target = next(o for o in objects if "本季度完成" in o.get("text", ""))
     dst = tmp_path / "out.pptx"
     new_bbox = {"x": 2000000, "y": 2500000, "w": 7000000, "h": 1500000}
     edits.apply_patches_to_file(
@@ -169,7 +169,7 @@ def test_apply_geometry_partial_move_keeps_inherited_position(tmp_path):
 
 def test_apply_duplicate_patch_rejected(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    target = next(o for o in objects if "本季度完成" in o["text"])
+    target = next(o for o in objects if "本季度完成" in o.get("text", ""))
     patch = {"action": "edit", "shape_id": target["shape_id"], "after": "x"}
     with pytest.raises(edits.PatchError, match="duplicate"):
         edits.apply_patches_to_file(demo_pptx, tmp_path / "o.pptx", [patch, dict(patch)])
@@ -177,7 +177,7 @@ def test_apply_duplicate_patch_rejected(demo_pptx, tmp_path):
 
 def test_apply_before_mismatch_rejected(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    target = next(o for o in objects if "本季度完成" in o["text"])
+    target = next(o for o in objects if "本季度完成" in o.get("text", ""))
     with pytest.raises(edits.PatchConflict):
         edits.apply_patches_to_file(
             demo_pptx, tmp_path / "o.pptx",
@@ -213,14 +213,14 @@ def test_apply_geometry_on_group_member_rejected(demo_pptx, tmp_path):
 
 def test_apply_group_text_edit_allowed(demo_pptx, tmp_path):
     objects = _objects_of(demo_pptx)
-    grouped = next(o for o in objects if o.get("grouped") and "总体情况" in o["text"])
+    grouped = next(o for o in objects if o.get("grouped") and "总体情况" in o.get("text", ""))
     dst = tmp_path / "out.pptx"
     edits.apply_patches_to_file(
         demo_pptx, dst,
         [{"action": "edit", "shape_id": grouped["shape_id"], "after": "第一章 综合情况"}],
     )
     parsed, _ = parse.parse_pptx(str(dst))
-    assert any("综合情况" in o["text"] for o in parsed)
+    assert any("综合情况" in o.get("text", "") for o in parsed)
 
 
 # ---------- ai.extract_requested_slide ----------
@@ -326,7 +326,7 @@ def test_parse_pptx_structure(demo_pptx):
     assert merged["col_span"] == 2
     # group child present and flagged
     grouped = [o for o in objects if o.get("grouped")]
-    assert any("总体情况" in o["text"] for o in grouped)
+    assert any("总体情况" in o.get("text", "") for o in grouped)
     # every bbox inside slide bounds
     for o in objects:
         bb = o["bbox_emu"]

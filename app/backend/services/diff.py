@@ -20,7 +20,8 @@ _TEXT_SNIPPET = 120
 _MAX_PER_SECTION = 50
 
 _SECTIONS = ("added", "removed", "moved", "text_changed", "geometry_changed", "style_changed")
-_STYLE_FIELDS = ("font_name", "font_size", "bold", "color")
+# parse._font_info 的源字段 → changelog 对外字段名（font_size_pt → font_size）
+_STYLE_FIELDS = {"font_name": "font_name", "font_size_pt": "font_size", "bold": "bold", "color": "color"}
 
 
 def _top_level_objects(payload: Dict[str, Any]) -> Dict[int, Dict[str, Dict[str, Any]]]:
@@ -62,8 +63,8 @@ def _norm_style(value: Any) -> Any:
 
 def _style_changes(a: Dict[str, Any], b: Dict[str, Any]) -> List[Dict[str, Any]]:
     changes = []
-    for field in _STYLE_FIELDS:
-        before, after = _norm_style(a.get(field)), _norm_style(b.get(field))
+    for src, field in _STYLE_FIELDS.items():
+        before, after = _norm_style(a.get(src)), _norm_style(b.get(src))
         if before != after:
             changes.append({"field": field, "before": before, "after": after})
     return changes

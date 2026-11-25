@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -177,6 +178,27 @@ def _shape_kind(shape) -> str:
     except Exception:
         pass
     return "shape"
+
+
+def _alt_text_of(shape) -> str:
+    """cNvPr@descr（替代文本）；未设置为空串。
+
+    python-pptx add_picture 会把源文件名写进 descr（如 image.png）——
+    那是程序残留不是人写的图说，按裸文件名过滤掉，免得 AI 当真。"""
+    try:
+        from lxml import etree as _etree
+
+        for node in shape._element.iter():
+            if isinstance(node.tag, str) and _etree.QName(node).localname == "cNvPr":
+                text = str(node.get("descr") or "")
+                if text and not re.fullmatch(
+                    r"[\w.\-]+\.(png|jpe?g|gif|bmp|webp|svg|tiff?)", text, re.I
+                ):
+                    return text
+                return ""
+    except Exception:
+        pass
+    return ""
 
 
 def _compose(parent: Callable[[float, float], Tuple[float, float]], group) -> Callable[[float, float], Tuple[float, float]]:
@@ -453,6 +475,31 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
                         "resizable": False,
                     }
                 )
+            return
+        if kind == "picture":
+            # v0.5 #6：图片进 objects（无文本框，此前只出现在 elements），
+            # 带 alt_text 让 AI 能读到/补写图说（无障碍 + 内容理解）。
+            # text 恒为 ""——objects 的既有消费方按 o["text"] 直取。
+            alt = _alt_text_of(shape)
+            objects.append(
+                {
+                    "slide_index": slide_index,
+                    "shape_index": current_seq,
+                    "shape_id": shape_id,
+                    "shape_name": name or "图片",
+                    "kind": "picture",
+                    "text": "",
+                    "bbox_emu": bbox,
+                    "slide_size_emu": slide_size,
+                    "grouped": grouped,
+                    "parent_shape_id": parent_shape_id,
+                    "group_path": list(group_path),
+                    "deletable": not grouped,
+                    "movable": not grouped,
+                    "resizable": not grouped,
+                    **({"alt_text": alt} if alt else {}),
+                }
+            )
             return
         if not getattr(shape, "has_text_frame", False):
             return

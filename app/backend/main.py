@@ -185,7 +185,7 @@ def _sanitize_detail(text: Any) -> str:
     return clean
 
 
-app = FastAPI(title="PPT Light", version="0.4.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
+app = FastAPI(title="PPT Light", version="0.5.0", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
 app.add_middleware(GZipMiddleware, minimum_size=1500)
 app.add_middleware(
     CORSMiddleware,
@@ -718,7 +718,7 @@ def health():
     return {
         "ok": True,
         "service": "ppt-light",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "ai_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         "libreoffice": bool(shutil.which("soffice") or shutil.which("libreoffice")),
@@ -1960,6 +1960,9 @@ def compare_versions(doc_id: str, version_a: str, version_b: str):
         )
     diff_pages = len(changed) + len(added) + len(removed)
     struct = diff.structural_changelog(payload_a, payload_b)
+    # changelog 自带版本标识，AI 单看 struct 也能知道比的是哪两版
+    struct["a"] = a_id
+    struct["b"] = b_id
     return {
         "a": a_id,
         "b": b_id,

@@ -316,7 +316,7 @@ def test_chat_undo_last_rolls_back_through_version_chain(client, uploaded_doc, m
     assert done["applied"] is False
     doc = client.get(f"/api/docs/{doc_id}").json()
     assert doc["version_id"] == "v2"
-    assert original in [o["text"] for o in doc["objects"]]
+    assert original in [o.get("text", "") for o in doc["objects"]]
 
 
 # ---------- 14b. 范围：显式「整份文稿」不被页码提及降级 ----------

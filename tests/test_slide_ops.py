@@ -345,9 +345,9 @@ def test_delete_slide_renumbers_object_ids(demo_pptx, tmp_path):
     objects, payload = parse.parse_pptx(str(dst))
     assert payload["slide_count"] == 2
     assert not any(o["kind"] == "table_cell" for o in objects)
-    group_text = next(o for o in objects if "总体情况" in o["text"])
+    group_text = next(o for o in objects if "总体情况" in o.get("text", ""))
     assert group_text["shape_id"].startswith("s1_")
-    title = next(o for o in objects if "项目进展汇报" in o["text"])
+    title = next(o for o in objects if "项目进展汇报" in o.get("text", ""))
     assert title["shape_id"].startswith("s0_")
 
 

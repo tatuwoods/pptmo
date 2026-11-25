@@ -201,7 +201,7 @@ def test_agent_new_ops_flow_through_apply(demo_pptx, tmp_path):
         demo_pptx, tmp_path / "out.pptx", patches
     )
     assert touched == {0, 1, 2}
-    texts = [o["text"] for o in parse.parse_pptx(str(tmp_path / "out.pptx"))[0]]
+    texts = [o.get("text", "") for o in parse.parse_pptx(str(tmp_path / "out.pptx"))[0]]
     assert not any("项目" in t for t in texts)
 
 
