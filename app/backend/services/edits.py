@@ -1392,7 +1392,7 @@ SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide",
 # deck-wide bulk ops (v0.3): run after shape patches but BEFORE slide-level ops
 # so slide_index parameters still refer to the base deck the caller read
 DECK_ACTIONS = {"font_unify", "replace_text", "font_scale", "add_page_numbers",
-                 "highlight_text"}
+                 "highlight_text", "theme_rebrand", "recolor"}
 
 _ACTION_ALIASES = {
     "update": "edit",
@@ -1472,6 +1472,13 @@ _ACTION_ALIASES = {
     "clear_hyperlink": "remove_hyperlink",
     "highlight_text": "highlight_text",
     "highlight": "highlight_text",
+    # v0.5 #1 整套重主题 / #2 调色板映射
+    "theme_rebrand": "theme_rebrand",
+    "set_theme": "theme_rebrand",
+    "rebrand": "theme_rebrand",
+    "recolor": "recolor",
+    "replace_color": "recolor",
+    "color_mapping": "recolor",
 }
 
 
@@ -2734,6 +2741,160 @@ def _apply_slide_background(slide, merged: Dict[str, Any]) -> None:
     cSld.insert(0, bg)
 
 
+# ---------- v0.5 #1: theme_rebrand 整套重主题 ----------
+# theme part 是 python-pptx 未注册的 OPC part（blob 载荷），直接改 XML 后写回 _blob。
+THEME_SLOTS = (
+    "dk1", "lt1", "dk2", "lt2",
+    "accent1", "accent2", "accent3", "accent4", "accent5", "accent6",
+    "hlink", "folHlink",
+)
+# PowerPoint UI 名称（Text 1 / Background 1 …）→ theme 槽位
+_THEME_SLOT_LOOKUP = {
+    **{slot.lower(): slot for slot in THEME_SLOTS},
+    "text1": "dk1", "background1": "lt1",
+    "text2": "dk2", "background2": "lt2",
+    "hyperlink": "hlink", "followedhyperlink": "folHlink", "followed_hyperlink": "folHlink",
+}
+
+
+def _iter_theme_parts(prs):
+    seen = set()
+    for master in prs.slide_masters:
+        try:
+            theme = master.part.part_related_by(RT.THEME)
+        except KeyError:
+            continue
+        if theme.partname in seen:
+            continue
+        seen.add(theme.partname)
+        yield theme
+
+
+def _theme_hex(value: Any, slot: str) -> str:
+    text = str(value or "").strip().lstrip("#").upper()
+    if not _COLOR_RE.fullmatch(text):
+        raise PatchError(f"palette[{slot}] 需要 6-digit hex（如 1A1A2E）：{value!r}")
+    return text
+
+
+def _rewrite_theme(root, palette: Dict[str, str], fonts: Dict[str, str]) -> None:
+    ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    scheme = root.find(f".//{ns}clrScheme")
+    if scheme is not None:
+        for slot, hexval in palette.items():
+            slot_el = scheme.find(f"{ns}{slot}")
+            if slot_el is None:
+                raise PatchError(f"theme 缺少 {slot} 槽位")
+            for child in list(slot_el):
+                slot_el.remove(child)
+            srgb = slot_el.makeelement(f"{ns}srgbClr", {"val": hexval})
+            slot_el.append(srgb)
+    if fonts:
+        font_scheme = root.find(f".//{ns}fontScheme")
+        if font_scheme is not None:
+            for which in ("major", "minor"):
+                name = fonts.get(which)
+                if not name:
+                    continue
+                container = font_scheme.find(f"{ns}{which}Font")
+                if container is None:
+                    raise PatchError(f"theme 缺少 {which}Font")
+                # latin/ea/cs 都要写：CJK 文字走 ea 槽，只写 latin 换不动中文
+                anchor = None
+                for tag in ("latin", "ea", "cs"):
+                    el = container.find(f"{ns}{tag}")
+                    if el is None:
+                        el = container.makeelement(f"{ns}{tag}", {})
+                        if anchor is None:
+                            container.insert(0, el)
+                        else:
+                            anchor.addnext(el)
+                    el.set("typeface", str(name))
+                    anchor = el
+
+
+def _op_theme_rebrand(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    raw_palette = merged.get("palette") or merged.get("colors") or {}
+    raw_fonts = merged.get("fonts") or {}
+    if not isinstance(raw_palette, dict) or not isinstance(raw_fonts, dict):
+        raise PatchError("theme_rebrand 需要 palette/fonts 对象")
+    palette: Dict[str, str] = {}
+    for key, value in raw_palette.items():
+        slot = _THEME_SLOT_LOOKUP.get(str(key).strip().lower())
+        if slot is None:
+            raise PatchError(
+                f"未知主题槽位 {key}（支持：{', '.join(THEME_SLOTS)}）"
+            )
+        palette[slot] = _theme_hex(value, slot)
+    fonts: Dict[str, str] = {}
+    for key in ("major", "minor"):
+        name = raw_fonts.get(key)
+        if name is not None and str(name).strip():
+            fonts[key] = str(name).strip()
+    for key in raw_fonts:
+        if str(key).strip().lower() not in ("major", "minor"):
+            raise PatchError(f"未知字体槽位 {key}（支持：major, minor）")
+    if not palette and not fonts:
+        raise PatchError("theme_rebrand 需要 palette 或 fonts 至少一项")
+
+    themes = list(_iter_theme_parts(prs))
+    if not themes:
+        raise PatchError("文稿没有 theme part，无法重主题")
+    for theme in themes:
+        root = parse_xml(theme.blob)
+        _rewrite_theme(root, palette, fonts)
+        theme._blob = etree_bytes(root)
+    return set(range(n_orig))
+
+
+def etree_bytes(root) -> bytes:
+    """OPC part 的 XML 序列化：声明 + UTF-8（与 python-pptx 保存格式一致）。"""
+    from lxml import etree as _etree
+
+    return _etree.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+
+
+# ---------- v0.5 #2: recolor 硬编码颜色映射 ----------
+# 与 theme_rebrand 互补：theme 管主题引用色，recolor 扫全稿（页面+版式+母版）
+# 的 a:srgbClr（solidFill/渐变 stop/线条色/文字色）按映射替换。
+
+
+def _op_recolor(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    raw = merged.get("mapping") or {}
+    if not isinstance(raw, dict) or not raw:
+        raise PatchError('recolor 需要非空 mapping（如 {"FF0000":"0066CC"}）')
+    mapping: Dict[str, str] = {}
+    for key, value in raw.items():
+        source = str(key or "").strip().lstrip("#").upper()
+        target = _bg_color(value, f"mapping[{key}]")
+        if not _COLOR_RE.fullmatch(source):
+            raise PatchError(f"mapping 源颜色需要 6-digit hex：{key!r}")
+        mapping[source] = target
+
+    containers: List[Any] = list(prs.slides)
+    for master in prs.slide_masters:
+        containers.append(master)
+        containers.extend(master.slide_layouts)
+    slide_index_of = {id(slide): index for index, slide in enumerate(prs.slides)}
+    touched: Set[int] = set()
+    replaced = 0
+    for container in containers:
+        changed = 0
+        for node in container._element.iter(qn("a:srgbClr")):
+            value = str(node.get("val") or "").strip().upper()
+            if value in mapping:
+                node.set("val", mapping[value])
+                changed += 1
+        replaced += changed
+        if changed and id(container) in slide_index_of:
+            touched.add(slide_index_of[id(container)])
+    if replaced == 0:
+        raise PatchError(f"未找到要替换的颜色：{', '.join(sorted(mapping))}")
+    return touched
+
+
 def _apply_deck_patches(
     prs, patches: List[Dict[str, Any]], n_orig: int
 ) -> Set[int]:
@@ -2752,6 +2913,10 @@ def _apply_deck_patches(
             touched.update(_op_add_page_numbers(prs, merged))
         elif action == "highlight_text":
             touched.update(_op_highlight_text(prs, merged, n_orig))
+        elif action == "theme_rebrand":
+            touched.update(_op_theme_rebrand(prs, merged, n_orig))
+        elif action == "recolor":
+            touched.update(_op_recolor(prs, merged, n_orig))
         else:
             raise PatchError(f"unsupported bulk action: {action}")
     return touched

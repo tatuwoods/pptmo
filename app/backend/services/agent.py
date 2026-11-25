@@ -108,6 +108,27 @@ ACTION_ALIASES = {
     "undo_last": "undo_last",
     "undo": "undo_last",
     "revert_last": "undo_last",
+    # v0.5：重主题 / 调色 / 切换动画 / 隐藏页 / 元数据 / 替代文本 / 自修
+    "theme_rebrand": "theme_rebrand",
+    "set_theme": "theme_rebrand",
+    "rebrand": "theme_rebrand",
+    "recolor": "recolor",
+    "replace_color": "recolor",
+    "color_mapping": "recolor",
+    "set_transition": "set_transition",
+    "transition": "set_transition",
+    "slide_transition": "set_transition",
+    "hide_slide": "hide_slide",
+    "hide": "hide_slide",
+    "show_slide": "show_slide",
+    "unhide_slide": "show_slide",
+    "edit_props": "edit_props",
+    "set_props": "edit_props",
+    "doc_props": "edit_props",
+    "set_alt_text": "set_alt_text",
+    "alt_text": "set_alt_text",
+    "fix_issues": "fix_issues",
+    "lint_fix": "fix_issues",
 }
 
 # slide-level operations submitted through propose_operations like any other op
@@ -134,6 +155,15 @@ V03_ACTIONS = {
     "highlight_text",
     "set_hyperlink",
     "remove_hyperlink",
+    # v0.5：重主题 / 调色板 / 切换动画 / 隐藏页 / 元数据 / 替代文本 / 自修
+    "theme_rebrand",
+    "recolor",
+    "set_transition",
+    "hide_slide",
+    "show_slide",
+    "edit_props",
+    "set_alt_text",
+    "fix_issues",
 }
 
 TOOL_NAMES = {
@@ -1516,6 +1546,14 @@ class _OperationStore:
             "highlight_text": "高亮文字",
             "set_hyperlink": "添加超链接",
             "remove_hyperlink": "移除超链接",
+            "theme_rebrand": "整套重主题",
+            "recolor": "调色板映射",
+            "set_transition": "设置切换动画",
+            "hide_slide": "隐藏页面",
+            "show_slide": "取消隐藏",
+            "edit_props": "改文档属性",
+            "set_alt_text": "设置替代文本",
+            "fix_issues": "自动修复问题",
         }
         op: Dict[str, Any] = {
             "id": f"op{len(self.ops) + 1}",
@@ -1904,6 +1942,57 @@ class _OperationStore:
             op["meta"] = {"slide_index": slide_index, "kind": "hyperlink"}
             return self._finish_v03_op(op, raw, merged)
 
+        if action in ("theme_rebrand", "recolor"):
+            _slide_index, scope_label, scope_error = self._v03_scope(merged, deck_only=True)
+            if scope_error:
+                return None, scope_error
+            op["scope"] = scope_label
+            if action == "theme_rebrand":
+                palette_raw = merged.get("palette") if isinstance(merged.get("palette"), dict) else {}
+                fonts_raw = merged.get("fonts") if isinstance(merged.get("fonts"), dict) else {}
+                if not palette_raw and not fonts_raw:
+                    return None, "theme_rebrand 需要 palette（accent1..6 等）或 fonts（major/minor）"
+                try:
+                    for key, value in palette_raw.items():
+                        edits._theme_hex(value, str(key))
+                        if str(key).strip().lower() not in edits._THEME_SLOT_LOOKUP:
+                            raise edits.PatchError(f"未知主题槽位 {key}")
+                    for key in fonts_raw:
+                        if str(key).strip().lower() not in ("major", "minor"):
+                            raise edits.PatchError(f"未知字体槽位 {key}")
+                except edits.PatchError as exc:
+                    return None, str(exc)
+                if palette_raw:
+                    op["palette"] = {
+                        str(k).strip().lower(): str(v).strip().lstrip("#").upper()
+                        for k, v in palette_raw.items()
+                    }
+                if fonts_raw:
+                    op["fonts"] = {str(k).strip().lower(): str(v).strip()[:100] for k, v in fonts_raw.items()}
+                op["meta"] = {
+                    "kind": "theme",
+                    "colors": len(palette_raw),
+                    "fonts": sorted(fonts_raw) or None,
+                }
+            else:  # recolor
+                mapping_raw = merged.get("mapping")
+                if not isinstance(mapping_raw, dict) or not mapping_raw:
+                    return None, 'recolor 需要 mapping（如 {"FF0000":"0066CC"}）'
+                try:
+                    for key, value in mapping_raw.items():
+                        source = str(key or "").strip().lstrip("#").upper()
+                        if not edits._COLOR_RE.fullmatch(source):
+                            raise edits.PatchError(f"mapping 源颜色需要 6-digit hex：{key!r}")
+                        edits._bg_color(value, f"mapping[{key}]")
+                except edits.PatchError as exc:
+                    return None, str(exc)
+                op["mapping"] = {
+                    str(k).strip().lstrip("#").upper(): str(v).strip().lstrip("#").upper()
+                    for k, v in mapping_raw.items()
+                }
+                op["meta"] = {"kind": "recolor", "colors": len(op["mapping"])}
+            return self._finish_v03_op(op, raw, merged)
+
         return None, f"不支持的操作：{action}"
 
     def _v03_scope_deck_required(self, merged: Dict[str, Any]):
@@ -1944,6 +2033,10 @@ class _OperationStore:
             op.get("position"),
             op.get("color"),
             json.dumps(op.get("gradient"), ensure_ascii=False, sort_keys=True) if op.get("gradient") else None,
+            # v0.5：重主题 / 调色板映射（不同 palette 是不同操作）
+            json.dumps(op.get("palette"), ensure_ascii=False, sort_keys=True) if op.get("palette") else None,
+            json.dumps(op.get("fonts"), ensure_ascii=False, sort_keys=True) if op.get("fonts") else None,
+            json.dumps(op.get("mapping"), ensure_ascii=False, sort_keys=True) if op.get("mapping") else None,
         )
         if key in self.v03_keys:
             return None, "已提交过相同的批量操作"
@@ -2006,7 +2099,9 @@ class _OperationStore:
                 "font_name", "find", "replace", "delta_pt", "align", "mode", "op",
                 "shape_ids", "skip_first", "position", "start", "color", "gradient",
                 "offset_emu", "pages", "layout", "title", "items", "url", "text",
-                "categories", "series",
+                "categories", "series", "palette", "fonts", "mapping", "type",
+                "duration_ms", "advance_after_ms", "advance_on_click", "props",
+                "alt_text", "hidden",
             ):
                 if op.get(key) is not None:
                     item[key] = op.get(key)
@@ -2237,6 +2332,14 @@ SYSTEM_PROMPT = (
     'remove_hyperlink：{"action":"remove_hyperlink","shape_id":"..."} 清除链接（仅 http/https/mailto）。\n'
     '- highlight_text：{"action":"highlight_text","find":"关键词","color":"FFFF00","slide_index":可选} '
     "给匹配文字加高亮（审阅标记；找不到会报错）\n"
+    "v0.5 新增操作：\n"
+    '- theme_rebrand：{"action":"theme_rebrand","palette":{"accent1":"1A1A2E","accent2":"16213E"},'
+    '"fonts":{"major":"标题字体","minor":"正文字体"}} 整套重主题——一次操作换品牌色+主字体，'
+    "配色槽位支持 dk1/lt1/dk2/lt2/accent1..6/hlink/folHlink（或 text1/background1 等 UI 名）；"
+    "palette/fonts 至少给一项。\n"
+    '- recolor：{"action":"recolor","mapping":{"FF0000":"0066CC"}} 全稿硬编码颜色映射替换'
+    "（solidFill/渐变 stop/线条/文字色，含版式与母版）；与 theme_rebrand 互补——theme 管主题引用，"
+    "recolor 管写死的颜色；先 search 确认色值来源再选操作。\n"
     "SmartArt：read_slides 会把 SmartArt 节点列为 smartart_node 对象（shape_id 形如 s0_id90_n0），"
     "用 edit 修改 after 文本即可；SmartArt 结构重建不支持，只能改文字。\n\n"
     f"约束：单次 propose 最多 {MAX_OPS_PER_CALL} 条，本次对话最多 {MAX_OPS} 条。\n\n"
