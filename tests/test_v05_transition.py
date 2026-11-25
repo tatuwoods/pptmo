@@ -44,6 +44,18 @@ class TestSetTransition:
             assert push is not None
             assert push.get("dir") == "l"
 
+    def test_pages_all(self, demo_pptx, tmp_path):
+        """pages:"all" 与 hide_slide 同语义：整套页全选（SKILL.md 文档用法）。"""
+        dst = tmp_path / "out.pptx"
+        touched = edits.apply_patches_to_file(
+            demo_pptx, dst,
+            [{"action": "set_transition", "payload": {"pages": "all", "effect": "push", "direction": "l"}}],
+        )
+        prs = Presentation(str(dst))
+        assert touched == set(range(len(prs.slides)))
+        for index in range(len(prs.slides)):
+            assert _transition_of(prs, index) is not None
+
     def test_advance_after_and_click(self, demo_pptx, tmp_path):
         dst = tmp_path / "out.pptx"
         edits.apply_patches_to_file(

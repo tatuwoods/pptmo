@@ -3078,7 +3078,12 @@ def _op_set_transition(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
             raise PatchError(f"slide_index 超出范围：{merged.get('slide_index')!r}（0..{n_orig - 1}）")
         targets = [index]
     elif merged.get("pages") is not None:
-        targets = parse_slide_spec(merged.get("pages"), n_orig)
+        # pages:"all"（含 全部/*）与 hide_slide 同语义 = 整套页；其余走 1-based 页码选择器
+        pages = merged.get("pages")
+        if pages in ("", "all", "ALL", "全部", "*"):
+            targets = list(range(n_orig))
+        else:
+            targets = parse_slide_spec(pages, n_orig)
     else:
         targets = list(range(n_orig))
     for index in targets:
