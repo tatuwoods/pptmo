@@ -19,10 +19,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -32,7 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 import storage  # noqa: E402
-from services import agent, ai, edits, parse, render  # noqa: E402
+from services import agent, ai, broker, edits, parse, render  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ppt-light")
@@ -496,7 +496,31 @@ def _commit_result(committed: Dict[str, Any], objects_payload: Dict[str, Any], t
     result = _serialize(committed, objects_payload)
     if touched is not None:
         result["touched_slides"] = sorted(set(touched))
+    _publish_changed(result)
     return result
+
+
+def _publish_changed(result: Dict[str, Any]) -> None:
+    """向 watch 订阅者广播版本变更。
+
+    所有提交路径（apply / chat 自动应用 / undo / restore / merge）都经
+    _commit_result 汇合，在这里发一次即可全覆盖；推送失败不影响提交。"""
+    doc_id = str(result.get("doc_id") or "")
+    if not doc_id:
+        return
+    event: Dict[str, Any] = {
+        "type": "changed",
+        "version": int(result.get("version") or 0),
+        "version_id": result.get("version_id"),
+    }
+    if result.get("touched_slides") is not None:
+        event["touched_slides"] = result["touched_slides"]
+    if result.get("slide_count") is not None:
+        event["slide_count"] = int(result["slide_count"])
+    try:
+        broker.publish(doc_id, event)
+    except Exception:
+        log.warning("watch event publish failed for %s", doc_id, exc_info=True)
 
 
 def _finalize_chat(
@@ -1485,8 +1509,27 @@ def _is_degraded(render_dir: Path) -> bool:
     return render.partial_marker(render_dir).exists()
 
 
+def _hidden_slide_indexes(doc_id: str, meta: Dict[str, Any]) -> set:
+    """当前文稿的隐藏页 0-based 索引集合（presentation.xml 的 show="0"）。
+
+    v0.5 #5/#10：导出默认跳过隐藏页的依据；读不出来时按无隐藏处理，导出
+    行为退回 v0.4（全量），不让隐藏特性把导出搞挂。"""
+    from pptx import Presentation as _Presentation
+
+    try:
+        prs = _Presentation(str(storage.current_path(doc_id)))
+        flags = [child.get("show") == "0" for child in prs.slides._sldIdLst]
+    except Exception:
+        return set()
+    return {index for index, flag in enumerate(flags) if flag}
+
+
 @app.get("/api/docs/{doc_id}/export/pdf")
-def export_pdf(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+def export_pdf(
+    doc_id: str,
+    include_hidden: bool = False,
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
     meta = storage.load_meta(doc_id)
     _assert_doc_open(meta, x_doc_password)
     render_dir = _current_render_dir(doc_id, meta)
@@ -1496,6 +1539,29 @@ def export_pdf(doc_id: str, x_doc_password: Optional[str] = Header(default=None,
         pdf_path = render_dir / "export.pdf"
     if not pdf_path.exists():
         raise FileNotFoundError("PDF 尚未生成（渲染未产出 PDF），请稍后重试或先重新渲染")
+    if not include_hidden:
+        hidden = _hidden_slide_indexes(doc_id, meta)
+        if hidden:
+            import pymupdf
+
+            doc = pymupdf.open(pdf_path)
+            try:
+                # 页数对齐才按索引剔除；渲染器若已跳过隐藏页则原样导出
+                if doc.page_count == int(meta.get("slide_count", 0)):
+                    doc.select([i for i in range(doc.page_count) if i not in hidden])
+                    tmp_dir = storage.DATA_DIR / "tmp"
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+                    tmp_path = tmp_dir / f"export-{uuid.uuid4().hex}.pdf"
+                    doc.save(str(tmp_path), garbage=3, deflate=True)
+                    return FileResponse(
+                        tmp_path,
+                        media_type="application/pdf",
+                        filename=f"{_export_base_name(meta)}.pdf",
+                        headers={"Cache-Control": "no-store"},
+                        background=BackgroundTask(lambda: tmp_path.unlink(missing_ok=True)),
+                    )
+            finally:
+                doc.close()
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
@@ -1505,7 +1571,11 @@ def export_pdf(doc_id: str, x_doc_password: Optional[str] = Header(default=None,
 
 
 @app.get("/api/docs/{doc_id}/export/images.zip")
-def export_images_zip(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+def export_images_zip(
+    doc_id: str,
+    include_hidden: bool = False,
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
     meta = storage.load_meta(doc_id)
     _assert_doc_open(meta, x_doc_password)
     render_dir = _current_render_dir(doc_id, meta)
@@ -1517,6 +1587,11 @@ def export_images_zip(doc_id: str, x_doc_password: Optional[str] = Header(defaul
         pages = sorted(render_dir.glob("slide-*.png"))
     if not pages:
         raise FileNotFoundError("暂无可打包的页面图片，请先触发一次渲染")
+    if not include_hidden and len(pages) == int(meta.get("slide_count", 0)):
+        # 页数对齐才按索引剔除（渲染 PNG 与页码 1:1）；渲染器已跳过隐藏页时全量
+        hidden = _hidden_slide_indexes(doc_id, meta)
+        if hidden:
+            pages = [page for index, page in enumerate(pages) if index not in hidden]
     tmp_dir = storage.DATA_DIR / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / f"export-{uuid.uuid4().hex}.zip"
@@ -1542,11 +1617,14 @@ def export_images_zip(doc_id: str, x_doc_password: Optional[str] = Header(defaul
 NOTES_PDF_CJK_FONT = "china-s"  # PyMuPDF 内置简体字体，备注文字可渲染
 
 
-def _compose_notes_pdf(pptx_path: Path, slides_pdf_path: Path, out_path: Path) -> Path:
-    """幻灯片 + 演讲者备注合成讲义 PDF：A4 竖版，上页图下备注。"""
+def _compose_notes_pdf(pptx_path: Path, slides_pdf_path: Path, out_path: Path, hidden: Optional[set] = None) -> Path:
+    """幻灯片 + 演讲者备注合成讲义 PDF：A4 竖版，上页图下备注。
+
+    hidden：要跳过的 0-based 页索引（v0.5 #10 隐藏页默认不进讲义）。"""
     import pymupdf
     from pptx import Presentation as _Presentation
 
+    hidden = hidden or set()
     prs = _Presentation(str(pptx_path))
     notes = []
     for slide in prs.slides:
@@ -1561,6 +1639,8 @@ def _compose_notes_pdf(pptx_path: Path, slides_pdf_path: Path, out_path: Path) -
     out = pymupdf.open()
     page_w, page_h, margin = 595, 842, 40
     for index in range(max(src.page_count, len(notes))):
+        if index in hidden:
+            continue
         page = out.new_page(width=page_w, height=page_h)
         top = margin
         if index < src.page_count:
@@ -1580,7 +1660,11 @@ def _compose_notes_pdf(pptx_path: Path, slides_pdf_path: Path, out_path: Path) -
 
 
 @app.get("/api/docs/{doc_id}/export/pdf-notes")
-def export_pdf_notes(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+def export_pdf_notes(
+    doc_id: str,
+    include_hidden: bool = False,
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
     meta = storage.load_meta(doc_id)
     _assert_doc_open(meta, x_doc_password)
     render_dir = _current_render_dir(doc_id, meta)
@@ -1593,8 +1677,9 @@ def export_pdf_notes(doc_id: str, x_doc_password: Optional[str] = Header(default
     tmp_dir = storage.DATA_DIR / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / f"pdf-notes-{uuid.uuid4().hex}.pdf"
+    hidden = set() if include_hidden else _hidden_slide_indexes(doc_id, meta)
     try:
-        _compose_notes_pdf(storage.current_path(doc_id), pdf_path, tmp_path)
+        _compose_notes_pdf(storage.current_path(doc_id), pdf_path, tmp_path, hidden=hidden)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -1617,6 +1702,7 @@ def _outline_lines(meta: Dict[str, Any], pptx_path: Path) -> List[str]:
         or Path(str(meta.get("file_name") or "presentation.pptx")).stem
     )
     lines = [f"# {title}", ""]
+    hidden_flags = [child.get("show") == "0" for child in prs.slides._sldIdLst]
 
     def walk(shapes):
         for shape in shapes:
@@ -1653,7 +1739,8 @@ def _outline_lines(meta: Dict[str, Any], pptx_path: Path) -> List[str]:
                     lines.append(f"- {line.strip()}")
 
     for index, slide in enumerate(prs.slides, start=1):
-        lines.append(f"## 第 {index} 页")
+        marker = "（已隐藏）" if hidden_flags[index - 1] else ""
+        lines.append(f"## 第 {index} 页{marker}")
         walk(slide.shapes)
         if getattr(slide, "has_notes_slide", False):
             try:
@@ -2240,6 +2327,175 @@ def merge_document(
     )
     log.info("merged %d slides into %s -> v%d", merged, doc_id, new_version)
     return result
+
+
+# ---------- v0.5 #9：watch 实时预览 ----------
+
+# 空转轮询间隔：订阅队列短暂等待，空了就发一条 SSE 注释行保活
+WATCH_EVENT_TIMEOUT = 1.0
+
+
+@app.get("/api/docs/{doc_id}/events")
+def doc_events(
+    doc_id: str,
+    max_events: Optional[int] = None,
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
+    """文档事件流（SSE）：连接即 hello（当前版本），此后每次版本变更推 changed。
+
+    max_events：发出指定条数（含 hello）后发 bye 并收尾 —— 无限流无法在
+    TestClient 下断开（不发 disconnect），测试用它让流自然终止；浏览器不传。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    version = int(meta.get("version", 0))
+    if max_events is not None:
+        max_events = max(1, min(int(max_events), 1000))
+    q = broker.subscribe(doc_id)
+
+    def stream():
+        sent = 0
+        try:
+            yield _sse(
+                "hello",
+                {
+                    "doc_id": doc_id,
+                    "version": version,
+                    "version_id": f"v{version}",
+                    "slide_count": int(meta.get("slide_count", 0)),
+                },
+            )
+            sent += 1
+            while max_events is None or sent < max_events:
+                try:
+                    event = q.get(timeout=WATCH_EVENT_TIMEOUT)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                yield _sse(str(event.get("type") or "changed"), event)
+                sent += 1
+            if max_events is not None:
+                yield _sse("bye", {"doc_id": doc_id, "sent": sent})
+        finally:
+            broker.unsubscribe(doc_id, q)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+_WATCH_PAGE = """<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>watch · 实时预览</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, "PingFang SC", sans-serif;
+         background: #14161a; color: #e6e9ef; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+           background: #1b1f26; border-bottom: 1px solid #2a2f3a; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .badge { font-size: 12px; color: #8b94a7; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #f0b429; }
+  .dot.on { background: #35c46f; }
+  aside { width: 190px; overflow-y: auto; background: #181b21; border-right: 1px solid #2a2f3a; }
+  aside .thumb { padding: 8px; cursor: pointer; }
+  aside .thumb img { width: 100%; border-radius: 4px; display: block;
+                     border: 2px solid transparent; }
+  aside .thumb.cur img { border-color: #4d8ef7; }
+  aside .thumb span { font-size: 11px; color: #8b94a7; }
+  main { flex: 1; overflow: auto; display: flex; align-items: flex-start; justify-content: center; }
+  main img.page { max-width: 100%; max-height: 100%; margin: 16px; border-radius: 6px;
+                  box-shadow: 0 8px 40px rgba(0,0,0,.5); background: #fff; }
+  footer { padding: 6px 16px; font-size: 12px; color: #8b94a7; background: #1b1f26;
+           border-top: 1px solid #2a2f3a; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1 id="title">实时预览</h1>
+  <span class="badge" id="version-badge">v-</span>
+  <span class="badge" id="slide-badge"></span>
+</header>
+<div style="flex:1; display:flex; min-height:0;">
+  <aside id="thumbs"></aside>
+  <main><img class="page" id="page" alt="当前页渲染图"></main>
+</div>
+<footer id="log">等待连接…</footer>
+<script>
+const DOC_ID = "__DOC_ID__";
+const base = "/api/docs/" + DOC_ID;
+let current = 0, version = null, slideCount = 0;
+
+const es = new EventSource(base + "/events");
+es.addEventListener("open", () => { dot.classList.add("on"); log.textContent = "已连接"; });
+es.addEventListener("error", () => { dot.classList.remove("on"); log.textContent = "连接断开，自动重连中…"; });
+es.addEventListener("hello", (e) => {
+  const d = JSON.parse(e.data);
+  version = d.version_id;
+  slideCount = d.slide_count || 0;
+  log.textContent = "已连接 · 当前 " + version;
+  refresh(false);
+});
+es.addEventListener("changed", (e) => {
+  const d = JSON.parse(e.data);
+  version = d.version_id || version;
+  if (d.slide_count != null) slideCount = d.slide_count;
+  if (Array.isArray(d.touched_slides) && d.touched_slides.length && !d.touched_slides.includes(current)) {
+    current = d.touched_slides[0];
+  }
+  log.textContent = "变更 → " + version + (d.touched_slides ? " · 页 " + d.touched_slides.map(n => n + 1).join(",") : "");
+  refresh(true);
+});
+
+function refresh(scroll) {
+  versionBadge.textContent = version || "-";
+  slideBadge.textContent = slideCount ? slideCount + " 页" : "";
+  if (current >= slideCount) current = 0;
+  page.src = base + "/slides/" + current + "/image?v=" + (version || "0");
+  thumbs.innerHTML = "";
+  for (let i = 0; i < slideCount; i++) {
+    const div = document.createElement("div");
+    div.className = "thumb" + (i === current ? " cur" : "");
+    const img = document.createElement("img");
+    img.src = base + "/slides/" + i + "/image?thumb=1&v=" + (version || "0");
+    img.loading = "lazy";
+    const span = document.createElement("span");
+    span.textContent = "第 " + (i + 1) + " 页";
+    div.appendChild(img); div.appendChild(span);
+    div.onclick = () => { current = i; refresh(true); };
+    thumbs.appendChild(div);
+  }
+  if (scroll && slideCount) {
+    const cur = thumbs.children[current];
+    if (cur) cur.scrollIntoView({ block: "nearest" });
+  }
+}
+
+fetch(base).then(r => r.json()).then(d => {
+  document.title = (d.title || "watch") + " · 实时预览";
+  title.textContent = d.title || "实时预览";
+  if (!version) { version = d.version_id; slideCount = d.slide_count || 0; refresh(false); }
+}).catch(() => {});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/api/docs/{doc_id}/watch")
+def watch_page(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    """浏览器分屏实时预览页：EventSource 订阅 /events，changed 后自动刷新渲染图。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    # 标题由页面 JS 拉取 /api/docs/{id} 后自行填充；模板只需注入 doc_id
+    page = _WATCH_PAGE.replace("__DOC_ID__", doc_id)
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/docs/{doc_id}/slides/{slide_index}/image")
