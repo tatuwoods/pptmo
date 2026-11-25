@@ -358,6 +358,8 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
     max_shapes = _cap("PARSE_MAX_SHAPES", 5000)
     max_depth = _cap("PARSE_MAX_GROUP_DEPTH", 20)
     limits = {"truncated_slides": False, "truncated_shapes": False, "truncated_depth": False}
+    # v0.5 #5：隐藏页标记（presentation.xml 的 <p:sldId show="0"/>，按 sldIdLst 顺序对齐）
+    hidden_flags = [child.get("show") == "0" for child in prs.slides._sldIdLst]
 
     def walk(shape, transform, slide_index: int, grouped: bool, parent_shape_id: Optional[str], group_path: List[str], depth: int = 0) -> None:
         nonlocal seq
@@ -485,7 +487,10 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
         if slide_index >= max_slides or limits["truncated_shapes"]:
             limits["truncated_slides"] = slide_index >= max_slides
             break
-        slides.append({"slide_index": slide_index})
+        slides.append({
+            "slide_index": slide_index,
+            "hidden": hidden_flags[slide_index] if slide_index < len(hidden_flags) else False,
+        })
         for shape in slide.shapes:
             walk(shape, _identity, slide_index, False, None, [])
         if len(elements) >= max_shapes:

@@ -44,7 +44,7 @@ def test_export_pdf_notes_endpoint(client, uploaded_doc, monkeypatch):
     doc_id = uploaded_doc["doc_id"]
     calls = {}
 
-    def fake_compose(pptx_path, slides_pdf, out_path):
+    def fake_compose(pptx_path, slides_pdf, out_path, hidden=None):
         calls["pptx"] = str(pptx_path)
         out_path.write_bytes(b"%PDF-1.4 notes-handout-stub\n%%EOF\n")
 

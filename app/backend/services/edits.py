@@ -1392,7 +1392,8 @@ SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide",
 # deck-wide bulk ops (v0.3): run after shape patches but BEFORE slide-level ops
 # so slide_index parameters still refer to the base deck the caller read
 DECK_ACTIONS = {"font_unify", "replace_text", "font_scale", "add_page_numbers",
-                 "highlight_text", "theme_rebrand", "recolor", "set_transition"}
+                 "highlight_text", "theme_rebrand", "recolor", "set_transition",
+                 "hide_slide", "show_slide"}
 
 _ACTION_ALIASES = {
     "update": "edit",
@@ -1483,6 +1484,16 @@ _ACTION_ALIASES = {
     "set_transition": "set_transition",
     "transition": "set_transition",
     "slide_transition": "set_transition",
+    # v0.5 #5 隐藏页
+    "hide_slide": "hide_slide",
+    "hide": "hide_slide",
+    "hide_slides": "hide_slide",
+    "hide_page": "hide_slide",
+    "show_slide": "show_slide",
+    "show": "show_slide",
+    "unhide": "show_slide",
+    "unhide_slide": "show_slide",
+    "show_page": "show_slide",
 }
 
 
@@ -3056,6 +3067,27 @@ def _op_set_transition(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     return set(targets)
 
 
+# ---------- v0.5 #5: hide_slide / show_slide 隐藏页 ----------
+# show 属性挂在 presentation.xml 的 <p:sldId show="0"/>：播放、导 PDF、打印
+# 都会跳过隐藏页，但页码/对象结构不动（不同于删页）。
+
+def _op_slide_visibility(prs, merged: Dict[str, Any], n_orig: int, hide: bool) -> Set[int]:
+    pages = merged.get("pages")
+    if pages in (None, "", "all", "ALL", "全部", "*"):
+        targets = list(range(n_orig))
+    else:
+        targets = parse_slide_spec(pages, n_orig)
+    sld_ids = _sld_ids(prs)
+    for index in targets:
+        element = sld_ids[index]
+        if hide:
+            element.set("show", "0")
+        elif element.get("show") is not None:
+            # 缺省即可见；清掉属性而不是写 show="1"，保持与 PowerPoint 存盘一致
+            del element.attrib["show"]
+    return set(targets)
+
+
 # ---------- v0.5 #3: merge 从另一 deck 拉页（跨包克隆） ----------
 # 源与目标属于不同 OPC 包：slide XML 深拷贝之外，版式/母版/主题/图片/图表等
 # 关系目标按源 part 树递归复制进目标包（partname 挪到空闲槽位），rId 重映射。
@@ -3226,6 +3258,10 @@ def _apply_deck_patches(
             touched.update(_op_recolor(prs, merged, n_orig))
         elif action == "set_transition":
             touched.update(_op_set_transition(prs, merged, n_orig))
+        elif action == "hide_slide":
+            touched.update(_op_slide_visibility(prs, merged, n_orig, hide=True))
+        elif action == "show_slide":
+            touched.update(_op_slide_visibility(prs, merged, n_orig, hide=False))
         else:
             raise PatchError(f"unsupported bulk action: {action}")
     return touched
