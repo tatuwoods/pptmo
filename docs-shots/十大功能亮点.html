@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>PPT Light v0.5.0 — 十大功能亮点（附真实测试截图）</title>
+<style>
+  body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 980px; margin: 40px auto; padding: 0 24px; color: #1a2b3c; line-height: 1.7; background: #fafbfc; }
+  h1 { border-bottom: 3px solid #0a7cff; padding-bottom: 12px; }
+  h2 { color: #0a7cff; margin-top: 48px; border-left: 5px solid #0a7cff; padding-left: 12px; }
+  .meta { color: #6b7c8c; font-size: 0.9em; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #d8e1e8; padding: 8px 12px; text-align: left; }
+  th { background: #eef4fa; }
+  .shot { max-width: 100%; border: 1px solid #c8d4dd; border-radius: 6px; margin: 8px 0; }
+  .pass { color: #1a8f4c; font-weight: bold; }
+  .badge { display: inline-block; background: #0a7cff; color: white; border-radius: 4px; padding: 1px 8px; font-size: 0.8em; margin-right: 6px; }
+  code { background: #eef2f5; padding: 1px 6px; border-radius: 3px; }
+  .summary { background: #eef4fa; border-radius: 8px; padding: 16px 20px; margin: 20px 0; }
+</style>
+</head>
+<body>
+<h1>PPT Light v0.5.0 — 十大功能亮点</h1>
+<p class="meta">pptmo · 对话式 AI PPTX 编辑器 · 全部功能附真实测试截图 · 测试 518 全绿 · 服务 http://127.0.0.1:8090 · 2026-11-25</p>
+
+<div class="summary">
+<b>一句话：</b>把 PPTX 丢进浏览器，用中文对话让 AI 精准改稿——它读大纲、读页面、查表格，提交可审阅的精确操作，直接写回 <b>真正可编辑的 .pptx</b>。跑在你自己的 Mac 上，用自己的 API Key，不上传任何第三方。
+</div>
+
+<h2>1. 对话式精准改稿（核心能力）</h2>
+<p>指定页码、对象和期望效果，AI 以 ReAct 工具循环执行：读大纲 → 读页面 → 读表格/查对象 → 提交操作 → 总结。支持"当前页"与"整份文稿"两种范围，最近 12 条对话带入上下文连续追问。</p>
+<img class="shot" src="./shot-service-latest.png" alt="服务渲染首页">
+<p class="meta">▲ 服务全链路渲染首页（真实文档）</p>
+
+<h2>2. 幻灯片级操作（v0.2）</h2>
+<p><code>duplicate_slide</code> 复制页（文字+样式+图片+表格+备注全保真，XML 深拷贝+关系重家园化）、<code>add_slide</code>、<code>delete_slide</code>（对象编号自动位移）、<code>move_slide</code> 重排。AI 直接听懂"复制第 1 页生成第 2 页"。</p>
+
+<h2>3. Wingdings 乱码根治（v0.2.2，三层防线）</h2>
+<p>Windows PPT 的项目符号用 Wingdings 私用码（U+F020-U+F0FF），macOS 无此字体导致渲染乱码。三层修复：上传时 <code>garble_fix</code> 自动把 buFont/buChar 换成 Unicode 等价符号；Noto Sans CJK SC 字体装入 LibreOffice；渲染走 launchd 常驻 worker 隔离会话。</p>
+<img class="shot" src="./shot-wingdings.png" alt="Wingdings 修复后">
+<p class="meta">▲ 极限压测 P2：6 种 Wingdings 私用码符号全部正确渲染（■✓●□✗➡）</p>
+
+<h2>4. Windows 字体声明自动重映射</h2>
+<p>上传时自动把 Microsoft YaHei / 微软雅黑 / SimSun / SimHei / 等线（含 UI 变体）声明替换为本机可 PDF 嵌入的 Noto Sans CJK SC（OFL 授权），根治"中文整段消失"。</p>
+<img class="shot" src="./shot-fonts6.png" alt="六字体压测">
+<p class="meta">▲ 极限压测 P1：微软雅黑/MS YaHei/UI/宋体/黑体/等线 六种声明全部正常渲染</p>
+
+<h2>5. 跨语言与符号混排</h2>
+<p>繁體中文、日文假名、箭头/数学符号、全套中文标点、Emoji 混排全部正常 fallback 渲染。</p>
+<img class="shot" src="./shot-mixed.png" alt="跨语言混排">
+<p class="meta">▲ 极限压测 P3：繁体+日文+特殊符号+中文标点+Emoji 全部正常</p>
+
+<h2>6. 22 项批量编辑操作（v0.3）</h2>
+<table>
+<tr><th>类别</th><th>操作</th></tr>
+<tr><td>文字</td><td>全局替换（跨页）、文字高亮、字体统一、批量字号 ±N 磅</td></tr>
+<tr><td>对象</td><td>对齐分布、复制对象、层级调整（置顶/上移/下移/置底）、替换图片</td></tr>
+<tr><td>表格</td><td>增删行列、合并单元格（文字保全）</td></tr>
+<tr><td>页面</td><td>背景纯色/渐变、批量页码（活字段）、版式库套用、AI 摘要页生成</td></tr>
+</table>
+
+<h2>7. 导入导出全家桶（v0.3/v0.4）</h2>
+<p>导出 PDF（含备注版讲义模式）、PNG 打包 zip、TXT 大纲（贴飞书即用）、整份另存副本、图片批量转 PPTX、版本对比（结构化 changelog）。</p>
+
+<h2>8. AI 对话体验（v0.3/v0.4）</h2>
+<p><b>多步规划</b>：复杂指令先出计划清单逐项执行汇报；<b>undo_last</b>：AI 可自动回退上一轮（连续撤销有血统锚点，undo-undo ≠ redo）；<b>错误自愈</b>：工具失败自动换参数重试；<b>风格模仿</b>：给参考页自动复用字体配色版式；<b>双语</b>：英文提问自动切英文回复。</p>
+
+<h2>9. 协作与安全（v0.4）</h2>
+<p><b>只读分享链接</b>（带 token、可撤销，发客户看预览）；<b>文档密码保护</b>；<b>操作审计日志</b>（audit.jsonl，界面查最近 50 条）；<b>宏检测</b>（含 vbaProject 的文件转只读预览，防宏病毒）。</p>
+
+<h2>10. 工程级可靠性</h2>
+<p><b>lint + fix 确定性自修</b>：每次改稿后自动检查文字溢出/越界/重叠，能修的自动修；<b>结构 diff</b>：版本对比精确到对象级变更；<b>watch 实时预览</b>：SSE 分屏看 AI 改稿过程；<b>渲染 worker 队列</b>：launchd 常驻隔离会话（根治 launchd 链丢字形问题）；<b>渲染缓存+超时降级</b>：部分页先出不整单失败。<b>518 个测试全绿</b>，每个功能测试先行。</p>
+
+<h2>质量指标</h2>
+<table>
+<tr><th>指标</th><th>数值</th></tr>
+<tr><td>测试用例</td><td class="pass">518 全绿（v0.1 起每项功能测试先行）</td></tr>
+<tr><td>版本</td><td>v0.1 → v0.5.0（5 个 tag，全部推送 GitHub tatuwoods/pptmo）</td></tr>
+<tr><td>累计功能</td><td>44+ 项（页内编辑 5 种 → 22 项批量操作 → 10 项对标功能）</td></tr>
+<tr><td>乱码修复</td><td class="pass">极限压测 3 页全绿（6 字体声明 + 6 种 Wingdings 码 + 跨语言混排）</td></tr>
+<tr><td>部署</td><td>launchd 常驻（com.tt06.pptlight :8090，KeepAlive 自启）；tailnet 9443 可远程访问</td></tr>
+</table>
+
+<p class="meta">仓库：github.com/tatuwoods/pptmo · 文档：SKILL.md / README.md / CHANGELOG · 截图：docs-shots/（本页所有截图均为真实服务渲染输出）</p>
+</body>
+</html>
