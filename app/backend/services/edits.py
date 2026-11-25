@@ -1392,7 +1392,7 @@ SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide",
 # deck-wide bulk ops (v0.3): run after shape patches but BEFORE slide-level ops
 # so slide_index parameters still refer to the base deck the caller read
 DECK_ACTIONS = {"font_unify", "replace_text", "font_scale", "add_page_numbers",
-                 "highlight_text", "theme_rebrand", "recolor"}
+                 "highlight_text", "theme_rebrand", "recolor", "set_transition"}
 
 _ACTION_ALIASES = {
     "update": "edit",
@@ -1479,6 +1479,10 @@ _ACTION_ALIASES = {
     "recolor": "recolor",
     "replace_color": "recolor",
     "color_mapping": "recolor",
+    # v0.5 #4 页面切换动画
+    "set_transition": "set_transition",
+    "transition": "set_transition",
+    "slide_transition": "set_transition",
 }
 
 
@@ -2895,6 +2899,163 @@ def _op_recolor(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
     return touched
 
 
+# ---------- v0.5 #4: set_transition 页面切换动画 ----------
+# python-pptx 无切换 API，手工组 <p:transition>（CT_Slide 序列位：
+# cSld → clrMapOvr → transition → timing → extLst，插错位 PowerPoint 会拒开）。
+
+# effect → 允许的 dir 取值（空集 = 该效果无 dir 属性；不传 dir 则省略用 OOXML 默认）
+_TRANSITION_DIRS = {
+    "fade": frozenset(),
+    "cut": frozenset(),
+    "dissolve": frozenset(),
+    "random": frozenset(),
+    "circle": frozenset(),
+    "diamond": frozenset(),
+    "plus": frozenset(),
+    "newsflash": frozenset(),
+    "wedge": frozenset(),
+    "wheel": frozenset(),
+    "push": frozenset({"l", "r", "u", "d"}),
+    "wipe": frozenset({"l", "r", "u", "d"}),
+    "pull": frozenset({"l", "r", "u", "d", "ld", "lu", "rd", "ru"}),
+    "cover": frozenset({"l", "r", "u", "d", "ld", "lu", "rd", "ru"}),
+    "zoom": frozenset({"in", "out"}),
+    "blinds": frozenset({"horz", "vert"}),
+    "checker": frozenset({"horz", "vert"}),
+    "comb": frozenset({"horz", "vert"}),
+    "randomBar": frozenset({"horz", "vert"}),
+    "split": frozenset({"horz", "vert"}),
+    "strips": frozenset({"ld", "ru"}),
+}
+
+_TRANSITION_ALIASES = {
+    "randombar": "randomBar",
+    "random_bar": "randomBar",
+    "淡入": "fade",
+    "淡出": "fade",
+    "淡化": "fade",
+    "推入": "push",
+    "推送": "push",
+    "擦除": "wipe",
+    "切割": "cut",
+    "溶解": "dissolve",
+    "覆盖": "cover",
+    "随机": "random",
+    "缩放": "zoom",
+    "百叶窗": "blinds",
+    "棋盘": "checker",
+    "梳理": "comb",
+    "分割": "split",
+    "条纹": "strips",
+    "楔形": "wedge",
+    "轮辐": "wheel",
+    "圆形": "circle",
+    "菱形": "diamond",
+    "十字": "plus",
+    "新闻纸": "newsflash",
+}
+
+_TRANSITION_SPEEDS = {"slow": "slow", "慢": "slow", "med": "med", "medium": "med",
+                      "中": "med", "normal": "med", "fast": "fast", "快": "fast"}
+
+_TRANSITION_NONE = {"none", "off", "remove", "无", "移除", "删除"}
+
+
+def _transition_effect(merged: Dict[str, Any]) -> str:
+    raw = merged.get("effect")
+    if raw is None:
+        raw = merged.get("transition")
+    if raw is None:
+        raise PatchError("set_transition 需要 effect（如 fade/push/wipe；none 为移除切换）")
+    name = str(raw).strip()
+    lowered = name.lower()
+    if lowered in _TRANSITION_NONE:
+        return "none"
+    canonical = _TRANSITION_ALIASES.get(name) or _TRANSITION_ALIASES.get(lowered, lowered)
+    if canonical not in _TRANSITION_DIRS:
+        raise PatchError(
+            f"未知切换效果 {name!r}（支持：{'/'.join(sorted(_TRANSITION_DIRS))}）"
+        )
+    return canonical
+
+
+def _remove_transition(sld) -> None:
+    for node in sld.findall(qn("p:transition")):
+        sld.remove(node)
+
+
+def _build_transition(effect: str, merged: Dict[str, Any]):
+    attrs = ""
+    speed = merged.get("speed")
+    if speed is not None:
+        canonical = _TRANSITION_SPEEDS.get(str(speed).strip().lower())
+        if canonical is None:
+            raise PatchError(f"speed 无效：{speed!r}（支持 slow/med/fast）")
+        attrs += f' spd="{canonical}"'
+    adv_click = merged.get("advance_on_click", merged.get("adv_click"))
+    if adv_click is not None:
+        if not isinstance(adv_click, bool):
+            raise PatchError(f"advance_on_click 需要 bool：{adv_click!r}")
+        attrs += f' advClick="{"1" if adv_click else "0"}"'
+    adv_after = merged.get("advance_after", merged.get("advance_after_seconds"))
+    if adv_after is not None:
+        try:
+            seconds = float(adv_after)
+        except (TypeError, ValueError):
+            raise PatchError(f"advance_after 需要秒数：{adv_after!r}")
+        if seconds <= 0 or seconds > 3600:
+            raise PatchError(f"advance_after 超出范围（0-3600 秒）：{adv_after!r}")
+        attrs += f' advTm="{int(round(seconds * 1000))}"'
+
+    inner_attrs = ""
+    if _TRANSITION_DIRS[effect]:
+        direction = merged.get("direction") or merged.get("dir")
+        if direction is not None:
+            direction = str(direction).strip()
+            if direction not in _TRANSITION_DIRS[effect]:
+                allowed = "/".join(sorted(_TRANSITION_DIRS[effect]))
+                raise PatchError(f"效果 {effect} 不支持方向 {direction!r}（允许 {allowed}）")
+            inner_attrs = f' dir="{direction}"'
+    return parse_xml(
+        f'<p:transition{attrs} xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+        f"<p:{effect}{inner_attrs}/></p:transition>"
+    )
+
+
+def _set_transition(sld, effect: str, merged: Dict[str, Any]) -> None:
+    _remove_transition(sld)
+    if effect == "none":
+        return
+    transition = _build_transition(effect, merged)
+    # CT_Slide 序列：transition 排在 timing/extLst 之前、cSld/clrMapOvr 之后
+    anchor = None
+    for tag in ("p:timing", "p:extLst"):
+        node = sld.find(qn(tag))
+        if node is not None:
+            anchor = node
+            break
+    if anchor is not None:
+        anchor.addprevious(transition)
+    else:
+        sld.append(transition)
+
+
+def _op_set_transition(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    effect = _transition_effect(merged)
+    if merged.get("slide_index") is not None:
+        index = _get_slide_param(merged, ("slide_index",), "slide_index")
+        if index is None or not (0 <= index < n_orig):
+            raise PatchError(f"slide_index 超出范围：{merged.get('slide_index')!r}（0..{n_orig - 1}）")
+        targets = [index]
+    elif merged.get("pages") is not None:
+        targets = parse_slide_spec(merged.get("pages"), n_orig)
+    else:
+        targets = list(range(n_orig))
+    for index in targets:
+        _set_transition(prs.slides[index]._element, effect, merged)
+    return set(targets)
+
+
 # ---------- v0.5 #3: merge 从另一 deck 拉页（跨包克隆） ----------
 # 源与目标属于不同 OPC 包：slide XML 深拷贝之外，版式/母版/主题/图片/图表等
 # 关系目标按源 part 树递归复制进目标包（partname 挪到空闲槽位），rId 重映射。
@@ -3063,6 +3224,8 @@ def _apply_deck_patches(
             touched.update(_op_theme_rebrand(prs, merged, n_orig))
         elif action == "recolor":
             touched.update(_op_recolor(prs, merged, n_orig))
+        elif action == "set_transition":
+            touched.update(_op_set_transition(prs, merged, n_orig))
         else:
             raise PatchError(f"unsupported bulk action: {action}")
     return touched
