@@ -32,7 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 import storage  # noqa: E402
-from services import agent, ai, broker, diff, edits, parse, render  # noqa: E402
+from services import agent, ai, broker, diff, edits, parse, render, vision  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ppt-light")
@@ -985,6 +985,7 @@ def chat(doc_id: str, body: ChatIn, x_doc_password: Optional[str] = Header(defau
                 base_version=start_version,
                 auto_apply=bool(body.auto_apply),
                 undo_last=lambda base_version: _agent_undo(doc_id, base_version),
+                vision_check=lambda slides: _agent_vision_check(doc_id, slides),
             )
         except Exception as exc:
             message_text = str(exc) or "Agent 执行失败"
@@ -1159,6 +1160,11 @@ def _apply_locked(doc_id: str, body: ApplyIn, label: str):
             from services import lint as lint_mod
 
             result["lint_issues"] = lint_mod.lint_pptx(storage.current_path(doc_id))
+            # v0.6 #1：渲染验证闭环入口——触达页的视觉自检 URL（多模态模型看渲染图）
+            result["vision_check_url"] = (
+                f"/api/docs/{doc_id}/vision-check?slides="
+                + ",".join(str(i) for i in sorted(set(touched)))
+            )
             # Mark exactly the message the patches came from. The legacy
             # label-prefix scan marked the newest un-applied assistant message even
             # when the user applied a different (or partial) set, silently
@@ -1447,6 +1453,86 @@ def _agent_undo(doc_id: str, base_version: Optional[int]) -> Dict[str, Any]:
         "new_version": result.get("version_id"),
         "label": f"撤销上一轮 · 回到 {result.get('restored_from')}",
     }
+
+
+def _resolve_slides_for_vision(doc_id: str, meta: Dict[str, Any], slides: Optional[List[int]]) -> List[int]:
+    """v0.6 #1：归一化自检页码（0-based，去重排序，封顶 MAX_PAGES_PER_CALL）。"""
+    total = int(meta.get("slide_count", 0))
+    if slides:
+        wanted = []
+        for item in slides:
+            try:
+                index = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < total and index not in wanted:
+                wanted.append(index)
+        return sorted(wanted)[: vision.MAX_PAGES_PER_CALL]
+    return list(range(min(total, vision.MAX_PAGES_PER_CALL)))
+
+
+def _vision_check_pages(doc_id: str, meta: Dict[str, Any], slides: Optional[List[int]]) -> Dict[str, Any]:
+    """对当前（或指定）版本的渲染 PNG 逐页跑多模态自检。
+
+    FileNotFoundError（页图未渲染）与 VisionError（模型不可用）原样上抛，
+    由全局 exception handler 转 404 / 502。"""
+    version = int(meta.get("version", 0))
+    wanted = _resolve_slides_for_vision(doc_id, meta, slides)
+    if not wanted:
+        raise HTTPException(status_code=400, detail="文档没有可自检的页面")
+    pages = [
+        vision.check_page_png(storage.image_path(doc_id, version, index), index + 1)
+        for index in wanted
+    ]
+    return {
+        "doc_id": doc_id,
+        "version_id": f"v{version}",
+        "model": pages[0].get("model") if pages else vision._model(),
+        "pages": pages,
+        "issue_count": sum(len(p.get("issues") or []) for p in pages),
+        "summary": vision.summarize(pages),
+    }
+
+
+def _agent_vision_check(doc_id: str, slides: Optional[List[int]]) -> Dict[str, Any]:
+    """vision_check 工具的后端回调：出错时返回 error 字段（observation 可读）。"""
+    try:
+        meta = storage.load_meta(doc_id)
+        return _vision_check_pages(doc_id, meta, slides)
+    except HTTPException as exc:
+        return {"error": str(exc.detail)}
+    except vision.VisionError as exc:
+        return {"error": str(exc)}
+    except FileNotFoundError:
+        return {"error": "渲染图尚未生成，请稍后重试"}
+
+
+@app.get("/api/docs/{doc_id}/vision-check")
+def vision_check_document(
+    doc_id: str,
+    slides: Optional[str] = None,
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
+    """v0.6 #1：渲染验证闭环——把渲染 PNG 喂多模态模型自检（溢出/乱码/塌版/对比度）。
+
+    slides：0-based 页码逗号列表（如 0,1,2）；缺省自检前 6 页。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    indices: Optional[List[int]] = None
+    if slides:
+        indices = []
+        for token in str(slides).split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                index = int(token)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"无效页码：{token}") from None
+            if index < 0 or index >= int(meta.get("slide_count", 0)):
+                raise HTTPException(status_code=400, detail=f"页码超出范围：{index}（文档共 {meta.get('slide_count')} 页）")
+            indices.append(index)
+    return _vision_check_pages(doc_id, meta, indices)
 
 
 @app.get("/api/docs/{doc_id}/download")
