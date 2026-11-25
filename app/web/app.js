@@ -24,6 +24,8 @@ const dom = {
   nextBtn: $id("nextBtn"),
   slideLabel: $id("slideLabel"),
   addTextBtn: $id("addTextBtn"),
+  visionBtn: $id("visionBtn"),
+  presentBtn: $id("presentBtn"),
   stageScroll: $id("stageScroll"),
   stage: $id("stage"),
   slideImage: $id("slideImage"),
@@ -237,6 +239,43 @@ async function openAuditPanel() {
   } catch (error) {
     toast(`读取审计日志失败：${error.message}`, "error");
   }
+}
+
+// v0.6 #1：渲染验证闭环——多模态模型「看」当前页渲染图（溢出/乱码/塌版/对比度）
+async function runVisionCheck() {
+  if (!state.doc) return;
+  const slide = state.slideIndex;
+  setStatus(`视觉自检中（第 ${slide + 1} 页）…`);
+  appendChatElement(
+    `<div class="chat-msg system"><div class="chat-bubble"><div class="chat-text">👁 正在自检第 ${slide + 1} 页渲染图…</div></div></div>`
+  );
+  try {
+    const data = await api(`/api/docs/${state.doc.doc_id}/vision-check?slides=${slide}`, {}, 240000);
+    const page = (data.pages || [])[0] || { issues: [] };
+    const kindLabels = { overflow: "溢出", garbled: "乱码", layout: "塌版", contrast: "对比度", other: "其他" };
+    const lines = (page.issues || []).map((issue) => {
+      const label = kindLabels[issue.kind] || issue.kind;
+      return `• [${label}] ${escapeHtml(issue.description)}${issue.suggestion ? `<br/>　→ 建议：${escapeHtml(issue.suggestion)}` : ""}`;
+    });
+    const body = page.ok
+      ? `✅ 第 ${slide + 1} 页自检通过，未发现溢出/乱码/塌版问题。`
+      : `第 ${slide + 1} 页发现 ${(page.issues || []).length} 处问题：<br/>${lines.join("<br/>")}`;
+    appendChatElement(
+      `<div class="chat-msg system"><div class="chat-bubble"><div class="chat-text">${body}</div><div class="chat-meta"><span>${escapeHtml(data.model || "")} · ${escapeHtml(data.version_id || "")}</span></div></div></div>`
+    );
+    setStatus(data.summary || "视觉自检完成");
+  } catch (error) {
+    appendChatElement(
+      `<div class="chat-msg system"><div class="chat-bubble"><div class="chat-text">⚠️ 视觉自检失败：${escapeHtml(error.message)}</div></div></div>`
+    );
+    setStatus("视觉自检失败");
+  }
+}
+
+// v0.6 #5：演示模式——渲染 PNG 全屏翻页 + 演讲者视图 + 排练计时（独立页面）
+function openPresentMode() {
+  if (!state.doc) return;
+  window.open(`/api/docs/${state.doc.doc_id}/present`, "_blank");
 }
 
 function setBusy(show, title = "处理中", text = "请稍候…") {
@@ -2247,6 +2286,8 @@ function bindEvents() {
   dom.prevBtn.addEventListener("click", () => setSlide(state.slideIndex - 1));
   dom.nextBtn.addEventListener("click", () => setSlide(state.slideIndex + 1));
   dom.addTextBtn.addEventListener("click", startDraftTextbox);
+  if (dom.visionBtn) dom.visionBtn.addEventListener("click", () => void runVisionCheck());
+  if (dom.presentBtn) dom.presentBtn.addEventListener("click", openPresentMode);
 
   dom.tabAi.addEventListener("click", () => switchTab("ai"));
   dom.tabText.addEventListener("click", () => switchTab("text"));
