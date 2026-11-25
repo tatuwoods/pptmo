@@ -32,7 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 import storage  # noqa: E402
-from services import agent, ai, broker, edits, parse, render  # noqa: E402
+from services import agent, ai, broker, diff, edits, parse, render  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ppt-light")
@@ -847,6 +847,20 @@ def get_document(doc_id: str, x_doc_password: Optional[str] = Header(default=Non
     return _serialize(meta, objects_payload)
 
 
+@app.get("/api/docs/{doc_id}/objects")
+def get_objects(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    """轻量对象清单：AI 补 alt_text/查 shape_id 时不必拉全量 doc 序列化。"""
+    meta, objects_payload = _load_doc(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    return {
+        "objects": objects_payload.get("objects", []),
+        "elements": objects_payload.get("elements", []),
+        "tables": objects_payload.get("tables", []),
+        "slide_count": int(meta.get("slide_count", 0)),
+        "version_id": _version_id(meta),
+    }
+
+
 @app.patch("/api/docs/{doc_id}")
 def rename_document(doc_id: str, body: RenameIn):
     with storage.lock_for(doc_id):
@@ -1141,6 +1155,10 @@ def _apply_locked(doc_id: str, body: ApplyIn, label: str):
                 page_count, expected_version=entry_version,
             )
             result = _commit_result(committed, objects_payload, sorted(touched))
+            # v0.5 #7：apply 后自动后置 lint，AI 拿 issues 决定是否再发 fix_issues
+            from services import lint as lint_mod
+
+            result["lint_issues"] = lint_mod.lint_pptx(storage.current_path(doc_id))
             # Mark exactly the message the patches came from. The legacy
             # label-prefix scan marked the newest un-applied assistant message even
             # when the user applied a different (or partial) set, silently
@@ -1941,6 +1959,7 @@ def compare_versions(doc_id: str, version_a: str, version_b: str):
             }
         )
     diff_pages = len(changed) + len(added) + len(removed)
+    struct = diff.structural_changelog(payload_a, payload_b)
     return {
         "a": a_id,
         "b": b_id,
@@ -1950,9 +1969,11 @@ def compare_versions(doc_id: str, version_a: str, version_b: str):
         "added": added,
         "removed": removed,
         "unchanged_pages": unchanged,
+        # v0.5 #8：对象级结构化 changelog（新增/删除/移动/几何/样式），JSON 给 AI 消费
+        "struct": struct,
         "summary": (
             f"共 {diff_pages} 页存在差异：改动 {len(changed)} 页、"
-            f"新增 {len(added)} 页、删除 {len(removed)} 页"
+            f"新增 {len(added)} 页、删除 {len(removed)} 页；{struct['summary']['text']}"
         ),
     }
 
@@ -2496,6 +2517,22 @@ def watch_page(doc_id: str, x_doc_password: Optional[str] = Header(default=None,
     # 标题由页面 JS 拉取 /api/docs/{id} 后自行填充；模板只需注入 doc_id
     page = _WATCH_PAGE.replace("__DOC_ID__", doc_id)
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/docs/{doc_id}/lint")
+def lint_document(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    """v0.5 #7：按需 lint 当前版本（apply 响应也自动带 lint_issues）。"""
+    from services import lint as lint_mod
+
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    issues = lint_mod.lint_pptx(storage.current_path(doc_id))
+    return {
+        "doc_id": doc_id,
+        "version_id": f"v{int(meta.get('version', 0))}",
+        "issues": issues,
+        "count": len(issues),
+    }
 
 
 @app.get("/api/docs/{doc_id}/slides/{slide_index}/image")

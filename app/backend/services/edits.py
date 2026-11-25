@@ -1315,6 +1315,9 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
     if action == "set_hyperlink":
         _apply_set_hyperlink(shape, merged)
         return slide_index
+    if action == "set_alt_text":
+        _apply_set_alt_text(shape, merged)
+        return slide_index
     if action == "remove_hyperlink":
         _apply_remove_hyperlink(shape)
         return slide_index
@@ -1393,7 +1396,7 @@ SLIDE_ACTIONS = {"duplicate_slide", "add_slide", "delete_slide", "move_slide",
 # so slide_index parameters still refer to the base deck the caller read
 DECK_ACTIONS = {"font_unify", "replace_text", "font_scale", "add_page_numbers",
                  "highlight_text", "theme_rebrand", "recolor", "set_transition",
-                 "hide_slide", "show_slide"}
+                 "hide_slide", "show_slide", "edit_props", "fix_issues"}
 
 _ACTION_ALIASES = {
     "update": "edit",
@@ -1494,6 +1497,22 @@ _ACTION_ALIASES = {
     "unhide": "show_slide",
     "unhide_slide": "show_slide",
     "show_page": "show_slide",
+    # v0.5 #6 文档元数据 / 替代文本
+    "edit_props": "edit_props",
+    "set_props": "edit_props",
+    "props": "edit_props",
+    "edit_metadata": "edit_props",
+    "set_metadata": "edit_props",
+    "set_alt_text": "set_alt_text",
+    "alt_text": "set_alt_text",
+    "set_alttext": "set_alt_text",
+    "alttext": "set_alt_text",
+    # v0.5 #7 lint 自修
+    "fix_issues": "fix_issues",
+    "fix": "fix_issues",
+    "auto_fix": "fix_issues",
+    "autofix": "fix_issues",
+    "lint_fix": "fix_issues",
 }
 
 
@@ -3088,6 +3107,197 @@ def _op_slide_visibility(prs, merged: Dict[str, Any], n_orig: int, hide: bool) -
     return set(targets)
 
 
+# ---------- v0.5 #7: fix_issues 确定性自修 ----------
+# 判定与 services/lint.py 共用同一套几何启发式，修什么由 lint 报什么决定；
+# 重叠（shape_overlap）没有确定性答案，只告警不修。
+
+def _fix_font_bounds(shape, min_pt: float, max_pt: float) -> bool:
+    if not getattr(shape, "has_text_frame", False):
+        return False
+    changed = False
+    for paragraph in shape.text_frame.paragraphs:
+        for run in paragraph.runs:
+            if run.font.size is None:
+                continue
+            pt = float(run.font.size.pt)
+            clamped = min(max(pt, min_pt), max_pt)
+            if clamped != pt:
+                run.font.size = Pt(clamped)
+                changed = True
+    return changed
+
+
+def _fix_text_overflow(shape, min_pt: float) -> bool:
+    """缩字号直到装下：显式字号缺省时先落一个默认值再缩。"""
+    from services import lint as lint_mod
+
+    if not getattr(shape, "has_text_frame", False):
+        return False
+    text = str(shape.text or "")
+    if not text.strip():
+        return False
+    changed = False
+    if not lint_mod._run_sizes(shape):
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(lint_mod.DEFAULT_FONT_PT)
+                changed = True
+    # 局部 bbox（组内子形状的坐标缩放通常 ≈1，溢出估算够用）
+    bbox = (_int_or0(shape.left), _int_or0(shape.top), _int_or0(shape.width), _int_or0(shape.height))
+    for _ in range(int(lint_mod.DEFAULT_FONT_PT) + 8):
+        if lint_mod.text_fits(shape, bbox):
+            break
+        shrunk = False
+        for paragraph in shape.text_frame.paragraphs:
+            for run in paragraph.runs:
+                if run.font.size is None:
+                    continue
+                pt = float(run.font.size.pt)
+                if pt > min_pt:
+                    run.font.size = Pt(max(min_pt, pt - 1.0))
+                    shrunk = True
+                    changed = True
+        if not shrunk:
+            break  # 全部到下限仍装不下：保住下限，剩余问题留给 lint 再报
+    return changed
+
+
+def _int_or0(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fix_into_canvas(shape, slide_w: int, slide_h: int) -> bool:
+    """收回画布：先裁超宽高，再平移到界内。"""
+    if shape.width is None or shape.height is None:
+        return False
+    changed = False
+    width, height = _int_or0(shape.width), _int_or0(shape.height)
+    if width > slide_w:
+        shape.width = slide_w
+        width = slide_w
+        changed = True
+    if height > slide_h:
+        shape.height = slide_h
+        height = slide_h
+        changed = True
+    left, top = _int_or0(shape.left), _int_or0(shape.top)
+    new_left = min(max(left, 0), slide_w - width)
+    new_top = min(max(top, 0), slide_h - height)
+    if new_left != left:
+        shape.left = new_left
+        changed = True
+    if new_top != top:
+        shape.top = new_top
+        changed = True
+    return changed
+
+
+def _op_fix_issues(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    from services import lint as lint_mod
+
+    kinds = merged.get("kinds")
+    if isinstance(kinds, str):
+        kinds = [kinds]
+    kinds = set(kinds) if kinds else set(lint_mod.FIXABLE_KINDS)
+    unknown = kinds - set(lint_mod.FIXABLE_KINDS)
+    if unknown:
+        raise PatchError(f"fix_issues 不支持的问题类型：{sorted(unknown)}")
+    pages = merged.get("pages")
+    if pages in (None, "", "all", "ALL", "全部", "*"):
+        targets = list(range(n_orig))
+    else:
+        targets = parse_slide_spec(pages, n_orig)
+    slide_w, slide_h = _int_or0(prs.slide_width), _int_or0(prs.slide_height)
+    touched: Set[int] = set()
+    for index in targets:
+        changed = False
+        for shape, _bbox, _is_group in lint_mod._iter_shapes(prs.slides[index].shapes):
+            if "font_size_out_of_range" in kinds:
+                changed |= _fix_font_bounds(shape, lint_mod.MIN_FONT_PT, lint_mod.MAX_FONT_PT)
+            if "text_overflow" in kinds and not lint_mod.text_fits(shape, _bbox):
+                changed |= _fix_text_overflow(shape, lint_mod.MIN_FONT_PT)
+            if "shape_off_canvas" in kinds:
+                changed |= _fix_into_canvas(shape, slide_w, slide_h)
+        if changed:
+            touched.add(index)
+    return touched
+
+
+# ---------- v0.5 #6: edit_props 文档元数据 / set_alt_text 替代文本 ----------
+
+# docProps/core.xml 里可写的常用槽位（python-pptx core_properties 同名属性）
+_PROPS_FIELDS = ("title", "author", "subject", "keywords", "comments", "category")
+_PROPS_FIELD_ALIASES = {
+    "title": "title", "标题": "title",
+    "author": "author", "作者": "author", "creator": "author",
+    "subject": "subject", "主题": "subject", "topic": "subject",
+    "keywords": "keywords", "关键词": "keywords", "tags": "keywords",
+    "comments": "comments", "备注": "comments", "comment": "comments",
+    "description": "comments",
+    "category": "category", "分类": "category",
+}
+
+MAX_ALT_TEXT_CHARS = 1000
+
+
+def _op_edit_props(prs, merged: Dict[str, Any], n_orig: int) -> Set[int]:
+    core = prs.core_properties
+    updates: Dict[str, Any] = {}
+    for key, value in merged.items():
+        if key in ("action", "payload", "label", "slide_index", "shape_id", "pages"):
+            continue
+        field = _PROPS_FIELD_ALIASES.get(str(key).strip().lower()) or \
+            _PROPS_FIELD_ALIASES.get(str(key).strip())
+        if field is None:
+            raise PatchError(
+                f"未知属性 {key}（支持：{', '.join(_PROPS_FIELDS)}）"
+            )
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(item) for item in value)
+        updates[field] = str(value)
+    if not updates:
+        raise PatchError(
+            f"edit_props 需要至少一个字段（{', '.join(_PROPS_FIELDS)}）"
+        )
+    for field, value in updates.items():
+        setattr(core, field, value)
+    return set()  # 元数据不属于任何一页
+
+
+def _shape_cnvpr(shape):
+    """形状自己的 p:cNvPr（id/name/descr 挂这里）。nv*Pr 块是元素首子节点，
+    取第一个 cNvPr 后代即命中；图片/表格/组合/连线容器名不同但结构一致。"""
+    from lxml import etree as _etree
+
+    for node in shape._element.iter():
+        if isinstance(node.tag, str) and _etree.QName(node).localname == "cNvPr":
+            return node
+    return None
+
+
+def _apply_set_alt_text(shape, merged: Dict[str, Any]) -> None:
+    text = merged.get("alt_text")
+    if text is None:
+        text = merged.get("descr")
+    if text is None:
+        raise PatchError("set_alt_text 需要 alt_text（空字符串清除）")
+    text = str(text)
+    if len(text) > MAX_ALT_TEXT_CHARS:
+        raise PatchError(f"alt_text too long (max {MAX_ALT_TEXT_CHARS} chars)")
+    node = _shape_cnvpr(shape)
+    if node is None:
+        raise PatchError("对象缺少 cNvPr，无法设置替代文本")
+    if text:
+        node.set("descr", text)
+    else:
+        node.attrib.pop("descr", None)  # 清除而不是留空串
+
+
 # ---------- v0.5 #3: merge 从另一 deck 拉页（跨包克隆） ----------
 # 源与目标属于不同 OPC 包：slide XML 深拷贝之外，版式/母版/主题/图片/图表等
 # 关系目标按源 part 树递归复制进目标包（partname 挪到空闲槽位），rId 重映射。
@@ -3262,6 +3472,10 @@ def _apply_deck_patches(
             touched.update(_op_slide_visibility(prs, merged, n_orig, hide=True))
         elif action == "show_slide":
             touched.update(_op_slide_visibility(prs, merged, n_orig, hide=False))
+        elif action == "edit_props":
+            touched.update(_op_edit_props(prs, merged, n_orig))
+        elif action == "fix_issues":
+            touched.update(_op_fix_issues(prs, merged, n_orig))
         else:
             raise PatchError(f"unsupported bulk action: {action}")
     return touched
