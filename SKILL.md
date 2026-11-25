@@ -103,6 +103,27 @@ Say “第 N 页” in the message and the server auto-scopes to that slide (Chi
 
 Useful endpoints beyond these: `GET /api/sessions`, `GET /api/docs/{id}` (objects+messages in one shot), `GET /api/docs/{id}/versions`, `POST .../versions/{v}/restore`, `GET /api/docs/{id}/slides/{n}/image`. Interactive docs at `/api/docs-ui`.
 
+## v0.5 operations (rebrand / merge / transitions / hide / lint / diff / watch)
+
+Deck-wide ops go through the same `/apply` channel as patches:
+
+```json
+{"action":"theme_rebrand","payload":{"palette":{"accent1":"1A1A2E","accent2":"16213E"},"fonts":{"major":"Source Han Sans","minor":"Source Han Sans"}}}
+{"action":"recolor","payload":{"mapping":{"FF0000":"0066CC","000000":"222222"}}}
+{"action":"set_transition","payload":{"pages":"all","effect":"push","direction":"l","speed":"slow","advance_after":3}}
+{"action":"hide_slide","payload":{"pages":"2-3"}}        // show_slide unhides; parse marks slides[].hidden
+{"action":"edit_props","payload":{"title":"Q3 复盘","author":"张三","keywords":["销售","复盘"]}}
+{"action":"set_alt_text","shape_id":"s0_id4","alt_text":"柱状图：Q3 销售额"}   // pictures now appear in objects (kind=picture)
+{"action":"fix_issues","payload":{"kinds":["off_canvas","text_overflow"]}}    // deterministic lint self-fix
+```
+
+- **theme_rebrand vs recolor**: the first rewrites theme scheme colors + major/minor fonts (shapes referencing `accent1` etc. follow); the second remaps hard-coded fills (incl. gradient stops) via an exact hex mapping. Use both to re-brand a template deck.
+- **merge**: `POST /api/docs/{id}/merge` with multipart `file` (source pptx), `pages` (1-based selector, empty = all), `position` (0-based insert index). Layouts/masters/images are re-homed across the OPC package; notes travel with the page.
+- **lint**: every apply response carries `lint.issues` (text overflow / font size out of range / off-canvas / overlap warnings); `GET /api/docs/{id}/lint` checks on demand. `fix_issues` repairs deterministically (shrink font / pull back into canvas); overlaps are warn-only. Let the AI read `issues` and decide whether to fix.
+- **structural diff**: `GET /api/docs/{id}/versions/{a}/compare/{b}` now also returns a `changelog` — object-level added/removed, geometry changes (which axis, moved vs resized), style changes (font/size/bold/color), matched by `shape_id` per page. JSON for AI consumption.
+- **watch**: open `GET /api/docs/{id}/watch` in a browser — split-pane live preview. Changes publish SSE events on `GET /api/docs/{id}/events` (`hello` on connect, `changed` with version/touched_slides on every commit: apply/chat-auto-apply/undo/restore/merge).
+- **hidden pages & export**: export PDF / images.zip / pdf-notes skip hidden slides by default; add `?include_hidden=1` to include them. Outline marks hidden pages「（已隐藏）」.
+
 ## Remote access via Tailscale
 
 Best practice: keep uvicorn bound to `127.0.0.1` and publish through `tailscale serve` (auto-HTTPS, tailnet-only, streams SSE fine). **Since v0.1.2 the app runs a request guard** (anti drive-by / DNS-rebinding), so proxied browser traffic needs the public host whitelisted in `backend/.env` or every cross-origin POST gets 403:
