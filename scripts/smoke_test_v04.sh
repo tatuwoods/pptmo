@@ -60,9 +60,16 @@ run_checks() {
 
   echo "== v0.4 smoke against $BASE =="
 
-  # 1. health 版本号
+  # 1. health 版本号（回归脚本：>=0.4.0 即可，服务升级后仍可复用）
   ver=$(curl -sf --max-time 10 "$BASE/api/health" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null)
-  check "health version" "$ver" "0.4.0"
+  ge=$(echo "$ver" | "$PY" -c 'import sys
+ok=False
+try:
+    parts=[int(x) for x in sys.stdin.read().strip().split(".")]
+    ok=parts>=[0,4,0]
+except ValueError: pass
+print("yes" if ok else "no")' 2>/dev/null)
+  if [[ "$ge" == "yes" ]]; then ok "health version >=0.4.0 ($ver)"; else bad "health version (got ${ver:-none}, want >=0.4.0)"; fi
 
   # 2. 上传 + 改标题产生 v1（后续 compare/undo 的素材）
   doc=$(curl -sf --max-time 300 -X POST "$BASE/api/docs/upload" -F "file=@$DEMO")
