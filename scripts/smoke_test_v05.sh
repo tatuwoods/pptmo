@@ -184,12 +184,18 @@ run_checks() {
   check "include_hidden keeps all pages" "$(pdf_pages "$SCRATCH/out-all.pdf" 2>/dev/null)" "4"
 
   # 7. watch SSE：连上即 hello；触发一次 apply 后收到 changed
-  curl -sN --max-time 20 "$BASE/api/docs/$doc_id/events" >"$SCRATCH/sse.log" 2>/dev/null &
+  #    hello 落盘后才 apply —— /events 是同步端点走线程池，前面 PDF 导出占满
+  #    worker 时注册订阅可延迟数秒，固定 sleep 2 会把 changed 漏在订阅前。
+  curl -sN --max-time 30 "$BASE/api/docs/$doc_id/events" >"$SCRATCH/sse.log" 2>/dev/null &
   sse_pid=$!
-  sleep 2
+  hello_waited=0
+  until grep -q "event: hello" "$SCRATCH/sse.log" 2>/dev/null; do
+    if (( hello_waited >= 15 )); then break; fi
+    sleep 1; hello_waited=$((hello_waited + 1))
+  done
   curl -sf --max-time 300 -X POST "$BASE/api/docs/$doc_id/apply" -H 'Content-Type: application/json' \
     -d '{"patches":[{"action":"show_slide","payload":{"pages":"4"}}],"label":"冒烟v05取消隐藏"}' >/dev/null
-  sleep 3
+  sleep 5
   kill "$sse_pid" 2>/dev/null; wait "$sse_pid" 2>/dev/null
   grep -q "event: hello" "$SCRATCH/sse.log" && ok "watch SSE hello event" || bad "watch SSE missing hello"
   grep -q "event: changed" "$SCRATCH/sse.log" && ok "watch SSE changed event on apply" || bad "watch SSE missing changed"
