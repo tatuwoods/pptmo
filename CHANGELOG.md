@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.5.0 — 对标 GitHub 顶级同类项目，10 项高价值功能 (2026-11-25)
+
+对标 hands-on-deck（结构化编辑）/ OfficeCLI（render→look→fix）/ dashi-ppt-skill /
+Kami，围绕「对话式精准改稿」定位取长补短：
+
+1. `theme_rebrand` — 整套重主题：改 theme part 的 scheme colors + major/minor
+   字体，一次操作整套 PPT 换品牌色（模板 deck 重品牌化的核心原语）
+2. `recolor` — 调色板映射：`{mapping: {"FF0000":"0066CC"}}` 全稿扫描
+   solidFill/渐变 stop 按映射替换（管硬编码颜色，与 theme_rebrand 互补）
+3. `POST /api/docs/{id}/merge` — 从另一 deck 拉页：上传源 PPTX + 页码选择器 +
+   position，跨 OPC 包克隆（slide part + 版式/母版/图片 rels 全量重新家园化）
+4. `set_transition` — 页面切换动画：fade/push/wipe 等 21 种效果 + 方向 +
+   速度 + 自动换片（手工组 `<p:transition>` XML）
+5. `hide_slide` / `show_slide` — 隐藏页：`show="0"` 挂 sldId，播放/导出自动
+   跳过，页码/对象结构不动（不同于删页）；parse 输出 hidden 标记
+6. `edit_props` + `set_alt_text` — 文档元数据（标题/作者/主题/关键词）+
+   对象替代文本（无障碍 + AI 理解图片内容）；轻量 `GET /objects` 清单
+7. lint + `fix_issues` — 后置 lint：apply 后自动检查（文字溢出框外/字号超界/
+   对象越画布/重叠告警）返回 issues；fix 确定性修复（缩字号/收回画布），
+   重叠只告警；`GET /api/docs/{id}/lint` 按需检查
+8. 结构 diff 增强 — 版本对比输出对象级结构化 changelog（新增/删除/移动了
+   哪些对象、几何变化、样式变化），JSON 给 AI 消费
+9. watch 实时预览 — `GET /api/docs/{id}/watch` 浏览器分屏实时看渲染图变化
+   （SSE 推送版本变更事件，apply/undo/restore/merge 全覆盖）
+10. 隐藏页 + 导出联动 — 导出 PDF/PNG zip/pdf-notes 默认跳过隐藏页
+    （`?include_hidden=1` 可含）；outline 大纲标注「（已隐藏）」
+
 ## v0.4.0 — second-round optimization, 22 items (2026-11-24)
 
 ### A. Editing & AI (edits.py + agent.py, 8 items)
