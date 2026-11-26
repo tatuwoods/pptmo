@@ -1903,8 +1903,12 @@ IMPORT_IMAGE_MAX_BYTES = 30 * 1024 * 1024
 
 
 @app.post("/api/docs/import-images")
-def import_images(files: Optional[List[UploadFile]] = File(None)):
-    """多张图片（扫描件/截图）每张一页生成 PPTX，图片满宽居中。"""
+def import_images(files: Optional[List[UploadFile]] = File(None), ocr: str = Form("1")):
+    """多张图片（扫描件/截图）每张一页生成 PPTX，图片满宽居中。
+
+    v0.6 #4：默认开启本机 OCR（macOS Vision via pyobjc）——识别出的文字行
+    生成原生文本框叠在图片上层（可直接改字），图片保留作背景层；`ocr=0` 关闭；
+    OCR 不可用/失败/无文字时行为与 v0.4 一致（纯图片页）。"""
     if not files:
         raise HTTPException(status_code=400, detail="请至少上传 1 张图片（png/jpg）")
     if len(files) > IMPORT_IMAGES_MAX:
@@ -1938,6 +1942,16 @@ def import_images(files: Optional[List[UploadFile]] = File(None)):
     from pptx import Presentation as _Presentation
     from pptx.util import Emu as _Emu
 
+    from services import ocr as ocr_mod
+
+    ocr_requested = str(ocr or "").strip().lower() not in ("0", "false", "no", "off")
+    ocr_ok = True
+    ocr_active = ocr_requested and ocr_mod.ocr_available()
+    if ocr_requested and not ocr_active:
+        log.info("import-images: OCR requested but unavailable — falling back to image-only pages")
+    ocr_lines_total = 0
+    ocr_pages_with_text = 0
+
     prs = _Presentation()
     blank = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
     slide_w, slide_h = int(prs.slide_width), int(prs.slide_height)
@@ -1945,6 +1959,23 @@ def import_images(files: Optional[List[UploadFile]] = File(None)):
         slide = prs.slides.add_slide(blank)
         picture = slide.shapes.add_picture(io.BytesIO(data), _Emu(0), _Emu(0), width=_Emu(slide_w))
         picture.top = _Emu(max(0, (slide_h - int(picture.height)) // 2))
+        if ocr_active:
+            try:
+                lines = ocr_mod.ocr_image_bytes(data)
+            except Exception as exc:
+                log.warning("import-images: OCR failed for one page: %s", exc)
+                lines = []
+                ocr_ok = False
+            if lines:
+                ocr_pages_with_text += 1
+                ocr_lines_total += ocr_mod.overlay_textboxes(
+                    slide,
+                    lines,
+                    int(picture.left),
+                    int(picture.top),
+                    int(picture.width),
+                    int(picture.height),
+                )
     file_name = f"{(first_stem or '图片集')[:60]}-imported.pptx"
     storage.ensure_dirs()
     tmp_dir = storage.DATA_DIR / "tmp"
@@ -1967,7 +1998,13 @@ def import_images(files: Optional[List[UploadFile]] = File(None)):
         storage.save_objects(doc_id, parsed)
         _render_with_cache(doc_id, storage.current_path(doc_id), storage.render_dir(doc_id, 0))
         _prewarm_doc_async(doc_id)
-        return _serialize(meta, parsed)
+        result = _serialize(meta, parsed)
+        result["ocr"] = {
+            "enabled": bool(ocr_active and ocr_ok),
+            "pages_with_text": ocr_pages_with_text,
+            "lines": ocr_lines_total,
+        }
+        return result
     except Exception:
         if doc_id:
             shutil.rmtree(storage.doc_dir(doc_id), ignore_errors=True)

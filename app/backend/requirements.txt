@@ -5,3 +5,5 @@ python-multipart==0.0.9
 python-dotenv==1.0.1
 requests==2.32.3
 pymupdf>=1.24.0
+# v0.6 #4: 本机 OCR（macOS Vision framework）；非 macOS 平台自动跳过，导入退回纯图片页
+pyobjc-framework-Vision>=10.0; sys_platform == "darwin"
