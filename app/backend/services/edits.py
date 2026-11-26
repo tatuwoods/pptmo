@@ -1219,7 +1219,7 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
             if isinstance(notes_list, list):
                 items = notes_list
         if isinstance(items, list) and items:
-            last_index = 0
+            touched_indices: Set[int] = set()
             for entry in items:
                 if not isinstance(entry, dict):
                     raise PatchError("edit_notes.items 每项需要 {slide_index, text}")
@@ -1233,8 +1233,10 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
                 if text is None:
                     text = entry.get("after")
                 _set_slide_notes(prs.slides[item_index], "" if text is None else str(text))
-                last_index = item_index
-            return last_index
+                touched_indices.add(item_index)
+            # v0.6 #2：返回整组触达页（此前只回最后一页，passthrough 会把
+            # 其余页的 notes 用原字节还原掉——批量备注静默丢失）
+            return touched_indices
         try:
             slide_index = int(merged.get("slide_index"))
         except (TypeError, ValueError):
@@ -3446,6 +3448,15 @@ def merge_slides_from_file(
             _move_sld_id(dst_prs, n_dst + offset, position + offset)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     dst_prs.save(str(out_path))
+    # v0.6 #2：merge 只动 sldIdLst 和新增 part，既有页未触碰 → 原字节回填
+    # （外来页 part 名不在 dst 原页序里，不会被还原）
+    from . import passthrough
+
+    if passthrough.passthrough_enabled():
+        try:
+            passthrough.preserve_untouched_slides(dst_path, out_path, touched=set())
+        except Exception:  # noqa: BLE001 — 保真失败不阻塞正常保存
+            pass
     return len(page_indexes), set(range(position, position + len(page_indexes)))
 
 
@@ -3519,7 +3530,13 @@ def apply_patches_to_file(
         if _canonical_action(patch) == "align_objects":
             touched.add(_apply_align_objects(prs, patch))
         else:
-            touched.add(_apply_one(prs, patch, seen))
+            result = _apply_one(prs, patch, seen)
+            if isinstance(result, set):
+                # v0.6 #2：批量项（edit_notes.items 等）返回整组触达页，
+                # passthrough 按此判定哪些 part 不能原字节还原
+                touched.update(result)
+            else:
+                touched.add(result)
     if deck_patches:
         # deck ops still resolve against base numbering → must run before
         # slide-level ops mutate the deck
@@ -3528,4 +3545,13 @@ def apply_patches_to_file(
         touched.update(_apply_slide_patches(prs, slide_patches, n_orig))
     dst.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(dst))
+    # v0.6 #2：未触碰页的 slide part 原字节写回（动画/自定义 XML 保真）。
+    # touched 为原始页索引，按 part 名映射；重排/增删页不影响还原目标。
+    from . import passthrough
+
+    if passthrough.passthrough_enabled():
+        try:
+            passthrough.preserve_untouched_slides(src, dst, touched)
+        except Exception:  # noqa: BLE001 — 保真失败不阻塞正常保存
+            pass
     return touched
