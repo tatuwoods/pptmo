@@ -19,8 +19,12 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
+from lxml import etree
 from pptx import Presentation
+from pptx.enum.dml import MSO_THEME_COLOR
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.oxml.ns import qn
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.util import Pt
 
 MIN_FONT_PT = 8.0
@@ -253,19 +257,104 @@ def _slide_background_rgb(slide) -> Optional[str]:
         return None
 
 
-def _run_font_rgb(shape) -> Optional[str]:
-    """首个显式设置过的 run 字体色 RGB hex；无显式色返回 None（不猜主题色）。"""
+def _run_font_rgb(shape, theme_parsed: Optional[Dict[str, Dict[str, str]]] = None) -> Optional[str]:
+    """首个显式 run 字体色 hex：显式 RGB 优先，主题色经 theme+clrMap 解析；都没有返回 None。"""
     if not getattr(shape, "has_text_frame", False):
         return None
     for paragraph in shape.text_frame.paragraphs:
         for run in paragraph.runs:
             try:
-                rgb = run.font.color.rgb
+                color = run.font.color
+                try:
+                    rgb = color.rgb  # SCHEME 色在此抛 TypeError，走主题解析分支
+                except Exception:
+                    rgb = None
                 if rgb is not None:
                     return str(rgb)
+                if theme_parsed is not None:
+                    if getattr(color, "brightness", 0) or 0:
+                        continue  # 带亮度修饰（tint/shade）的主题色还原不准，不猜
+                    resolved = _resolve_theme_hex(color.theme_color, theme_parsed)
+                    if resolved:
+                        return resolved
             except Exception:
                 continue
     return None
+
+
+# ---------- 主题色解析：schemeClr（如 bg1/tx1）→ 具体 hex ----------
+
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_SYS_COLOR_FALLBACK = {"window": "FFFFFF", "windowText": "000000"}
+# clrMap 缺失时的常规缺省（浅色主题惯例：bg1→lt1、tx1→dk1）
+_CLR_MAP_DEFAULT = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}
+
+_THEME_COLOR_TO_SLOT: Dict[Any, str] = {
+    MSO_THEME_COLOR.ACCENT_1: "accent1",
+    MSO_THEME_COLOR.ACCENT_2: "accent2",
+    MSO_THEME_COLOR.ACCENT_3: "accent3",
+    MSO_THEME_COLOR.ACCENT_4: "accent4",
+    MSO_THEME_COLOR.ACCENT_5: "accent5",
+    MSO_THEME_COLOR.ACCENT_6: "accent6",
+    MSO_THEME_COLOR.BACKGROUND_1: "bg1",
+    MSO_THEME_COLOR.BACKGROUND_2: "bg2",
+    MSO_THEME_COLOR.TEXT_1: "tx1",
+    MSO_THEME_COLOR.TEXT_2: "tx2",
+    MSO_THEME_COLOR.DARK_1: "dk1",
+    MSO_THEME_COLOR.DARK_2: "dk2",
+    MSO_THEME_COLOR.LIGHT_1: "lt1",
+    MSO_THEME_COLOR.LIGHT_2: "lt2",
+    MSO_THEME_COLOR.HYPERLINK: "hlink",
+    MSO_THEME_COLOR.FOLLOWED_HYPERLINK: "folHlink",
+}
+
+
+def _theme_parsed(slide, cache: Dict[str, Dict[str, Dict[str, str]]]) -> Dict[str, Dict[str, str]]:
+    """该页所属 master 的 {"scheme": {slot: hex}, "map": {逻辑槽: scheme 槽}}；解析失败返回空结构。
+
+    同一 master 只解析一次（按 partname 缓存在本次 lint 调用内）。
+    """
+    try:
+        master = slide.slide_layout.slide_master
+    except Exception:
+        return {"scheme": {}, "map": {}}
+    key = str(master.part.partname)
+    if key not in cache:
+        scheme: Dict[str, str] = {}
+        clr_map: Dict[str, str] = {}
+        try:
+            theme_part = master.part.part_related_by(RT.THEME)
+            root = etree.fromstring(theme_part.blob)
+            scheme_el = root.find(f".//{{{_A_NS}}}clrScheme")
+            if scheme_el is not None:
+                for slot_el in scheme_el:
+                    slot = etree.QName(slot_el).localname
+                    srgb = slot_el.find(f"{{{_A_NS}}}srgbClr")
+                    if srgb is not None and srgb.get("val"):
+                        scheme[slot] = str(srgb.get("val"))
+                        continue
+                    sys_el = slot_el.find(f"{{{_A_NS}}}sysClr")
+                    if sys_el is not None:
+                        fallback = sys_el.get("lastClr") or _SYS_COLOR_FALLBACK.get(str(sys_el.get("val") or ""))
+                        if fallback:
+                            scheme[slot] = fallback
+            clr_map_el = master.element.find(qn("p:clrMap"))
+            if clr_map_el is not None:
+                clr_map = {str(k): str(v) for k, v in clr_map_el.attrib.items()}
+        except Exception:
+            pass
+        cache[key] = {"scheme": scheme, "map": clr_map}
+    return cache[key]
+
+
+def _resolve_theme_hex(theme_color, parsed: Dict[str, Dict[str, str]]) -> Optional[str]:
+    """MSO_THEME_COLOR → hex：逻辑槽（bg1/tx1/…）先经 master clrMap 映射到 scheme 槽。"""
+    slot = _THEME_COLOR_TO_SLOT.get(theme_color)
+    if not slot:
+        return None
+    if slot in _CLR_MAP_DEFAULT:
+        slot = parsed["map"].get(slot) or _CLR_MAP_DEFAULT[slot]
+    return parsed["scheme"].get(slot) or None
 
 
 def _rel_luminance(hex_rgb: str) -> float:
@@ -297,9 +386,15 @@ def _is_title_placeholder(shape) -> bool:
         return False
 
 
-def _slide_design_issues(slide, slide_index: int) -> List[Dict[str, Any]]:
+def _slide_design_issues(
+    slide,
+    slide_index: int,
+    theme_cache: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
+) -> List[Dict[str, Any]]:
     """字号层级混乱 / 对比度过低 / 图片拉伸变形（全部 warn-only，交给 AI 决策）。"""
     issues: List[Dict[str, Any]] = []
+    theme_cache = theme_cache if theme_cache is not None else {}
+    theme_parsed = _theme_parsed(slide, theme_cache)
 
     # 1) 字号层级：标题占位符与正文都有显式字号时才比较（继承字号不猜）
     title_max: Optional[float] = None
@@ -327,12 +422,12 @@ def _slide_design_issues(slide, slide_index: int) -> List[Dict[str, Any]]:
             ),
         }))
 
-    # 2) 对比度：文字色 vs 形状填充，无形状填充时看页面背景；两色都显式才判
+    # 2) 对比度：文字色（显式 RGB 或可解析的主题色）vs 形状填充，无填充时看页面背景
     background = _slide_background_rgb(slide)
     for shape, _bbox, _is_group in _iter_shapes(slide.shapes):
         if len(issues) >= MAX_ISSUES:
             break
-        font_rgb = _run_font_rgb(shape)
+        font_rgb = _run_font_rgb(shape, theme_parsed)
         if not font_rgb or not _shape_text(shape).strip():
             continue
         backdrop = _solid_fill_rgb(shape) or background
@@ -407,6 +502,7 @@ def lint_pptx(pptx_path: Path | str) -> List[Dict[str, Any]]:
     prs = Presentation(str(pptx_path))
     slide_w, slide_h = _int(prs.slide_width), _int(prs.slide_height)
     issues: List[Dict[str, Any]] = []
+    theme_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
     for slide_index, slide in enumerate(prs.slides):
         for shape, bbox, _is_group in _iter_shapes(slide.shapes):
             if len(issues) >= MAX_ISSUES:
@@ -438,7 +534,7 @@ def lint_pptx(pptx_path: Path | str) -> List[Dict[str, Any]]:
                     "message": f"「{name}」文字装不进文本框（估算溢出 ≥{int((FIT_TOLERANCE - 1) * 100)}%）",
                 }))
         issues.extend(_slide_bounds_issues(slide, slide_w, slide_h, slide_index))
-        issues.extend(_slide_design_issues(slide, slide_index))
+        issues.extend(_slide_design_issues(slide, slide_index, theme_cache))
         if len(issues) >= MAX_ISSUES:
             issues = issues[:MAX_ISSUES]
             issues.append({"kind": "lint_truncated", "severity": "warning",
