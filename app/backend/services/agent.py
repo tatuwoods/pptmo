@@ -2350,7 +2350,15 @@ SYSTEM_PROMPT = (
     "（solidFill/渐变 stop/线条/文字色，含版式与母版）；与 theme_rebrand 互补——theme 管主题引用，"
     "recolor 管写死的颜色；先 search 确认色值来源再选操作。\n"
     "SmartArt：read_slides 会把 SmartArt 节点列为 smartart_node 对象（shape_id 形如 s0_id90_n0），"
-    "用 edit 修改 after 文本即可；SmartArt 结构重建不支持，只能改文字。\n\n"
+    "用 edit 修改 after 文本即可；SmartArt 结构重建不支持，只能改文字。\n"
+    "v0.6 新增操作：\n"
+    '- add_chart：{"action":"add_chart","slide_index":0,"chart_type":"column|bar|bar_h|line|pie|area|doughnut",'
+    '"categories":["Q1","Q2"],"series":[{"name":"营收","values":[1,2]}],"title":可选,"bbox_emu":可选,'
+    '"legend":可选} 创建原生图表（PowerPoint 里可双击改数据的真图表，非贴图）；系列值数量必须与类目'
+    "数量一致，饼图/环形图只支持一个系列；创建后可用 edit_chart 继续改数。\n"
+    "- add_slide 支持 layout_name（如 \"标题和内容\"/\"Title and Content\"，中英等价模糊匹配）；"
+    "不指定版式时自动套用全稿最常用版式保持品牌一致；版式清单见 GET /api/docs/{id}/layouts"
+    "（文档序列化里的 layouts 字段也带占位符类型与在用页数）。\n\n"
     f"约束：单次 propose 最多 {MAX_OPS_PER_CALL} 条，本次对话最多 {MAX_OPS} 条。\n\n"
     "工作方式：\n"
     "- 先理解意图：用户点名字段或页面时优先处理该对象/页面；模糊需求先 outline/read_slides 判断。\n"

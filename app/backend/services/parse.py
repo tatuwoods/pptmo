@@ -17,6 +17,53 @@ def _int(v: Any) -> int:
         return 0
 
 
+# ---------- v0.6 #7：母版版式清单（AI 新增页按品牌版式套用） ----------
+
+_PH_TYPE_NAMES = {
+    "CENTER_TITLE": "center_title", "SUBTITLE": "subtitle", "TITLE": "title",
+    "BODY": "body", "OBJ": "body", "OBJECT": "body",
+    "DATE": "date", "FOOTER": "footer", "SLIDE_NUMBER": "slide_number",
+}
+
+
+def _layout_placeholders(layout) -> List[Dict[str, Any]]:
+    placeholders: List[Dict[str, Any]] = []
+    try:
+        for ph in layout.placeholders:
+            ph_type = str(getattr(ph.placeholder_format, "type", "") or "")
+            placeholders.append({
+                "type": _PH_TYPE_NAMES.get(ph_type.split(" (")[0].strip(), ph_type.lower() or "body"),
+                "idx": _int(getattr(ph.placeholder_format, "idx", None)),
+            })
+    except Exception:
+        pass
+    return placeholders
+
+
+def _layouts_payload(prs) -> List[Dict[str, Any]]:
+    """全部母版的版式扁平清单（index 为跨母版序号），附占位符与在用页数。"""
+    usage: Dict[str, int] = {}
+    for slide in prs.slides:
+        key = str(slide.slide_layout.part.partname)
+        usage[key] = usage.get(key, 0) + 1
+    layouts: List[Dict[str, Any]] = []
+    try:
+        masters = list(prs.slide_masters)
+    except Exception:
+        masters = []
+    for master_index, master in enumerate(masters):
+        for layout in master.slide_layouts:
+            layouts.append({
+                "index": len(layouts),
+                "name": str(layout.name or f"版式{len(layouts) + 1}"),
+                "master": str(master.name or f"母版{master_index + 1}"),
+                "master_index": master_index,
+                "placeholders": _layout_placeholders(layout),
+                "used_by": usage.get(str(layout.part.partname), 0),
+            })
+    return layouts[:60]  # 防御性上限：畸形包塞几百个版式时不炸序列化
+
+
 def _xml_font_size_pt(element) -> Optional[float]:
     for tag in ("a:rPr", "a:defRPr", "a:endParaRPr"):
         try:
@@ -476,6 +523,37 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
                     }
                 )
             return
+        if kind == "chart":
+            # v0.6 #6：图表进 objects（此前只在 elements），AI 拿 shape_id 发
+            # edit_chart 改数；带 chart_type/系列名概要便于选图
+            chart_type = ""
+            series_names: List[str] = []
+            try:
+                chart = shape.chart
+                chart_type = str(chart.chart_type).split(" (")[0]
+                series_names = [str(entry.name or "") for entry in chart.series]
+            except Exception:
+                pass
+            objects.append(
+                {
+                    "slide_index": slide_index,
+                    "shape_index": current_seq,
+                    "shape_id": shape_id,
+                    "shape_name": name or "图表",
+                    "kind": "chart",
+                    "text": "",
+                    "bbox_emu": bbox,
+                    "slide_size_emu": slide_size,
+                    "grouped": grouped,
+                    "parent_shape_id": parent_shape_id,
+                    "group_path": list(group_path),
+                    "deletable": not grouped,
+                    "movable": not grouped,
+                    "resizable": not grouped,
+                    **({"chart_type": chart_type, "series": series_names} if chart_type else {}),
+                }
+            )
+            return
         if kind == "picture":
             # v0.5 #6：图片进 objects（无文本框，此前只出现在 elements），
             # 带 alt_text 让 AI 能读到/补写图说（无障碍 + 内容理解）。
@@ -559,6 +637,8 @@ def parse_pptx(pptx_path: Path | str) -> Tuple[List[Dict[str, Any]], Dict[str, A
         "elements": elements,
         "tables": tables,
         "notes": notes,
+        # v0.6 #7：母版版式清单（新增页品牌一致 + layout_name 按名套用的数据源）
+        "layouts": _layouts_payload(prs),
     }
     payload.update({key: value for key, value in limits.items() if value})
     return objects, payload

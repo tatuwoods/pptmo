@@ -357,6 +357,8 @@ def _serialize(meta: Dict[str, Any], objects_payload: Dict[str, Any]) -> Dict[st
         "messages": messages[-60:],
         "message_count": len(messages),
         "notes": objects_payload.get("notes", []),
+        # v0.6 #7：母版版式清单——新增页按文档自带版式套用（品牌一致）
+        "layouts": objects_payload.get("layouts", []),
         "pending_operations": _pending_from_messages(messages),
         "ai_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
         "ai_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
@@ -863,6 +865,21 @@ def get_objects(doc_id: str, x_doc_password: Optional[str] = Header(default=None
         "tables": objects_payload.get("tables", []),
         "slide_count": int(meta.get("slide_count", 0)),
         "version_id": _version_id(meta),
+    }
+
+
+@app.get("/api/docs/{doc_id}/layouts")
+def get_layouts(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    """v0.6 #7：文档自带母版版式清单（跨母版扁平 index、占位符类型、在用页数）。
+
+    AI 新增页优先用文档母版版式保持品牌一致；layout_name 可按名（中英等价）套用。"""
+    meta, objects_payload = _load_doc(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    return {
+        "doc_id": doc_id,
+        "version_id": _version_id(meta),
+        "slide_count": int(meta.get("slide_count", 0)),
+        "layouts": objects_payload.get("layouts", []),
     }
 
 

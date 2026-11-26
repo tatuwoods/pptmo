@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import PP_ALIGN
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -716,6 +717,112 @@ def _set_slide_notes(slide, text: str) -> None:
     slide.notes_slide.notes_text_frame.text = str(text or "")
 
 
+# ---------- v0.6 #6：原生图表创建 ----------
+
+# add_chart 支持的类型（含中文别名）——全部是 PowerPoint 原生 chart part，
+# 双击可改数据（对标 ppt-master「真图表，不是贴图」）
+_CHART_TYPE_ALIASES = {
+    "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    "bar": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    "bar_chart": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    "柱状图": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    "柱形图": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    "bar_h": XL_CHART_TYPE.BAR_CLUSTERED,
+    "bar_horizontal": XL_CHART_TYPE.BAR_CLUSTERED,
+    "horizontal_bar": XL_CHART_TYPE.BAR_CLUSTERED,
+    "条形图": XL_CHART_TYPE.BAR_CLUSTERED,
+    "line": XL_CHART_TYPE.LINE_MARKERS,
+    "line_chart": XL_CHART_TYPE.LINE_MARKERS,
+    "折线图": XL_CHART_TYPE.LINE_MARKERS,
+    "pie": XL_CHART_TYPE.PIE,
+    "pie_chart": XL_CHART_TYPE.PIE,
+    "饼图": XL_CHART_TYPE.PIE,
+    "area": XL_CHART_TYPE.AREA,
+    "area_chart": XL_CHART_TYPE.AREA,
+    "面积图": XL_CHART_TYPE.AREA,
+    "doughnut": XL_CHART_TYPE.DOUGHNUT,
+    "donut": XL_CHART_TYPE.DOUGHNUT,
+    "环形图": XL_CHART_TYPE.DOUGHNUT,
+    "圆环图": XL_CHART_TYPE.DOUGHNUT,
+}
+MAX_CHART_SERIES = 12
+MAX_CHART_POINTS = 500
+
+
+def _add_native_chart(slide, merged: Dict[str, Any], slide_w: int, slide_h: int) -> Any:
+    """在页面上加一个原生图表 graphicFrame（PowerPoint 可双击改数据的 chart part）。"""
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_LEGEND_POSITION
+
+    raw_type = str(merged.get("chart_type") or merged.get("kind") or merged.get("type") or "").strip().lower()
+    chart_type = _CHART_TYPE_ALIASES.get(raw_type)
+    if chart_type is None:
+        raise PatchError(
+            f"chart_type 不支持：{raw_type or '空'}（可选 column/bar/bar_h/line/pie/area/doughnut，即柱状/条形/折线/饼/面积/环形图）"
+        )
+    series_spec = merged.get("series")
+    if not isinstance(series_spec, list) or not series_spec:
+        raise PatchError("add_chart 需要 series 列表（如 [{'name':'营收','values':[1,2]}]）")
+    if len(series_spec) > MAX_CHART_SERIES:
+        raise PatchError(f"series 过多（最多 {MAX_CHART_SERIES} 个）")
+    pie_restricted = chart_type in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT)
+    if pie_restricted and len(series_spec) > 1:
+        raise PatchError("饼图/环形图只支持一个 series（多余系列不会被渲染）")
+    categories_raw = merged.get("categories")
+    if categories_raw is None:
+        categories_raw = []
+    if not isinstance(categories_raw, list):
+        raise PatchError("categories 必须是列表")
+    if len(categories_raw) > MAX_CHART_POINTS:
+        raise PatchError(f"categories 过多（最多 {MAX_CHART_POINTS} 个）")
+
+    data = CategoryChartData()
+    data.categories = [str(value) for value in categories_raw]
+    for position, entry in enumerate(series_spec, start=1):
+        if not isinstance(entry, dict):
+            raise PatchError("series 每项需要是对象（name/values）")
+        raw_values = entry.get("values")
+        if not isinstance(raw_values, list) or not raw_values:
+            raise PatchError(f"series '{entry.get('name', '')}' 缺少 values 数值列表")
+        if len(raw_values) > MAX_CHART_POINTS:
+            raise PatchError(f"series '{entry.get('name', '')}' 数据点过多（最多 {MAX_CHART_POINTS}）")
+        try:
+            values = [float(value) for value in raw_values]
+        except (TypeError, ValueError):
+            raise PatchError(f"series '{entry.get('name', '')}' 的 values 必须是数值列表") from None
+        if len(values) != len(categories_raw):
+            raise PatchError(
+                f"系列「{entry.get('name', '')}」的值数量（{len(values)}）"
+                f"与类目数量（{len(categories_raw)}）不一致"
+            )
+        data.add_series(str(entry.get("name") or f"系列{position}"), values)
+
+    # bbox 缺省：横向居中 70% × 上部留白后的 60%（标题区以下）
+    bbox = dict(merged.get("bbox_emu") or {})
+    for key, ratio in (("x", 0.15), ("y", 0.2), ("w", 0.7), ("h", 0.6)):
+        if bbox.get(key) is None:
+            bbox[key] = int(slide_w * ratio) if key in ("x", "w") else int(slide_h * ratio)
+    box = _clamp_bbox(bbox, slide_w, slide_h)
+    frame = slide.shapes.add_chart(
+        chart_type, Emu(box["x"]), Emu(box["y"]), Emu(box["w"]), Emu(box["h"]), data
+    )
+    chart = frame.chart
+    title = str(merged.get("title") or "").strip()
+    if title:
+        chart.has_title = True
+        chart.chart_title.text_frame.text = title
+    else:
+        chart.has_title = False
+    legend = merged.get("legend")
+    if legend is None:
+        legend = len(series_spec) > 1  # 多系列缺省显示图例，单系列省空间
+    chart.has_legend = bool(legend)
+    if chart.has_legend:
+        chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+        chart.legend.include_in_layout = False
+    return frame
+
+
 # ---------- 图表数据编辑 ----------
 
 def _apply_edit_chart(chart, merged: Dict[str, Any]) -> None:
@@ -1190,6 +1297,16 @@ def _apply_one(prs, patch: Dict[str, Any], seen: Set[str]) -> int:
         _add_textbox(prs.slides[slide_index], slide_w, slide_h, patch)
         return slide_index
 
+    if action == "add_chart":
+        try:
+            slide_index = int(merged.get("slide_index"))
+        except (TypeError, ValueError):
+            raise PatchError("slide_index is required for add_chart")
+        if slide_index < 0 or slide_index >= len(prs.slides):
+            raise PatchError(f"slide_index out of range: {slide_index}")
+        _add_native_chart(prs.slides[slide_index], merged, slide_w, slide_h)
+        return slide_index
+
     if action == "slide_background":
         payload = patch.get("payload") or {}
         merged = {**patch, **payload}
@@ -1466,6 +1583,11 @@ _ACTION_ALIASES = {
     "summary_page": "generate_summary",
     "edit_chart": "edit_chart",
     "chart_data": "edit_chart",
+    # v0.6 #6 原生图表创建
+    "add_chart": "add_chart",
+    "new_chart": "add_chart",
+    "create_chart": "add_chart",
+    "insert_chart": "add_chart",
     "edit_smartart": "edit_smartart",
     "smartart_edit": "edit_smartart",
     "edit_notes": "edit_notes",
@@ -1640,16 +1762,93 @@ def _require_range(value: int, low: int, high: int, label: str) -> None:
         raise PatchError(f"{label} out of range: {value} (valid {low}..{high})")
 
 
-def _add_blank_slide_at(prs, layout_index: Optional[int], new_index: int) -> None:
+# ---------- v0.6 #7：母版版式读取与套用 ----------
+
+# PowerPoint 中英文标准版式名等价表（中文 Office 模板 vs python-pptx 默认模板）
+_LAYOUT_EQUIV = {
+    "title slide": "标题幻灯片", "标题幻灯片": "标题幻灯片",
+    "title and content": "标题和内容", "标题和内容": "标题和内容", "标题与内容": "标题和内容",
+    "section header": "节标题", "节标题": "节标题",
+    "two content": "两栏内容", "两栏内容": "两栏内容", "两项内容": "两栏内容",
+    "comparison": "比较", "比较": "比较",
+    "title only": "仅标题", "仅标题": "仅标题",
+    "blank": "空白", "空白": "空白",
+    "content with caption": "内容与标题", "内容与标题": "内容与标题",
+    "picture with caption": "图片与标题", "图片与标题": "图片与标题",
+}
+
+
+def _layout_key(name: Any) -> str:
+    token = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    return _LAYOUT_EQUIV.get(token, token)
+
+
+def _all_layouts(prs) -> List[Any]:
+    """全部母版的版式扁平列表（多母版文档 layout_index 只看第一家，名字可跨家匹配）。"""
+    layouts: List[Any] = []
+    for master in prs.slide_masters:
+        layouts.extend(master.slide_layouts)
+    return layouts
+
+
+def _find_layout_by_name(prs, wanted: str):
+    target = _layout_key(wanted)
+    if not target:
+        raise PatchError("layout_name 不能为空")
+    layouts = _all_layouts(prs)
+    for layout in layouts:  # 先精确（经中英等价归一）
+        if _layout_key(layout.name) == target:
+            return layout
+    for layout in layouts:  # 再子串包含（大小写/空白不敏感）
+        if target in _layout_key(layout.name):
+            return layout
+    available = "、".join(sorted({str(l.name or "") for l in layouts}))[:200]
+    raise PatchError(f"layout_name 找不到版式：{wanted}（可用：{available}）")
+
+
+def _pick_default_layout(prs):
+    """新增页缺省版式：全稿最常用版式优先（品牌一致），无页时退回空白/第一个。
+
+    按版式 part 名计数——slide.slide_layout 每次访问返回新代理对象，不能按身份比。"""
+    usage: Dict[str, int] = {}
+    by_part: Dict[str, Any] = {}
+    for slide in prs.slides:
+        layout = slide.slide_layout
+        key = str(layout.part.partname)
+        usage[key] = usage.get(key, 0) + 1
+        by_part[key] = layout
+    best: Optional[Any] = None
+    best_count = 0
+    for key, count in usage.items():
+        if count > best_count:
+            best, best_count = by_part[key], count
+    if best is not None:
+        return best
     layouts = prs.slide_layouts
-    if layout_index is None:
-        # 6 is "Blank" in the standard template; fall back to the first layout
-        layout_index = 6 if len(layouts) > 6 else 0
-    if layout_index < 0 or layout_index >= len(layouts):
-        raise PatchError(
-            f"layout_index out of range: {layout_index} (deck has {len(layouts)} layouts)"
-        )
-    prs.slides.add_slide(layouts[layout_index])
+    return layouts[6] if len(layouts) > 6 else layouts[0]
+
+
+def _resolve_slide_layout(prs, patch: Dict[str, Any]):
+    """add_slide 的版式决策：显式 layout_index > layout_name 按名 > 全稿最常用。"""
+    layout_index = _get_slide_param(
+        patch, ("layout_index", "layout"), "layout_index", default=None
+    )
+    if layout_index is not None:
+        layouts = prs.slide_layouts
+        if layout_index < 0 or layout_index >= len(layouts):
+            raise PatchError(
+                f"layout_index out of range: {layout_index} (deck has {len(layouts)} layouts)"
+            )
+        return layouts[layout_index]
+    payload = patch.get("payload") or {}
+    layout_name = str(patch.get("layout_name") or payload.get("layout_name") or "").strip()
+    if layout_name:
+        return _find_layout_by_name(prs, layout_name)
+    return _pick_default_layout(prs)
+
+
+def _add_slide_with_layout(prs, layout, new_index: int) -> None:
+    prs.slides.add_slide(layout)
     _dedupe_slide_partname(prs.slides[len(prs.slides) - 1])
     last = len(prs.slides) - 1  # appended at the end first
     if new_index != last:
@@ -1720,9 +1919,8 @@ def _apply_slide_patches(
             position = _get_slide_param(
                 patch, ("position", "insert_at"), "position", default=None
             )
-            layout_index = _get_slide_param(
-                patch, ("layout_index", "layout"), "layout_index", default=None
-            )
+            # v0.6 #7：显式 layout_index > layout_name 按名 > 全稿最常用版式
+            layout = _resolve_slide_layout(prs, patch)
             if after is not None:
                 _require_range(after, 0, n_orig - 1, "after_slide")
                 if position is None:
@@ -1731,7 +1929,7 @@ def _apply_slide_patches(
                 position = n_orig
             _require_range(position, 0, n_orig, "position")
             new_index = insertion_index(position)
-            _add_blank_slide_at(prs, layout_index, new_index)
+            _add_slide_with_layout(prs, layout, new_index)
             anchors.insert(new_index, position - 0.5)
             touched.add(new_index)
         elif action == "delete_slide":
