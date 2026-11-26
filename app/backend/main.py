@@ -206,6 +206,11 @@ class ApplyIn(BaseModel):
     assistant_message_id: Optional[str] = Field(default=None, max_length=32)
 
 
+class ThemePreviewIn(BaseModel):
+    patches: List[Dict[str, Any]] = Field(min_length=1, max_length=100)
+    slides: Optional[List[int]] = None  # 0-based 页码，缺省前 3 页
+
+
 class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     scope: Optional[str] = Field(default=None, max_length=20)
@@ -1556,6 +1561,79 @@ def doc_health(doc_id: str, x_doc_password: Optional[str] = Header(default=None,
 
     report = health_mod.health_report(storage.current_path(doc_id))
     return {"doc_id": doc_id, "version_id": _version_id(meta), **report}
+
+
+# ---------- v0.6 #8：整稿重主题预览安全网 ----------
+
+
+@app.post("/api/docs/{doc_id}/theme-preview")
+def theme_preview_doc(
+    doc_id: str,
+    body: ThemePreviewIn,
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
+    """v0.6 #8：重主题大改动先看效果——副本上应用 patches 渲染前后对比图。
+
+    真文档一字节不动（版本号/current.pptx 都不碰），确认后照常 POST /apply。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    from services import theme_preview as theme_preview_mod
+
+    previews_root = storage.doc_dir(doc_id) / "theme-previews"
+    token = uuid.uuid4().hex[:12]
+    try:
+        result = theme_preview_mod.build_theme_preview(
+            storage.current_path(doc_id),
+            body.patches,
+            previews_root / token,
+            before_dir=storage.render_dir(doc_id, int(meta.get("version", 0))),
+            pages=body.slides,
+        )
+    except theme_preview_mod.PreviewError:
+        raise  # ValueError handler → 400
+    # 预览产物可再生，只留最近 3 份防盘膨胀
+    try:
+        stale = sorted(previews_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[3:]
+        for item in stale:
+            shutil.rmtree(item, ignore_errors=True)
+    except OSError:
+        pass
+    base = f"/api/docs/{doc_id}/theme-previews/{token}"
+    return {
+        "doc_id": doc_id,
+        "version_id": _version_id(meta),  # 未变——真文档没动过
+        "token": token,
+        "page_count": result["page_count"],
+        "pages": [
+            {
+                "slide_index": page["slide_index"],
+                "before_url": f"{base}/before-{page['slide_index'] + 1:03d}.png",
+                "after_url": f"{base}/after-{page['slide_index'] + 1:03d}.png",
+            }
+            for page in result["pages"]
+        ],
+        "hint": "效果确认后照常 POST /api/docs/%s/apply 应用到真文档" % doc_id,
+    }
+
+
+@app.get("/api/docs/{doc_id}/theme-previews/{token}/{name}")
+def theme_preview_image(
+    doc_id: str,
+    token: str,
+    name: str,
+    x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password"),
+):
+    """v0.6 #8：对比图分发——文件名白名单 + token 格式校验，防路径穿越。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    from services import theme_preview as theme_preview_mod
+
+    if not re.fullmatch(r"[0-9a-f]{8,32}", token) or not theme_preview_mod.PREVIEW_FILE_RE.match(name):
+        raise HTTPException(status_code=404, detail="not found")
+    path = storage.doc_dir(doc_id) / "theme-previews" / token / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/docs/{doc_id}/download")
