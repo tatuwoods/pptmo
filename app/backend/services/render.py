@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import shlex
 import shutil
@@ -7,8 +8,9 @@ import subprocess  # noqa: F401  保留给非队列路径
 import threading
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Sequence
 
 import pymupdf
 
@@ -56,6 +58,91 @@ def _timeout_s() -> int:
         return max(1, int(os.getenv("RENDER_TIMEOUT_S", "180")))
     except (TypeError, ValueError):
         return 180
+
+
+# ---------- v0.6 #9：逐页并发光栅化（LibreOffice 整档转 PDF 后的 PNG 瓶颈） ----------
+
+RASTER_WORKER_CAP = 4  # 进程数上限：再多会跟 LibreOffice/uvicorn 抢核
+
+
+def raster_workers() -> int:
+    """并发光栅化进程数：PPTMO_RASTER_WORKERS 覆盖，默认 min(上限, CPU)，非法/<=1 走串行。"""
+    raw = os.getenv("PPTMO_RASTER_WORKERS")
+    if raw is None:
+        return max(1, min(RASTER_WORKER_CAP, os.cpu_count() or 1))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _page_chunks(page_count: int, chunks: int) -> List[range]:
+    """把 1..page_count 均分成不超过 chunks 个连续段（每段进程内按页顺扫）。"""
+    chunks = max(1, min(chunks, page_count))
+    size = math.ceil(page_count / chunks)
+    return [
+        range(start + 1, min(start + size, page_count) + 1)
+        for start in range(0, page_count, size)
+    ]
+
+
+def _rasterize_chunk(args) -> int:
+    """子进程入口：独立打开 PDF，渲染分到的页（slide + thumb 成对），返回页数。"""
+    pdf_path, out_dir, pages, scale, thumb_scale = args
+    written = 0
+    doc = pymupdf.open(pdf_path)
+    try:
+        for number in pages:
+            page = doc[number - 1]
+            page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).save(
+                Path(out_dir) / f"slide-{number:03d}.png"
+            )
+            page.get_pixmap(matrix=pymupdf.Matrix(thumb_scale, thumb_scale), alpha=False).save(
+                Path(out_dir) / f"thumb-{number:03d}.png"
+            )
+            written += 1
+    finally:
+        doc.close()
+    return written
+
+
+def rasterize_pdf(
+    pdf_path: Path, out_dir: Path, scale: float = 2.0, thumb_scale: Optional[float] = None
+) -> int:
+    """PDF → slide-NNN.png + thumb-NNN.png。多页且配置允许多进程时按页并发，
+    进程池异常/产出不全时回退串行重跑（产出契约不变）。返回页数。"""
+    if thumb_scale is None:
+        thumb_scale = max(0.2, min(0.5, scale * 0.16))
+    doc = pymupdf.open(pdf_path)
+    try:
+        page_count = doc.page_count
+    finally:
+        doc.close()
+
+    workers = raster_workers()
+    if workers > 1 and page_count >= 2:
+        chunks = _page_chunks(page_count, workers)
+        jobs = [(str(pdf_path), str(out_dir), chunk, scale, thumb_scale) for chunk in chunks]
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                written = sum(pool.map(_rasterize_chunk, jobs))
+            if written == page_count and (out_dir / f"slide-{page_count:03d}.png").exists():
+                return page_count
+        except Exception:
+            pass  # 受限环境（进程池起不来/被杀）→ 串行兜底，宁可慢不可挂
+
+    doc = pymupdf.open(pdf_path)
+    try:
+        for index, page in enumerate(doc):
+            page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).save(
+                out_dir / f"slide-{index + 1:03d}.png"
+            )
+            page.get_pixmap(matrix=pymupdf.Matrix(thumb_scale, thumb_scale), alpha=False).save(
+                out_dir / f"thumb-{index + 1:03d}.png"
+            )
+    finally:
+        doc.close()
+    return page_count
 
 
 def partial_marker(out_dir: Path) -> Path:
@@ -204,22 +291,15 @@ def _render_pptx_locked(
         raise RenderError("render worker produced no PDF")
 
     pdf_path = pdfs[0]
-    thumb_scale = max(0.2, min(0.5, scale * 0.16))
     try:
         doc = pymupdf.open(pdf_path)
         page_count = doc.page_count
+        doc.close()
         if page_count > _max_pages():
             raise RenderError(
                 f"document has {page_count} pages, above the render cap of {_max_pages()}"
             )
-        for index, page in enumerate(doc):
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
-            pix.save(out_dir / f"slide-{index + 1:03d}.png")
-            thumb = page.get_pixmap(
-                matrix=pymupdf.Matrix(thumb_scale, thumb_scale), alpha=False
-            )
-            thumb.save(out_dir / f"thumb-{index + 1:03d}.png")
-        doc.close()
+        rasterize_pdf(pdf_path, out_dir, scale=scale)
     finally:
         try:
             keep_pdf(out_dir, pdf_path)
