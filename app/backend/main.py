@@ -2668,6 +2668,159 @@ def watch_page(doc_id: str, x_doc_password: Optional[str] = Header(default=None,
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 
+# ---------- v0.6 #5：演讲者模式 + 排练计时 ----------
+
+_PRESENT_PAGE = """<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>present · 演讲者模式</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, "PingFang SC", sans-serif;
+         background: #0b0d10; color: #e6e9ef; height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 8px 16px;
+           background: #14161a; border-bottom: 1px solid #23272f; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  .badge { font-size: 12px; color: #8b94a7; }
+  .timer { font-variant-numeric: tabular-nums; font-size: 13px; color: #38bdf8; }
+  .timer b { color: #e6e9ef; font-weight: 600; }
+  button { background: #1b1f26; color: #cfd6e4; border: 1px solid #2a2f3a; border-radius: 6px;
+           padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  button:hover { background: #232833; }
+  button.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+  main { flex: 1; min-height: 0; display: flex; }
+  .stage { flex: 1; display: flex; align-items: center; justify-content: center; position: relative;
+           background: #0b0d10; }
+  .stage img.current { max-width: 96%; max-height: 96%; border-radius: 6px;
+                       box-shadow: 0 10px 50px rgba(0,0,0,.6); background: #fff; }
+  .pageno { position: absolute; right: 18px; bottom: 14px; font-size: 12px; color: #8b94a7;
+            background: rgba(20,22,26,.8); padding: 2px 10px; border-radius: 999px; }
+  aside { width: 330px; background: #101216; border-left: 1px solid #23272f; display: none;
+          flex-direction: column; }
+  body.speaker aside { display: flex; }
+  body.speaker .stage { flex: 1; }
+  aside .next { padding: 12px; border-bottom: 1px solid #23272f; }
+  aside .next img { width: 100%; border-radius: 4px; background: #fff; display: block; }
+  aside .next .label { font-size: 11px; color: #8b94a7; margin-bottom: 6px; }
+  aside .notes { flex: 1; overflow-y: auto; padding: 12px; font-size: 13px; line-height: 1.7;
+                 white-space: pre-wrap; color: #d7dce6; }
+  aside .notes .label { font-size: 11px; color: #8b94a7; margin-bottom: 6px; }
+  aside .hints { padding: 8px 12px; font-size: 11px; color: #6b7385; border-top: 1px solid #23272f; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">present</h1>
+  <span class="badge" id="version-badge"></span>
+  <span class="spacer"></span>
+  <span class="timer">总 <b id="timer-total">00:00</b> · 本页 <b id="timer-page">00:00</b></span>
+  <button id="btn-pause" onclick="togglePause()">⏸ 暂停</button>
+  <button onclick="resetTimers()">↺ 重置计时</button>
+  <button id="btn-speaker" onclick="toggleSpeaker()">🖥 演讲者视图</button>
+  <button class="primary" onclick="goFullscreen()">⛶ 全屏</button>
+</header>
+<main>
+  <div class="stage" id="stage" onclick="next()">
+    <img class="current" id="page" alt="当前页渲染图">
+    <span class="pageno" id="pageno"></span>
+  </div>
+  <aside>
+    <div class="next">
+      <div class="label">下一页预览</div>
+      <img id="next-img" alt="下一页预览">
+    </div>
+    <div class="notes"><div class="label">演讲者备注</div><div id="note">（无备注）</div></div>
+    <div class="hints">←/→ 或空格翻页 · S 演讲者视图 · P 暂停 · R 重置 · F 全屏 · Esc 退出</div>
+  </aside>
+</main>
+<script>
+const DOC_ID = "__DOC_ID__";
+const base = "/api/docs/" + DOC_ID;
+let total = 0, current = 0, notes = {}, title = "present", version = "";
+let elapsedTotal = 0, elapsedPage = 0, paused = false;
+
+const tick = setInterval(() => {
+  if (paused) return;
+  elapsedTotal += 1; elapsedPage += 1; renderTimer();
+}, 1000);
+
+function fmt(s) {
+  const m = Math.floor(s / 60), r = s % 60;
+  return String(m).padStart(2, "0") + ":" + String(r).padStart(2, "0");
+}
+function renderTimer() {
+  document.getElementById("timer-total").textContent = fmt(elapsedTotal);
+  document.getElementById("timer-page").textContent = fmt(elapsedPage);
+}
+function togglePause() {
+  paused = !paused;
+  document.getElementById("btn-pause").textContent = paused ? "▶ 继续" : "⏸ 暂停";
+}
+function resetTimers() { elapsedTotal = 0; elapsedPage = 0; renderTimer(); }
+function toggleSpeaker() { document.body.classList.toggle("speaker"); refresh(); }
+function goFullscreen() {
+  const el = document.documentElement;
+  if (document.fullscreenElement) document.exitFullscreen();
+  else (el.requestFullscreen && el.requestFullscreen());
+}
+function imgUrl(i) { return base + "/slides/" + i + "/image?v=" + (version || "0"); }
+function refresh() {
+  document.getElementById("page").src = imgUrl(current);
+  const nextImg = document.getElementById("next-img");
+  nextImg.src = (current + 1 < total) ? imgUrl(current + 1) : imgUrl(current);
+  nextImg.style.opacity = (current + 1 < total) ? "1" : ".35";
+  document.getElementById("note").textContent = notes[current] || "（无备注）";
+  document.getElementById("pageno").textContent = (current + 1) + " / " + total;
+}
+function next() { if (current < total - 1) { current += 1; elapsedPage = 0; refresh(); } }
+function prev() { if (current > 0) { current -= 1; elapsedPage = 0; refresh(); } }
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") { e.preventDefault(); next(); }
+  else if (e.key === "ArrowLeft" || e.key === "PageUp") { e.preventDefault(); prev(); }
+  else if (e.key === "Home") { current = 0; elapsedPage = 0; refresh(); }
+  else if (e.key === "End") { current = total - 1; elapsedPage = 0; refresh(); }
+  else if (e.key === "s" || e.key === "S") toggleSpeaker();
+  else if (e.key === "p" || e.key === "P") togglePause();
+  else if (e.key === "r" || e.key === "R") resetTimers();
+  else if (e.key === "f" || e.key === "F") goFullscreen();
+  else if (e.key === "Escape" && document.fullscreenElement) document.exitFullscreen();
+});
+
+fetch(base).then(r => r.json()).then(d => {
+  title = d.title || "present";
+  total = d.slide_count || 0;
+  version = d.version_id || "v0";
+  document.title = title + " · 演讲者模式";
+  document.getElementById("title").textContent = title;
+  document.getElementById("version-badge").textContent = version;
+  (d.notes || []).forEach(n => { notes[n.slide_index] = n.text; });
+  // 预热全部页图，翻页零等待
+  for (let i = 0; i < total; i++) { const im = new Image(); im.src = imgUrl(i); }
+  refresh();
+  renderTimer();
+}).catch(() => {});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/api/docs/{doc_id}/present")
+def present_page(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    """v0.6 #5：全屏演示 + 演讲者视图（当前页/下一页预览/备注/排练计时）。
+
+    渲染 PNG 直接放（LibreOffice 出图，保真 100%），浏览器只做翻页不重排。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    page = _PRESENT_PAGE.replace("__DOC_ID__", doc_id)
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/docs/{doc_id}/lint")
 def lint_document(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
     """v0.5 #7：按需 lint 当前版本（apply 响应也自动带 lint_issues）。"""

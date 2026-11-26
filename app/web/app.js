@@ -11,6 +11,7 @@ const dom = {
   landingUploadBtn: $id("landingUploadBtn"),
   historyBtn: $id("historyBtn"),
   downloadBtn: $id("downloadBtn"),
+  presentBtn: $id("presentBtn"),
   shareBtn: $id("shareBtn"),
   auditBtn: $id("auditBtn"),
   fileInput: $id("fileInput"),
@@ -332,8 +333,10 @@ function showLanding() {
   dom.uploadBtn.classList.add("is-hidden");
   dom.historyBtn.classList.add("is-hidden");
   dom.downloadBtn.classList.add("is-hidden");
+  dom.presentBtn.classList.add("is-hidden");
   dom.historyBtn.disabled = true;
   dom.downloadBtn.disabled = true;
+  dom.presentBtn.disabled = true;
 }
 
 function showWorkspace() {
@@ -344,8 +347,10 @@ function showWorkspace() {
   dom.uploadBtn.classList.remove("is-hidden");
   dom.historyBtn.classList.remove("is-hidden");
   dom.downloadBtn.classList.remove("is-hidden");
+  dom.presentBtn.classList.remove("is-hidden");
   dom.historyBtn.disabled = false;
   dom.downloadBtn.disabled = false;
+  dom.presentBtn.disabled = false;
   dom.shareBtn.classList.remove("is-hidden");
   dom.shareBtn.disabled = false;
 }
@@ -2168,6 +2173,11 @@ async function handleFile(file) {
   }
 }
 
+function openPresent() {
+  if (!state.doc) return;
+  window.open(`/api/docs/${state.doc.doc_id}/present`, "_blank");
+}
+
 function downloadCurrent() {
   if (!state.doc) return;
   const anchor = document.createElement("a");
@@ -2267,6 +2277,7 @@ function bindEvents() {
 
   dom.shareBtn.addEventListener("click", () => createShareLink());
   dom.auditBtn.addEventListener("click", () => openAuditPanel());
+  dom.presentBtn.addEventListener("click", openPresent);
   dom.downloadBtn.addEventListener("click", downloadCurrent);
   dom.historyBtn.addEventListener("click", () => void openHistory());
   dom.sessionLogBtn.addEventListener("click", openSessionLog);
