@@ -149,7 +149,7 @@ run_checks() {
 
   # 7. health 评分卡
   score=$(curl -sf --max-time 60 "$BASE/api/docs/$doc_id/health" \
-    | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(f"{d[\"score\"]}/{d[\"grade\"]}")' 2>/dev/null)
+    | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(str(d["score"])+"/"+d["grade"])' 2>/dev/null)
   [[ "$score" =~ ^[0-9]+/[ABCD]$ ]] && ok "health scorecard ($score)" || bad "health scorecard: $score"
 
   # 8. vision 自检闭环（多模态模型真实调用；未配 key 时降级为结构断言）
@@ -190,6 +190,7 @@ while (( attempt <= MAX_ATTEMPTS )); do
   fi
   attempt=$((attempt + 1))
 done
+cleanup 2>/dev/null || true
 release_lock; trap - EXIT
 echo "smoke failed after $MAX_ATTEMPTS attempts" >&2
 exit 1
