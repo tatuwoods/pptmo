@@ -22,6 +22,12 @@ MAX_FONT_PT = 96.0
 _RECOGNITION_LANGUAGES = ["zh-Hans", "en-US"]
 
 
+def _ns_value(x: Any) -> Any:
+    """pyobjc 对 Swift 属性的暴露形态随版本不同：有的直接给值，有的给
+    bound selector 需调用取值。统一在此取值，两种形态都兼容。"""
+    return x() if callable(x) else x
+
+
 def ocr_available() -> bool:
     try:
         import Foundation  # noqa: F401
@@ -56,13 +62,13 @@ def ocr_image_bytes(data: bytes) -> List[Dict[str, Any]]:
         if not candidates:
             continue
         candidate = candidates[0]
-        confidence = float(candidate.confidence())
+        confidence = float(_ns_value(candidate.confidence))
         if confidence < MIN_CONFIDENCE:
             continue
-        text = str(candidate.string()).strip()
+        text = str(_ns_value(candidate.string)).strip()
         if not text:
             continue
-        box = obs.boundingBox()  # 归一化，原点在左下
+        box = _ns_value(obs.boundingBox)  # 归一化，原点在左下
         origin, size = box.origin, box.size
         lines.append({
             "text": text,
