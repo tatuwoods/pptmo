@@ -1165,6 +1165,18 @@ def _apply_locked(doc_id: str, body: ApplyIn, label: str):
                 f"/api/docs/{doc_id}/vision-check?slides="
                 + ",".join(str(i) for i in sorted(set(touched)))
             )
+            # v0.6 #10：交付健康报告引用——AI 每轮改完看「还差多少分」
+            try:
+                from services import health as health_mod
+
+                report = health_mod.health_report(storage.current_path(doc_id))
+                result["health"] = {
+                    "score": report["score"],
+                    "grade": report["grade"],
+                    "url": f"/api/docs/{doc_id}/health",
+                }
+            except Exception:  # noqa: BLE001 — 报告失败不阻塞 apply
+                pass
             # Mark exactly the message the patches came from. The legacy
             # label-prefix scan marked the newest un-applied assistant message even
             # when the user applied a different (or partial) set, silently
@@ -1533,6 +1545,17 @@ def vision_check_document(
                 raise HTTPException(status_code=400, detail=f"页码超出范围：{index}（文档共 {meta.get('slide_count')} 页）")
             indices.append(index)
     return _vision_check_pages(doc_id, meta, indices)
+
+
+@app.get("/api/docs/{doc_id}/health")
+def doc_health(doc_id: str, x_doc_password: Optional[str] = Header(default=None, alias="X-Doc-Password")):
+    """v0.6 #10：交付健康报告——文档级质量评分卡（lint/乱码/字体统一度 + 统计）。"""
+    meta = storage.load_meta(doc_id)
+    _assert_doc_open(meta, x_doc_password)
+    from services import health as health_mod
+
+    report = health_mod.health_report(storage.current_path(doc_id))
+    return {"doc_id": doc_id, "version_id": _version_id(meta), **report}
 
 
 @app.get("/api/docs/{doc_id}/download")
