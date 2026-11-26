@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.6.0 — 对标 2026-11 最新 Top5，渲染验证闭环 + 保真 + 可编辑性 (2026-11-26)
+
+对标 guizang-ppt-skill / ppt-master / image-to-editable-ppt-skill / KitionAI
+kition-slide / CasualOffice slides（awesome-codex-ppt-skills 实测榜），
+核心洞察「pick by whether you can edit the result」：
+
+1. 渲染验证闭环（vision 自检）— `GET /api/docs/{id}/vision-check`：把当前
+   版本渲染 PNG 转 base64 视觉消息喂多模态模型（glm-5.3-flash 等，溢出/
+   乱码豆腐/塌版/对比度四类检查）；agent 新增 vision_check 工具（apply 响应
+   带 vision_check_url，前端「👁 自检」按钮），发现问题自提案修复——对标
+   OfficeCLI render→look→fix
+2. OOXML passthrough 保真 — apply/merge 保存后未触碰的 slide part（含
+   .rels/notes）按 part 名原字节回写，改一处不再丢别处（动画 timing/
+   自定义扩展元素保真）；`PPTMO_PASSTHROUGH=0` 可关——对标 CasualOffice
+   未映射 XML 透传
+3. lint 升级设计建议引擎 — 新增字号层级混乱（同页标题<正文）/对比度过低
+   （WCAG 3:1，含主题色解析）/图片拉伸变形（裁剪图与 <8px 占位图豁免）三类
+   warn-only 检查；全部 8 类 issue 携带「设计师会怎么改」自然语言
+   suggestion——对标 Kition designer 建议
+4. 图片导入 OCR 重建可编辑 — `/api/docs/import-images` 默认本机 OCR
+   （macOS Vision via pyobjc，zh-Hans 优先），文字行按行框生成原生文本框
+   叠在图片上层（可改字），`ocr=0` 可关、不可用自动退回纯图片页——对标
+   ningzimu 图片→可编辑
+5. 演讲者模式 + 排练计时 — `GET /api/docs/{id}/present`：渲染 PNG 直放
+   （保真 100%），←→/空格翻页、演讲者视图（当前页+下一页预览+备注+总/本页
+   双计时器、暂停/重置）、全屏；前端「▶ 演示」按钮——对标 guizang 第 1 名
+   核心体验
+6. 原生图表创建 — `add_chart` 操作：python-pptx 原生 chart part
+   （column/bar/bar_h/line/pie/area/doughnut + 中文别名，标题/图例/bbox，
+   值数=类目数校验、饼图单系列），PowerPoint 可双击改数据；parse 输出
+   kind=chart 对象供 edit_chart 续改——对标 ppt-master 数据图表
+7. 母版/版式强化 — `GET /api/docs/{id}/layouts` 列出多母版版式清单（占位符
+   类型+在用页数）；add_slide 缺省改用全稿最常用版式（品牌一致），支持
+   layout_name 中英等价匹配——对标 ppt-master slide masters
+8. 重主题预览安全网 — `POST /api/docs/{id}/theme-preview`：theme_rebrand/
+   recolor 先在副本上应用并渲染 before/after 对比图（真文档一字节不动），
+   确认后照常 /apply——对标 CasualOffice round-trip 大改动先看效果
+9. 逐页并发渲染 — PDF 光栅化按连续页段分给多进程（默认 min(4,CPU)，
+   `PPTMO_RASTER_WORKERS` 可调，失败自动回退串行），大文档预览提速——对标
+   ningzimu page worker 并发
+10. 交付健康报告 — `GET /api/docs/{id}/health`：文档级评分卡（lint 错误/
+    警告、乱码符号残留、字体统一度 + 页数/对象统计，0-100 分 + A/B/C/D 档
+    + 可解释扣分明细），apply 响应附带 health 摘要——对标 awesome 榜
+    rework 量度量
+
 ## v0.5.0 — 对标 GitHub 顶级同类项目，10 项高价值功能 (2026-11-25)
 
 对标 hands-on-deck（结构化编辑）/ OfficeCLI（render→look→fix）/ dashi-ppt-skill /

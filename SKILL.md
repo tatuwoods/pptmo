@@ -124,6 +124,19 @@ Deck-wide ops go through the same `/apply` channel as patches:
 - **watch**: open `GET /api/docs/{id}/watch` in a browser — split-pane live preview. Changes publish SSE events on `GET /api/docs/{id}/events` (`hello` on connect, `changed` with version/touched_slides on every commit: apply/chat-auto-apply/undo/restore/merge).
 - **hidden pages & export**: export PDF / images.zip / pdf-notes skip hidden slides by default; add `?include_hidden=1` to include them. Outline marks hidden pages「（已隐藏）」.
 
+## v0.6 operations (vision 闭环 / passthrough / 设计建议 / OCR / 演讲者 / 图表 / 版式 / 预览 / 并发 / 健康分)
+
+- **vision 自检闭环**: `GET /api/docs/{id}/vision-check?slides=0,2` 把渲染 PNG 喂多模态模型（需 key 支持视觉，`VISION_MODEL` 可单独指定，默认沿用 DEEPSEEK_MODEL），返回 `issues[]`（overflow/garbled/layout/contrast）+ 设计建议；agent 对话里会自动调用 vision_check 工具并自提案修复；apply 响应带 `vision_check_url`；前端「👁 自检」按钮。
+- **OOXML passthrough**: apply/merge 只重写被编辑的 slide part，未触碰页（含 rels/notes）原字节回写——动画 timing、第三方扩展元素不再因「改别处」丢失。`PPTMO_PASSTHROUGH=0` 关闭（退回 python-pptx 整包重序列化）。
+- **设计建议引擎**: lint 在 v0.5 四类几何检查外新增 `font_hierarchy`（同页标题<正文）/`low_contrast`（WCAG 3:1，含主题色解析）/`image_distorted`（非等比拉伸；裁剪图与 <8px 占位图豁免），全部 issue 带 `suggestion`「设计师会怎么改」。
+- **图片 OCR 导入**: `POST /api/docs/import-images` 默认本机 OCR（macOS Vision via pyobjc），文字行生成可编辑原生文本框叠在图片上层；`ocr=0` 关闭，OCR 不可用自动退回 v0.4 纯图片页。响应带 `ocr` 统计。
+- **演讲者模式**: `GET /api/docs/{id}/present` 全屏演示（渲染 PNG 直放）+ 演讲者视图（下一页预览/备注/总与本页双计时、暂停/重置）；←→/空格翻页，S 切视图，F 全屏。前端「▶ 演示」按钮直达。
+- **原生图表**: `{"action":"add_chart","slide_index":0,"chart_type":"column|bar|bar_h|line|pie|area|doughnut","categories":[...],"series":[{"name":"营收","values":[1,2]}],"title":...,"bbox_emu":...}` 创建真图表（PowerPoint 可双击改数据）；值数量必须=类目数量，饼图/环形图单系列；`GET /api/docs/{id}` 的 objects 里图表以 `kind:"chart"` 出现，可继续 edit_chart。
+- **母版版式**: `GET /api/docs/{id}/layouts` 列出全部母版版式（名称/占位符/在用页数）；`add_slide` 支持 `layout_name`（中英等价匹配），缺省自动套用全稿最常用版式（品牌一致）；`layout_index` 仍然优先。
+- **重主题预览**: `POST /api/docs/{id}/theme-preview` body `{"patches":[theme_rebrand/recolor 操作],"slides":[0,1]}`——副本上应用并渲染 before/after 对比图（URL 直接可看），真文档一字节不动；确认后照常 POST /apply。对比图只留最近 3 份。
+- **并发渲染**: PDF→PNG 光栅化多进程并行（默认 min(4,CPU)，`PPTMO_RASTER_WORKERS` 调整），大文档预览明显提速；失败自动回退串行。
+- **健康报告**: `GET /api/docs/{id}/health` 返回 0-100 分 + A/B/C/D 档（lint 扣分/乱码符号/字体统一度/统计），`checks` 明细可解释每项扣分；apply 响应也带 `health` 摘要，AI 每轮改完可引用「还差多少分」。
+
 ## Remote access via Tailscale
 
 Best practice: keep uvicorn bound to `127.0.0.1` and publish through `tailscale serve` (auto-HTTPS, tailnet-only, streams SSE fine). **Since v0.1.2 the app runs a request guard** (anti drive-by / DNS-rebinding), so proxied browser traffic needs the public host whitelisted in `backend/.env` or every cross-origin POST gets 403:

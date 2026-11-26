@@ -54,5 +54,5 @@ def test_health_reports_version(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["version"] == "0.5.0"
+    assert body["version"] == "0.6.0"
     assert body["ok"] is True
